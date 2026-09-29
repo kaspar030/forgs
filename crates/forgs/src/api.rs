@@ -32,6 +32,28 @@ pub mod error_code {
     pub const USERNAME_INVALID: &str = "username_invalid";
     /// The signup ticket is unknown or expired.
     pub const TICKET_EXPIRED: &str = "ticket_expired";
+    /// A new identity asserted an email another user already holds. forgs
+    /// never auto-links on email: log in with the existing method and link
+    /// this one from there.
+    pub const EMAIL_IN_USE: &str = "email_in_use";
+    /// The identity is already linked (to this or another user).
+    pub const IDENTITY_TAKEN: &str = "identity_taken";
+    /// The request conflicts with the current state.
+    pub const CONFLICT: &str = "conflict";
+    /// The server failed; nothing about the request is implied.
+    pub const SERVER_ERROR: &str = "server_error";
+    /// No workload issuer is configured for this grant.
+    pub const WORKLOAD_UNCONFIGURED: &str = "workload_unconfigured";
+    /// The change would leave a namespace without an admin.
+    pub const LAST_ADMIN: &str = "last_admin";
+    /// The login provider is unknown or not configured.
+    pub const UNKNOWN_PROVIDER: &str = "unknown_provider";
+    /// The identity provider could not complete the login.
+    pub const UPSTREAM_ERROR: &str = "upstream_error";
+    /// The provider asserted no verified email, so the login is refused.
+    pub const NO_VERIFIED_EMAIL: &str = "no_verified_email";
+    /// The server is at capacity for this flow; retry later.
+    pub const TEMPORARILY_UNAVAILABLE: &str = "temporarily_unavailable";
 }
 
 /// A token-exchange request to `POST /auth/token`.
@@ -306,6 +328,109 @@ pub struct ApiKeyRevoked {
     pub namespace: String,
     /// The hashes deleted.
     pub revoked: Vec<String>,
+}
+
+/// A request to `POST /auth/members`: manage a namespace's direct members.
+///
+/// Listing needs membership; changing needs the highest role on the ladder
+/// (inherited roles count). Users travel as usernames and are resolved once,
+/// server-side, to their immutable id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum MembersRequest {
+    /// List the direct members.
+    List {
+        /// The namespace (id or path).
+        namespace: String,
+    },
+    /// Add a user, or change their role.
+    Set {
+        /// The namespace (id or path).
+        namespace: String,
+        /// The user's current username.
+        username: String,
+        /// A role label from the app's ladder.
+        role: String,
+    },
+    /// Remove a user's direct membership.
+    Remove {
+        /// The namespace (id or path).
+        namespace: String,
+        /// The user's current username.
+        username: String,
+    },
+}
+
+/// One direct member.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemberInfo {
+    /// The rendered subject key (`user:<id>`, a workload, an app subject).
+    pub subject: String,
+    /// The user id, for user members.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+    /// The username, for user members. Display only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    /// The role label.
+    pub role: String,
+}
+
+/// A namespace's direct members.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemberList {
+    /// The namespace id listed.
+    pub namespace: String,
+    /// The members, by subject.
+    pub members: Vec<MemberInfo>,
+}
+
+/// A request to `POST /auth/rename`.
+///
+/// The old name is tombstoned forever (docs/design.md §6, decision 5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum RenameRequest {
+    /// Rename the calling user (and their personal namespace with them).
+    User {
+        /// The new username.
+        new_username: String,
+    },
+    /// Rename a (non-personal) namespace node the caller administers.
+    Namespace {
+        /// The namespace (id or path).
+        namespace: String,
+        /// Its new name (one path segment).
+        new_name: String,
+    },
+}
+
+/// One membership in a [`SessionInfo`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionMembership {
+    /// The namespace id.
+    pub namespace: String,
+    /// The direct role label.
+    pub role: String,
+}
+
+/// `GET /auth/session`: who the caller is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionInfo {
+    /// The rendered subject key.
+    pub subject: String,
+    /// The user id, for a user session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+    /// The username, for a user session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    /// The credential's expiry (epoch seconds), if it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires: Option<u64>,
+    /// The user's direct memberships.
+    #[serde(default)]
+    pub memberships: Vec<SessionMembership>,
 }
 
 /// A rejected request.
@@ -634,6 +759,71 @@ mod tests {
                 error: error_code::INVALID_GRANT.into(),
             },
             &json!({"error": "invalid_grant"}),
+        );
+    }
+
+    #[test]
+    fn members_and_rename_shapes() {
+        round_trip(
+            &MembersRequest::List {
+                namespace: "acme".into(),
+            },
+            &json!({"action": "list", "namespace": "acme"}),
+        );
+        round_trip(
+            &MembersRequest::Set {
+                namespace: "acme".into(),
+                username: "bob".into(),
+                role: "write".into(),
+            },
+            &json!({"action": "set", "namespace": "acme", "username": "bob", "role": "write"}),
+        );
+        round_trip(
+            &MembersRequest::Remove {
+                namespace: "acme".into(),
+                username: "bob".into(),
+            },
+            &json!({"action": "remove", "namespace": "acme", "username": "bob"}),
+        );
+        round_trip(
+            &MemberList {
+                namespace: "n".into(),
+                members: vec![MemberInfo {
+                    subject: "user:01J".into(),
+                    user_id: Some("01J".into()),
+                    username: Some("bob".into()),
+                    role: "admin".into(),
+                }],
+            },
+            &json!({"namespace": "n", "members": [{"subject": "user:01J", "user_id": "01J",
+                    "username": "bob", "role": "admin"}]}),
+        );
+        round_trip(
+            &RenameRequest::User {
+                new_username: "al".into(),
+            },
+            &json!({"action": "user", "new_username": "al"}),
+        );
+        round_trip(
+            &RenameRequest::Namespace {
+                namespace: "acme".into(),
+                new_name: "acme2".into(),
+            },
+            &json!({"action": "namespace", "namespace": "acme", "new_name": "acme2"}),
+        );
+        round_trip(
+            &SessionInfo {
+                subject: "user:01J".into(),
+                user_id: Some("01J".into()),
+                username: Some("al".into()),
+                expires: Some(5),
+                memberships: vec![SessionMembership {
+                    namespace: "n".into(),
+                    role: "admin".into(),
+                }],
+            },
+            &json!({"subject": "user:01J", "user_id": "01J", "username": "al", "expires": 5,
+                    "memberships": [{"namespace": "n", "role": "admin"}]}),
         );
     }
 

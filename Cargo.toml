@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
-# forgs-http joins this list as it lands (docs/design.md §5).
 members = [
     "crates/forgs",
     "crates/forgs-client",
+    "crates/forgs-http",
     "crates/forgs-idp",
     "crates/forgs-store",
 ]
@@ -24,6 +24,7 @@ license = "MIT OR Apache-2.0"
 # internal
 forgs = { path = "crates/forgs" }
 forgs-client = { path = "crates/forgs-client" }
+forgs-http = { path = "crates/forgs-http" }
 forgs-idp = { path = "crates/forgs-idp" }
 forgs-store = { path = "crates/forgs-store" }
 
@@ -75,7 +76,20 @@ jsonwebtoken = { version = "10", default-features = false, features = ["rust_cry
 # so apps keep `_sqlx_migrations` to themselves.
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
 
+# HTTP server surface (forgs-http only; forgs-client must never see these).
+# No `tokio` / `http1`: the app owns the listener and nests forgs' router.
+# `original-uri` lets the cookie-prefix fence see the full path under a nest.
+axum = { version = "0.8", default-features = false, features = ["json", "query", "form", "original-uri"] }
+# CSRF / cookie MACs and constant-time comparison. Both pure Rust.
+hmac = "0.12"
+subtle = "2"
+# Parsing `application/x-www-form-urlencoded` bodies on routes that accept
+# either JSON or a no-JS HTML form. Already in the graph via axum's `form`.
+serde_urlencoded = "0.7"
+
 # dev / test helpers
+# `oneshot` for driving a Router in forgs-http's integration tests.
+tower = { version = "0.5", default-features = false, features = ["util"] }
 # Test certificates for forgs-client's pinned-TLS test; `ring`, not aws-lc.
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 tokio = { version = "1", default-features = false, features = ["macros", "rt"] }
