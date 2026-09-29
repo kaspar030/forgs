@@ -1,10 +1,10 @@
 [workspace]
 resolver = "2"
-# forgs-store, forgs-http and forgs-client join this list as they land
-# (docs/design.md §5).
+# forgs-http and forgs-client join this list as they land (docs/design.md §5).
 members = [
     "crates/forgs",
     "crates/forgs-idp",
+    "crates/forgs-store",
 ]
 
 [workspace.lints.rust]
@@ -23,6 +23,7 @@ license = "MIT OR Apache-2.0"
 # internal
 forgs = { path = "crates/forgs" }
 forgs-idp = { path = "crates/forgs-idp" }
+forgs-store = { path = "crates/forgs-store" }
 
 # Dependency discipline (carried over from probe-rs-fleet):
 #
@@ -35,6 +36,11 @@ forgs-idp = { path = "crates/forgs-idp" }
 #   is used, so every feature in the tree is one somebody asked for.
 # * The core `forgs` crate is pure: no IO, no async runtime (tokio is a
 #   dev-dependency only), no clock (`now` is always a parameter).
+# * The one sanctioned exception to "no C toolchain" is `sqlx`'s `sqlite`
+#   feature, which builds a bundled libsqlite3. It is acceptable **only** in
+#   server-side crates (forgs-store, forgs-http): `forgs` and `forgs-client`
+#   must never depend on forgs-store, so the armv7-musl agent build never sees
+#   it.
 
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
@@ -61,6 +67,11 @@ webpki-roots = { version = "1", default-features = false }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 # `rust_crypto`, not `aws_lc_rs`: the same cross-compilation reason as rustls.
 jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto"] }
+
+# Storage (forgs-store). No `macros` / `migrate`: queries are runtime-checked
+# (the crate builds without a live database) and forgs runs its own migrator
+# so apps keep `_sqlx_migrations` to themselves.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
 
 # dev / test helpers
 tokio = { version = "1", default-features = false, features = ["macros", "rt"] }

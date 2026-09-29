@@ -1,0 +1,19 @@
+[package]
+name = "forgs-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "forgs storage: SQLite schema, migrations, and the Store / scoped handles over sqlx."
+
+[dependencies]
+forgs.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+
+[lints]
+workspace = true
