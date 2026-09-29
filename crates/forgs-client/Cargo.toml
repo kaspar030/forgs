@@ -1,0 +1,33 @@
+[package]
+name = "forgs-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "forgs HTTP client: device login, refresh, logout, API keys and workload token exchange. No server dependencies."
+
+# Runs on the fleet agent (armv7-musl): pure Rust, rustls `ring` provider, and
+# nothing server-side. `tests/no_http_server_dep.rs` enforces that.
+[dependencies]
+forgs.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+sha2.workspace = true
+
+hyper = { workspace = true, features = ["client", "http1"] }
+hyper-util = { workspace = true, features = ["client-legacy", "http1", "tokio"] }
+hyper-rustls.workspace = true
+http-body-util.workspace = true
+http.workspace = true
+rustls.workspace = true
+webpki-roots.workspace = true
+tokio = { workspace = true, features = ["time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "net", "io-util", "time", "sync"] }
+rcgen.workspace = true
+
+[lints]
+workspace = true

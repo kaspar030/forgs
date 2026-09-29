@@ -35,7 +35,7 @@ pub mod error_code {
 }
 
 /// A token-exchange request to `POST /auth/token`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "grant_type", rename_all = "snake_case")]
 pub enum TokenRequest {
     /// Exchange a still-valid session token for a fresh one.
@@ -63,10 +63,30 @@ pub enum TokenRequest {
         /// The refresh token, written by `login`.
         refresh_token: String,
     },
+    /// Exchange a **GitHub Actions OIDC JWT** for a short-lived workload
+    /// token (wire `grant_type: "github_oidc"`).
+    ///
+    /// The runner holds no secret: `permissions: id-token: write` lets it ask
+    /// GitHub for the JWT, and this exchanges it. New contract: `forgs-http`
+    /// must implement it (a server without a workload issuer configured
+    /// answers `503`; a verification failure is a flat `401 invalid_grant`).
+    GithubOidc {
+        /// The JWT from the runner's token service.
+        oidc_token: String,
+    },
+    /// Redeem an **API key** for a workload token (wire
+    /// `grant_type: "api_key"`) — the fallback for a runner with no workload
+    /// identity. New contract: `forgs-http` must implement it (an expired or
+    /// consumed key is a `401 invalid_grant`; a key whose purpose does not
+    /// redeem to a workload token a `403 forbidden`).
+    ApiKey {
+        /// The API key, as minted by [`ApiKeyRequest::Create`].
+        api_key: String,
+    },
 }
 
 /// A successful token exchange (and the `Granted` device-poll outcome).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenResponse {
     /// The minted session token.
     pub token: String,
@@ -94,7 +114,7 @@ pub struct TokenResponse {
 ///
 /// Authenticated with `Authorization: Bearer <session token>`: an ordinary
 /// authenticated call about the caller's *own* identity.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogoutRequest {
     /// The caller's refresh token, so it can be revoked alongside the
     /// session. A refresh token belonging to **another** user is ignored
@@ -119,7 +139,7 @@ pub struct DeviceStartRequest {}
 /// forgs is itself the device authorization server (docs/design.md §4): the
 /// user opens `verification_uri` in a browser, logs in with any provider
 /// (choosing a username on first login), and confirms `user_code`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceStartResponse {
     /// This client's poll credential. Never a connection credential; it is
     /// redeemed only at `/auth/device/poll`.
@@ -141,7 +161,7 @@ pub struct DeviceStartResponse {
 }
 
 /// A poll for the outcome of a device flow.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DevicePollRequest {
     /// The device secret from [`DeviceStartResponse`].
     pub device_secret: String,
@@ -150,7 +170,7 @@ pub struct DevicePollRequest {
 /// The outcome of a device-flow poll.
 ///
 /// There is no "needs username" state: the username is chosen in the browser.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum DevicePollResponse {
     /// Not yet approved; poll again after `interval`.
@@ -166,7 +186,7 @@ pub enum DevicePollResponse {
 }
 
 /// Complete a first login by choosing a username (`POST /auth/signup`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignupRequest {
     /// The pending-signup ticket.
     pub ticket: String,
@@ -220,7 +240,7 @@ pub enum ApiKeyRequest {
 }
 
 /// A freshly minted API key. **The only time the secret exists.**
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApiKeyCreated {
     /// The key itself. Stored nowhere, only its hash.
     pub key: String,
@@ -300,6 +320,105 @@ pub struct ErrorResponse {
     pub error: String,
 }
 
+/// What every hand-written `Debug` below prints in place of a secret.
+const REDACTED: &str = "<redacted>";
+
+/// `Some(<redacted>)` / `None`, so a `Debug` still shows *whether* an optional
+/// secret is present.
+fn redact_opt(v: Option<&String>) -> Option<&'static str> {
+    v.map(|_| REDACTED)
+}
+
+impl std::fmt::Debug for TokenRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (name, field) = match self {
+            Self::Refresh { .. } => ("Refresh", "session_token"),
+            Self::RefreshToken { .. } => ("RefreshToken", "refresh_token"),
+            Self::GithubOidc { .. } => ("GithubOidc", "oidc_token"),
+            Self::ApiKey { .. } => ("ApiKey", "api_key"),
+        };
+        f.debug_struct(name).field(field, &REDACTED).finish()
+    }
+}
+
+impl std::fmt::Debug for TokenResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenResponse")
+            .field("token", &REDACTED)
+            .field("expires", &self.expires)
+            .field("username", &self.username)
+            .field("user_id", &self.user_id)
+            .field("refresh_token", &redact_opt(self.refresh_token.as_ref()))
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for LogoutRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LogoutRequest")
+            .field("refresh_token", &redact_opt(self.refresh_token.as_ref()))
+            .field("all", &self.all)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for DeviceStartResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceStartResponse")
+            .field("device_secret", &REDACTED)
+            .field("user_code", &self.user_code)
+            .field("verification_uri", &self.verification_uri)
+            .field("verification_uri_complete", &self.verification_uri_complete)
+            .field("interval", &self.interval)
+            .field("expires_in", &self.expires_in)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for DevicePollRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DevicePollRequest")
+            .field("device_secret", &REDACTED)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for DevicePollResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pending => f.write_str("Pending"),
+            Self::SlowDown => f.write_str("SlowDown"),
+            Self::Denied => f.write_str("Denied"),
+            Self::Expired => f.write_str("Expired"),
+            Self::Granted(t) => f.debug_tuple("Granted").field(t).finish(),
+        }
+    }
+}
+
+impl std::fmt::Debug for SignupRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SignupRequest")
+            .field("ticket", &REDACTED)
+            .field("username", &self.username)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for ApiKeyCreated {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApiKeyCreated")
+            .field("key", &REDACTED)
+            .field("key_hash", &self.key_hash)
+            .field("id", &self.id)
+            .field("namespace", &self.namespace)
+            .field("single_use", &self.single_use)
+            .field("purpose", &self.purpose)
+            .field("subject_name", &self.subject_name)
+            .field("expires", &self.expires)
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,6 +446,18 @@ mod tests {
                 refresh_token: "r".into(),
             },
             &json!({"grant_type": "refresh_token", "refresh_token": "r"}),
+        );
+        round_trip(
+            &TokenRequest::GithubOidc {
+                oidc_token: "j".into(),
+            },
+            &json!({"grant_type": "github_oidc", "oidc_token": "j"}),
+        );
+        round_trip(
+            &TokenRequest::ApiKey {
+                api_key: "k".into(),
+            },
+            &json!({"grant_type": "api_key", "api_key": "k"}),
         );
         assert!(serde_json::from_value::<TokenRequest>(
             json!({"grant_type": "auth_key", "auth_key": "k"})
@@ -504,5 +635,91 @@ mod tests {
             },
             &json!({"error": "invalid_grant"}),
         );
+    }
+
+    #[test]
+    fn debug_never_prints_secrets() {
+        const S: &str = "SEKRIT";
+        let tr = TokenResponse {
+            token: format!("{S}-t"),
+            expires: 1,
+            username: Some("alice".into()),
+            user_id: None,
+            refresh_token: Some(format!("{S}-r")),
+        };
+        let shown = [
+            format!(
+                "{:?}",
+                TokenRequest::Refresh {
+                    session_token: S.into()
+                }
+            ),
+            format!(
+                "{:?}",
+                TokenRequest::RefreshToken {
+                    refresh_token: S.into()
+                }
+            ),
+            format!(
+                "{:?}",
+                TokenRequest::GithubOidc {
+                    oidc_token: S.into()
+                }
+            ),
+            format!("{:?}", TokenRequest::ApiKey { api_key: S.into() }),
+            format!("{tr:?}"),
+            format!("{:?}", DevicePollResponse::Granted(tr.clone())),
+            format!(
+                "{:?}",
+                LogoutRequest {
+                    refresh_token: Some(S.into()),
+                    all: true
+                }
+            ),
+            format!(
+                "{:?}",
+                DevicePollRequest {
+                    device_secret: S.into()
+                }
+            ),
+            format!(
+                "{:?}",
+                DeviceStartResponse {
+                    device_secret: S.into(),
+                    user_code: "ABCD-1234".into(),
+                    verification_uri: "https://x/device".into(),
+                    verification_uri_complete: None,
+                    interval: 5,
+                    expires_in: 900,
+                }
+            ),
+            format!(
+                "{:?}",
+                SignupRequest {
+                    ticket: S.into(),
+                    username: "alice".into()
+                }
+            ),
+            format!(
+                "{:?}",
+                ApiKeyCreated {
+                    key: S.into(),
+                    key_hash: "h".into(),
+                    id: "i".into(),
+                    namespace: "n".into(),
+                    single_use: true,
+                    purpose: "ci".into(),
+                    subject_name: None,
+                    expires: 3,
+                }
+            ),
+        ];
+        for s in &shown {
+            assert!(!s.contains(S), "secret leaked: {s}");
+            assert!(s.contains(REDACTED), "{s}");
+        }
+        // Non-secret fields stay visible.
+        assert!(shown[4].contains("alice"));
+        assert!(shown[8].contains("ABCD-1234"));
     }
 }

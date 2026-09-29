@@ -1,8 +1,9 @@
 [workspace]
 resolver = "2"
-# forgs-http and forgs-client join this list as they land (docs/design.md §5).
+# forgs-http joins this list as it lands (docs/design.md §5).
 members = [
     "crates/forgs",
+    "crates/forgs-client",
     "crates/forgs-idp",
     "crates/forgs-store",
 ]
@@ -22,6 +23,7 @@ license = "MIT OR Apache-2.0"
 [workspace.dependencies]
 # internal
 forgs = { path = "crates/forgs" }
+forgs-client = { path = "crates/forgs-client" }
 forgs-idp = { path = "crates/forgs-idp" }
 forgs-store = { path = "crates/forgs-store" }
 
@@ -74,4 +76,6 @@ jsonwebtoken = { version = "10", default-features = false, features = ["rust_cry
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
 
 # dev / test helpers
+# Test certificates for forgs-client's pinned-TLS test; `ring`, not aws-lc.
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 tokio = { version = "1", default-features = false, features = ["macros", "rt"] }
