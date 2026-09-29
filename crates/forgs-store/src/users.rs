@@ -138,7 +138,8 @@ pub(crate) async fn check_name_free(
             "SELECT EXISTS (SELECT 1 FROM forgs_user WHERE username = ?1 AND id IS NOT ?2)
                  OR EXISTS (SELECT 1 FROM forgs_ns_node
                              WHERE parent_id IS NULL AND lower(name_canonical) = ?1
-                               AND personal_of_user_id IS NOT ?2 AND id IS NOT ?3)",
+                               AND (?2 IS NULL OR personal_of_user_id IS NOT ?2)
+                               AND id IS NOT ?3)",
         )
         .bind(&tomb)
         .bind(except_user)
@@ -562,7 +563,11 @@ impl Store {
     /// # Errors
     ///
     /// [`StoreError::NotFound`], [`StoreError::HasChildren`] if the personal
-    /// node has children, or a database error.
+    /// node has children, [`StoreError::Dangling`] if the user still owns
+    /// other (non-personal) nodes (`owner_user_id` is `ON DELETE RESTRICT`:
+    /// transfer or delete them first) or an app table still references the
+    /// user or the personal node, or a database error. Nothing is changed on
+    /// error.
     pub async fn delete_user(&self, user: UserId, now: u64) -> Result<()> {
         let user_s = user.to_string();
         let mut tx = self.begin().await?;

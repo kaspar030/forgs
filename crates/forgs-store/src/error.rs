@@ -111,6 +111,11 @@ impl From<sqlx::Error> for StoreError {
         if msg.contains("forgs: name is taken") {
             return StoreError::NameTaken;
         }
+        // `ON DELETE RESTRICT` reports as SQLITE_CONSTRAINT_TRIGGER (1811),
+        // which sqlx does not classify as a foreign-key violation.
+        if msg.contains("FOREIGN KEY constraint failed") {
+            return StoreError::Dangling;
+        }
         match db.kind() {
             sqlx::error::ErrorKind::UniqueViolation => {
                 if msg.contains("forgs_identity.") {

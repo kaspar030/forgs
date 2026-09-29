@@ -400,6 +400,67 @@ async fn usernames_and_root_nodes_share_one_name_space() {
     .unwrap();
 }
 
+/// The store's own pre-check (not the triggers or the unique index) must
+/// see non-personal root nodes: drop the backstops and check it still refuses.
+#[tokio::test]
+async fn the_root_pre_check_sees_non_personal_nodes_without_backstops() {
+    let s = store(forgefront()).await;
+    sqlx::raw_sql(
+        "DROP TRIGGER forgs_user_root_insert;
+         DROP TRIGGER forgs_user_root_update;
+         DROP TRIGGER forgs_ns_node_root_user_insert;
+         DROP TRIGGER forgs_ns_node_root_user_update;
+         DROP INDEX forgs_ns_node_root_name;",
+    )
+    .execute(s.pool())
+    .await
+    .unwrap();
+    s.create_node(None, "forge", "acme", NameOrigin::App, None, NOW)
+        .await
+        .unwrap();
+    assert!(matches!(
+        s.create_local_user("Acme", None, NOW).await,
+        Err(StoreError::NameTaken)
+    ));
+    assert!(matches!(
+        s.signup(&signup("acme", "1", None), NOW).await,
+        Err(StoreError::NameTaken)
+    ));
+    assert!(matches!(
+        s.create_node(None, "forge", "ACME", NameOrigin::App, None, NOW)
+            .await,
+        Err(StoreError::NameTaken)
+    ));
+    let (bob, _) = s.create_local_user("bob", None, NOW).await.unwrap();
+    assert!(matches!(
+        s.rename_user(bob, "acme", NOW).await,
+        Err(StoreError::NameTaken)
+    ));
+    let other = s
+        .create_node(None, "forge", "other", NameOrigin::App, None, NOW)
+        .await
+        .unwrap();
+    assert!(matches!(
+        s.rename_node(other, "acme", NameOrigin::App, NOW).await,
+        Err(StoreError::NameTaken)
+    ));
+    assert_eq!(count(&s, "forgs_user").await, 1);
+    assert_eq!(count(&s, "forgs_ns_node").await, 3); // acme, bob, other
+}
+
+#[tokio::test]
+async fn delete_user_refuses_while_they_own_other_nodes() {
+    let s = store(fleet()).await;
+    let (alice, _) = s.create_local_user("alice", None, NOW).await.unwrap();
+    s.create_node(None, "org", "team", NameOrigin::User, Some(alice), NOW)
+        .await
+        .unwrap();
+    let r = s.delete_user(alice, NOW).await;
+    assert!(matches!(r, Err(StoreError::Dangling)), "{r:?}");
+    assert!(s.user_by_id(alice).await.unwrap().is_some());
+    assert_eq!(count(&s, "forgs_ns_tombstone").await, 0);
+}
+
 #[tokio::test]
 async fn app_created_root_nodes_block_usernames() {
     let s = store(forgefront()).await;
