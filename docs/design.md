@@ -169,10 +169,15 @@ membership { ns_node_id, subject (user | team), role }
 
 - Renaming a node or username changes its path. Every stored reference is an id,
   so grants and memberships survive.
-- **Name reuse cool-down** (configurable, default 90 days): a released name
-  stays in a `ns_tombstone` table before anyone else may claim it. Otherwise,
-  renaming lets someone squat the old path and receive traffic (the same class
-  of issue as GitHub login reuse). Optional redirects from tombstones.
+- **Released names are blocked forever** (decided, for now): a released name
+  goes into `forgs_ns_tombstone` and can never be claimed again, by anyone,
+  including its previous holder. Otherwise renaming lets someone squat the old
+  path and receive traffic (the same class of issue as GitHub login reuse).
+  The tombstone keeps the old node id, so a redirect from the old path can be
+  added later without a schema change. Relaxing this to a cool-down is a
+  config change, not a redesign.
+- Teams are deferred (decided). The `membership.subject` column is already
+  typed so that adding team subjects later is additive.
 
 ## 3. Principals and credentials
 
@@ -219,11 +224,21 @@ user_email{ user_id, email UNIQUE (canonical), verified_at, primary }
 - **The key is `(provider, immutable provider_subject)`**, which for GitHub is
   the numeric id. It is never the email, and never the login. This preserves
   fleet's takeover defence: emails and logins both get reassigned.
-- The GitHub IdP requests the `read:user user:email` scopes and reads
-  `GET /user/emails`, then takes the `primary && verified` address. With no
-  verified email, login is refused and the error says so. The GitHub login is
-  offered only as a **suggestion** for the username field, never as an
+- **Providers (decided): GitHub, Codeberg/Forgejo, GitLab, and generic OIDC.**
+  Only external login exists: no passwords, no magic links. Admin-created
+  local users (no identity row) exist only for bootstrapping and tests.
+- The provider layer is therefore **OAuth2 + OIDC-first**, with GitHub as the
+  adapter. Forgejo/Codeberg and GitLab are OIDC providers (discovery,
+  `id_token`, `email_verified` claim). GitHub is OAuth2-only: it requests
+  `read:user user:email`, reads `GET /user/emails` and takes the
+  `primary && verified` address. Each provider maps to one `ExternalIdentity
+  { provider, subject, email, email_verified, suggested_username }`. With no
+  verified email, login is refused and the error says so. The provider login
+  is offered only as a **suggestion** for the username field, never as an
   identifier.
+- A provider instance is **configured**, not hardcoded: `provider` is the
+  configured instance name (`github`, `codeberg`, `gitlab-work`), so two
+  Forgejo instances are two providers and their subject ids never mix.
 - The GitHub access token is still spent once and never stored (unchanged).
   Apps that need a long-lived GitHub credential, as forgefront does, manage it
   themselves, separately from login.
@@ -254,18 +269,28 @@ IdP callback / device poll  →  identity known?
 - `coordinator user-token` (fleet's second id scheme) becomes "create a local
   user with username X" through the same code path, without an identity row.
 
+### CLI login is forgs' own device flow
+
+Not every provider has an RFC 8628 device flow (GitHub and GitLab do; Forgejo
+does not). Fleet currently brokers GitHub's. Instead, **forgs is itself the
+device authorization server**, reusing the pending-approval machine:
+
+```
+CLI  POST /auth/device/start → { device_secret, user_code, verification_uri }
+user opens verification_uri in a browser → logs in with ANY provider (auth-code
+     flow, incl. first-login username choice) → confirms the user code
+CLI  POST /auth/device/poll { device_secret } → pending | session + refresh
+```
+
+This makes CLI login provider-agnostic, and the username choice happens in
+the browser only. `DevicePoll::NeedsUsername` is gone. The one
+extra requirement is that forgs must have a browser-reachable `public_url`.
+
 ### Migrating fleet
 
-Existing `gh-<n>` users keep their user id. Ulid is the scheme for new rows,
-and the id is opaque either way, so nothing needs rewriting. The migration:
-
-- backfills `identity(github, n)`;
-- sets `username` to the old sanitised slug;
-- marks users `username_confirmed = false` so that the next login offers a rename;
-- **moves the personal org to a new id** (or keeps `gh-<n>` as the node id: opaque
-  is opaque). Keeping it is cheaper, since node ids like `gh-1/rpi-1` are baked
-  into board refs. Recommendation: keep the ids and change only the displayed
-  names.
+There is none (decided): fleet has one test user, and its DB is wiped. fleet
+switches to forgs **in one step**, with a fresh schema. Token prefixes need
+not stay compatible, although the brand stays configurable.
 
 ## 5. Crate layout (proposal)
 
@@ -284,27 +309,19 @@ forgs-client     HTTP client for login/refresh/logout/keys + CLI flow helpers
 These carry over fleet's pure-Rust / `ring` / `default-features = false`
 discipline. `forgs-client` must not pull axum or sqlx.
 
-**Migrations in a shared DB**: apps need foreign keys into `user` and
-`ns_node`, so forgs tables live in the app's SQLite file. They are prefixed
-`forgs_` to avoid collisions. forgs ships `forgs_store::migrate(&pool)` with
-its own migration list, and apps run it before their own. Open detail: sqlx 0.8
-has one `_sqlx_migrations` table, so either the two migrators use disjoint
-version ranges with `ignore_missing`, or forgs keeps its own
-`forgs_schema_version` table.
+**Migrations in a shared DB**: apps need foreign keys into `forgs_user` and
+`forgs_ns_node`, so forgs tables live in the app's SQLite file, **all prefixed
+`forgs_`** (decided). forgs keeps its own `forgs_schema_version` table and
+applies its own migrations in `forgs_store::migrate(&pool)`, independently
+of sqlx's `_sqlx_migrations`. Apps call it before running their own
+migrator.
 
-## 6. Open questions
+## 6. Decisions log
 
-1. **Table naming vs fleet compatibility**: rename fleet's `org`, `user`,
-   `member` and related tables to `forgs_*` in a fleet migration, or let forgs
-   use unprefixed names? Recommendation: prefix, with a one-off fleet migration.
-2. **Other IdPs soon?** (Codeberg/Forgejo OAuth, generic OIDC login.) This
-   affects whether `IdentityProvider` is generic OIDC-first or GitHub-first.
-3. **Should password or email-magic-link login exist at all**, or only
-   external IdPs? The sketch assumes IdP-only, plus admin-created local users.
-4. **Teams in v1 or later?**
-5. **Rename policy**: allowed at all? Cool-down length? Redirects?
-6. **One repo or several crates published separately?** The layout above is a
-   workspace in this repo, and fleet consumes it via git/path deps at first.
-7. **Where does the fleet cut happen**: fleet switches to depending on forgs
-   crate by crate (tokens → verify → store → http), each step green. Or one
-   big switch?
+1. Tables prefixed `forgs_`; fleet has a fresh schema and its DB is wiped.
+2. Providers: GitHub, Codeberg/Forgejo, GitLab, and generic OIDC.
+3. External login only.
+4. Teams later.
+5. Renames allowed; released names blocked forever.
+6. One workspace in this repo. fleet consumes it via a path/git dependency
+   and switches in one step, after forgs' initial version is done.
