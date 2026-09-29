@@ -10,14 +10,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use forgs::TokenFormat;
+use async_trait::async_trait;
+use forgs::store::{
+    ApiKeyRecord, AppRecord, DeviceSecretRecord, RefreshRecord, SessionRecord, WorkloadRecord,
+};
+use forgs::{AppKind, TokenFormat, TokenHash, TokenStore};
 use forgs_idp::{IdentityProvider, WorkloadIssuer};
 use forgs_store::Store;
 use hmac::{Hmac, Mac as _};
 use sha2::Sha256;
 
 use crate::audit::{AuditSink, StoreAuditSink};
-use crate::hooks::{ApiKeyPurposes, NoPendingApprovals, PendingApprovalHook, StaticPurposes};
+use crate::hooks::{
+    ApiKeyPurposes, AppTokenLookup, NoPendingApprovals, PendingApprovalHook, StaticPurposes,
+};
 
 /// A source of "now", in epoch seconds.
 pub trait Clock: Send + Sync {
@@ -244,6 +250,7 @@ pub(crate) struct Inner {
     pub(crate) audit: Arc<dyn AuditSink>,
     pub(crate) purposes: Arc<dyn ApiKeyPurposes>,
     pub(crate) approvals: Arc<dyn PendingApprovalHook>,
+    pub(crate) app_tokens: Option<Arc<dyn AppTokenLookup>>,
     pub(crate) post_login_redirect: String,
     pub(crate) max_pending_devices: u64,
     /// Last poll time per device-secret hash, for `slow_down`.
@@ -296,6 +303,7 @@ impl AuthContext {
             audit: None,
             purposes: Arc::new(StaticPurposes::default()),
             approvals: Arc::new(NoPendingApprovals),
+            app_tokens: None,
             post_login_redirect: "/".to_owned(),
             max_pending_devices: 1024,
         }
@@ -399,6 +407,15 @@ impl AuthContext {
         &self.inner.post_login_redirect
     }
 
+    /// The credential lookup every authentication goes through: the store for
+    /// core kinds, the [`AppTokenLookup`] hook (if any) for app kinds.
+    pub(crate) fn token_store(&self) -> CtxTokenStore<'_> {
+        CtxTokenStore {
+            store: &self.inner.store,
+            apps: self.inner.app_tokens.as_deref(),
+        }
+    }
+
     pub(crate) fn keys(&self) -> &CsrfKey {
         &self.inner.keys
     }
@@ -450,6 +467,7 @@ pub struct AuthContextBuilder {
     audit: Option<Arc<dyn AuditSink>>,
     purposes: Arc<dyn ApiKeyPurposes>,
     approvals: Arc<dyn PendingApprovalHook>,
+    app_tokens: Option<Arc<dyn AppTokenLookup>>,
     post_login_redirect: String,
     max_pending_devices: u64,
 }
@@ -557,6 +575,14 @@ impl AuthContextBuilder {
         self
     }
 
+    /// The lookup for the app's own connection token kinds (default: none,
+    /// so every app token is an unknown credential).
+    #[must_use]
+    pub fn app_tokens(mut self, lookup: Arc<dyn AppTokenLookup>) -> Self {
+        self.app_tokens = Some(lookup);
+        self
+    }
+
     /// Where a browser lands after login by default (`/`).
     #[must_use]
     pub fn post_login_redirect(mut self, path: &str) -> Self {
@@ -642,11 +668,59 @@ impl AuthContextBuilder {
                 audit,
                 purposes: self.purposes,
                 approvals: self.approvals,
+                app_tokens: self.app_tokens,
                 post_login_redirect: self.post_login_redirect,
                 max_pending_devices: self.max_pending_devices,
                 poll_log: Mutex::new(HashMap::new()),
             }),
         })
+    }
+}
+
+/// [`TokenStore`] over the context: every core lookup delegates to the
+/// [`Store`], app kinds go to the [`AppTokenLookup`] hook (or are unknown).
+pub(crate) struct CtxTokenStore<'a> {
+    store: &'a Store,
+    apps: Option<&'a dyn AppTokenLookup>,
+}
+
+#[async_trait]
+impl TokenStore for CtxTokenStore<'_> {
+    async fn lookup_session(&self, hash: &TokenHash) -> Result<Option<SessionRecord>, String> {
+        self.store.lookup_session(hash).await
+    }
+
+    async fn lookup_refresh_token(
+        &self,
+        hash: &TokenHash,
+    ) -> Result<Option<RefreshRecord>, String> {
+        self.store.lookup_refresh_token(hash).await
+    }
+
+    async fn lookup_api_key(&self, hash: &TokenHash) -> Result<Option<ApiKeyRecord>, String> {
+        self.store.lookup_api_key(hash).await
+    }
+
+    async fn lookup_workload(&self, hash: &TokenHash) -> Result<Option<WorkloadRecord>, String> {
+        self.store.lookup_workload(hash).await
+    }
+
+    async fn lookup_device_secret(
+        &self,
+        hash: &TokenHash,
+    ) -> Result<Option<DeviceSecretRecord>, String> {
+        self.store.lookup_device_secret(hash).await
+    }
+
+    async fn lookup_app(
+        &self,
+        kind: AppKind,
+        hash: &TokenHash,
+    ) -> Result<Option<AppRecord>, String> {
+        match self.apps {
+            Some(apps) => apps.lookup_app(kind, hash).await,
+            None => Ok(None),
+        }
     }
 }
 

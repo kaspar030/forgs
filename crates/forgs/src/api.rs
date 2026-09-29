@@ -245,6 +245,12 @@ pub enum ApiKeyRequest {
         /// derived from the key itself.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         subject_name: Option<String>,
+        /// App data the key carries (fleet: the tags stamped onto an
+        /// enrolled node, a CI key's ops). Validated and canonicalised by the
+        /// app's purpose policy; a server that knows no payload for the
+        /// purpose refuses a non-null one with `400`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        payload: Option<serde_json::Value>,
     },
     /// List a namespace's keys (hashes only).
     List {
@@ -280,6 +286,9 @@ pub struct ApiKeyCreated {
     /// that **ignored** the field from one that honoured it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject_name: Option<String>,
+    /// The payload as stored (the app's canonical form), if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<serde_json::Value>,
     /// Expiry (epoch seconds). Always set on this path.
     pub expires: u64,
 }
@@ -299,6 +308,9 @@ pub struct ApiKeyInfo {
     /// identity**, so revoking any of them affects that identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject_name: Option<String>,
+    /// The payload the key carries, if any. Not a secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<serde_json::Value>,
     /// Expiry (epoch seconds), or `None` for a key that never expires.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires: Option<u64>,
@@ -539,6 +551,7 @@ impl std::fmt::Debug for ApiKeyCreated {
             .field("single_use", &self.single_use)
             .field("purpose", &self.purpose)
             .field("subject_name", &self.subject_name)
+            .field("payload", &self.payload)
             .field("expires", &self.expires)
             .finish()
     }
@@ -681,9 +694,23 @@ mod tests {
                 multi_use: false,
                 purpose: "ci".into(),
                 subject_name: Some("builder".into()),
+                payload: None,
             },
             &json!({"action": "create", "namespace": "acme", "ttl_secs": 60,
                     "multi_use": false, "purpose": "ci", "subject_name": "builder"}),
+        );
+        round_trip(
+            &ApiKeyRequest::Create {
+                namespace: "acme".into(),
+                ttl_secs: 60,
+                multi_use: true,
+                purpose: "node".into(),
+                subject_name: None,
+                payload: Some(json!({"tags": ["a", "b"]})),
+            },
+            &json!({"action": "create", "namespace": "acme", "ttl_secs": 60,
+                    "multi_use": true, "purpose": "node",
+                    "payload": {"tags": ["a", "b"]}}),
         );
         let c: ApiKeyRequest = serde_json::from_value(
             json!({"action": "create", "namespace": "a", "ttl_secs": 1, "purpose": "ci"}),
@@ -694,6 +721,7 @@ mod tests {
             ApiKeyRequest::Create {
                 multi_use: false,
                 subject_name: None,
+                payload: None,
                 ..
             }
         ));
@@ -720,17 +748,25 @@ mod tests {
             single_use: true,
             purpose: "ci".into(),
             subject_name: None,
+            payload: None,
             expires: Some(9),
             consumed_at: None,
             created_at: 1,
             created_by: None,
         };
+        let with_payload = ApiKeyInfo {
+            payload: Some(json!(["x"])),
+            ..info.clone()
+        };
         round_trip(
             &ApiKeyList {
                 namespace: "n".into(),
-                keys: vec![info],
+                keys: vec![info, with_payload],
             },
-            &json!({"namespace": "n", "keys": [{"id": "01J", "key_hash": "ab",
+            &json!({"namespace": "n", "keys": [
+                {"id": "01J", "key_hash": "ab",
+                    "single_use": true, "purpose": "ci", "expires": 9, "created_at": 1},
+                {"id": "01J", "key_hash": "ab", "payload": ["x"],
                     "single_use": true, "purpose": "ci", "expires": 9, "created_at": 1}]}),
         );
         round_trip(
@@ -742,10 +778,27 @@ mod tests {
                 single_use: false,
                 purpose: "ci".into(),
                 subject_name: None,
+                payload: None,
                 expires: 3,
             },
             &json!({"key": "k", "key_hash": "h", "id": "i", "namespace": "n",
                     "single_use": false, "purpose": "ci", "expires": 3}),
+        );
+        round_trip(
+            &ApiKeyCreated {
+                key: "k".into(),
+                key_hash: "h".into(),
+                id: "i".into(),
+                namespace: "n".into(),
+                single_use: false,
+                purpose: "node".into(),
+                subject_name: None,
+                payload: Some(json!({"tags": ["a"]})),
+                expires: 3,
+            },
+            &json!({"key": "k", "key_hash": "h", "id": "i", "namespace": "n",
+                    "single_use": false, "purpose": "node",
+                    "payload": {"tags": ["a"]}, "expires": 3}),
         );
         round_trip(
             &ApiKeyRevoked {
@@ -900,6 +953,7 @@ mod tests {
                     single_use: true,
                     purpose: "ci".into(),
                     subject_name: None,
+                    payload: None,
                     expires: 3,
                 }
             ),

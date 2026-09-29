@@ -4,6 +4,7 @@
 #![allow(clippy::too_many_lines, clippy::similar_names)]
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -12,10 +13,12 @@ use axum::http::{header, Method, Request, StatusCode};
 use axum::routing::{get, post};
 use axum::Router;
 use forgs::schema::{KindSpec, Schema};
-use forgs::{RoleLadder, SubjectKey, TokenHash};
+use forgs::store::AppRecord;
+use forgs::{AppKind, RoleLadder, SubjectKey, TokenFormat, TokenHash, TokenKind, TokenUse};
 use forgs_http::{
-    ApiCookie, AuditEvent, AuditSink, AuthContext, Authenticated, FixedClock, PurposeKind,
-    SessionOnly, StaticPurposes,
+    AllowedKinds, AnyConnection, ApiCookie, ApiError, ApiKeyPurposes, AppTokenLookup, AuditEvent,
+    AuditSink, AuthContext, Authenticated, FixedClock, HeaderOnly, PurposeKind, SessionOnly,
+    StaticPurposes,
 };
 use forgs_idp::oidc::OidcError;
 use forgs_idp::workload::{WorkloadClaims, WorkloadIdentity};
@@ -151,6 +154,63 @@ impl Collect {
     }
 }
 
+/// The app's node tokens, keyed by hash; counts lookups.
+#[derive(Default)]
+struct NodeTokens {
+    rows: Mutex<HashMap<String, AppRecord>>,
+    lookups: AtomicUsize,
+    broken: AtomicBool,
+}
+
+#[async_trait]
+impl AppTokenLookup for NodeTokens {
+    async fn lookup_app(
+        &self,
+        kind: AppKind,
+        hash: &TokenHash,
+    ) -> Result<Option<AppRecord>, String> {
+        self.lookups.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(kind.label(), "node", "only connection kinds are looked up");
+        if self.broken.load(Ordering::SeqCst) {
+            return Err("disk on fire".into());
+        }
+        Ok(self.rows.lock().unwrap().get(hash.as_str()).cloned())
+    }
+}
+
+/// `ci`/`node` purposes; `node` keys carry `{"tags": [..]}`, stored sorted.
+struct TestPurposes(StaticPurposes);
+
+#[async_trait]
+impl ApiKeyPurposes for TestPurposes {
+    fn kind(&self, purpose: &str) -> Option<PurposeKind> {
+        self.0.kind(purpose)
+    }
+
+    fn check_payload(
+        &self,
+        purpose: &str,
+        payload: Option<&Value>,
+    ) -> Result<Option<String>, ApiError> {
+        match (purpose, payload) {
+            (_, None | Some(Value::Null)) => Ok(None),
+            ("node", Some(p)) => {
+                let mut tags: Vec<String> = p
+                    .get("tags")
+                    .and_then(Value::as_array)
+                    .ok_or(ApiError::BadRequest)?
+                    .iter()
+                    .map(|t| t.as_str().map(str::to_owned).ok_or(ApiError::BadRequest))
+                    .collect::<Result<_, _>>()?;
+                tags.sort();
+                tags.dedup();
+                Ok(Some(json!({ "tags": tags }).to_string()))
+            }
+            _ => Err(ApiError::BadRequest),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------
@@ -162,6 +222,9 @@ struct H {
     idp: Arc<StubIdp>,
     idp2: Arc<StubIdp>,
     audit: Arc<Collect>,
+    nodes: Arc<NodeTokens>,
+    node: AppKind,
+    node_device: AppKind,
 }
 
 struct Resp {
@@ -239,6 +302,32 @@ async fn app_me(auth: Authenticated<SessionOnly, ApiCookie>) -> String {
     auth.subject.key().to_string()
 }
 
+/// Brand `frg` (cookie names unchanged) plus fleet-like app kinds.
+fn test_format() -> (TokenFormat, AppKind, AppKind) {
+    let mut b = TokenFormat::builder("frg");
+    let node = b.app_kind("node", "n", TokenUse::Connection);
+    let node_device = b.app_kind("node_device", "nd", TokenUse::RedeemOnly);
+    (b.build().unwrap(), node, node_device)
+}
+
+struct NodeOnly;
+
+impl AllowedKinds for NodeOnly {
+    fn allowed(ctx: &AuthContext) -> Vec<TokenKind> {
+        vec![TokenKind::App(ctx.format().app_kind("node").unwrap())]
+    }
+}
+
+/// An app route only a node token reaches.
+async fn app_node(auth: Authenticated<NodeOnly, HeaderOnly>) -> String {
+    auth.subject.key().to_string()
+}
+
+/// An app route any connection credential reaches.
+async fn app_any(auth: Authenticated<AnyConnection, HeaderOnly>) -> String {
+    auth.subject.key().to_string()
+}
+
 async fn harness_with(issuer: bool) -> H {
     let store = Store::connect_in_memory(schema(), RoleLadder::new(&["member", "admin"]).unwrap())
         .await
@@ -247,17 +336,21 @@ async fn harness_with(issuer: bool) -> H {
     let idp = StubIdp::new("stub");
     let idp2 = StubIdp::new("stub2");
     let audit = Arc::new(Collect::default());
+    let nodes = Arc::new(NodeTokens::default());
+    let (format, node, node_device) = test_format();
     let mut b = AuthContext::builder(store, &format!("{PUBLIC}/"), &[42; 32])
         .app_label("test")
+        .format(format)
+        .app_tokens(nodes.clone())
         .clock(clock.clone())
         .provider(idp.clone())
         .provider(idp2.clone())
         .audit(audit.clone())
-        .api_key_purposes(Arc::new(
+        .api_key_purposes(Arc::new(TestPurposes(
             StaticPurposes::new()
                 .with("ci", PurposeKind::Workload)
                 .with("node", PurposeKind::App),
-        ));
+        )));
     if issuer {
         b = b.workload_issuer(Arc::new(StubIssuer));
     }
@@ -265,6 +358,8 @@ async fn harness_with(issuer: bool) -> H {
     let app = forgs_http::router::<AuthContext>()
         .route("/api/me", get(app_me).post(app_me))
         .route("/other/me", post(app_me))
+        .route("/api/node", get(app_node))
+        .route("/api/any", get(app_any))
         .with_state(ctx.clone());
     H {
         app,
@@ -273,6 +368,9 @@ async fn harness_with(issuer: bool) -> H {
         idp,
         idp2,
         audit,
+        nodes,
+        node,
+        node_device,
     }
 }
 
@@ -1595,4 +1693,244 @@ async fn config_is_validated() {
         ctx.redirect_uri("github"),
         format!("{PUBLIC}/sso/auth/github/callback")
     );
+}
+
+#[tokio::test]
+async fn app_connection_kinds_authenticate_through_the_hook() {
+    let h = harness().await;
+    let session = H::session(&h.signup("a", "1", "a@x.example", "alice").await);
+    let get = |uri: &'static str, t: String| {
+        let h = &h;
+        async move {
+            h.get(uri, None, &[("authorization", &format!("Bearer {t}"))])
+                .await
+        }
+    };
+    let subject = SubjectKey::new(Some("ns1"), forgs::SubjectKind::App("node"), "n1").unwrap();
+    let token = h.ctx.format().mint(TokenKind::App(h.node));
+    h.nodes.rows.lock().unwrap().insert(
+        token.hash().as_str().to_owned(),
+        AppRecord {
+            subject: subject.clone(),
+            expires: None,
+            issued_at: Some(NOW),
+        },
+    );
+    let node = token.to_secret_string();
+
+    // Known node token: the app route and an AnyConnection route accept it,
+    // speaking as the record's subject.
+    let r = get("/api/node", node.clone()).await;
+    r.expect(StatusCode::OK);
+    assert_eq!(r.text(), subject.to_string());
+    get("/api/any", node.clone()).await.expect(StatusCode::OK);
+    // Fenced per route: SessionOnly routes refuse it with 403.
+    get("/api/me", node.clone())
+        .await
+        .expect(StatusCode::FORBIDDEN);
+    // `/auth/session` answers any connection kind with its subject.
+    assert_eq!(h.whoami(&node).await.json()["subject"], subject.to_string());
+    h.post_json(
+        "/auth/keys",
+        Some(&node),
+        None,
+        &[],
+        &json!({"action": "list", "namespace": "alice"}),
+    )
+    .await
+    .expect(StatusCode::FORBIDDEN);
+    // And a session is not a node.
+    get("/api/node", session.clone())
+        .await
+        .expect(StatusCode::FORBIDDEN);
+    get("/api/any", session.clone())
+        .await
+        .expect(StatusCode::OK);
+    // A node token cannot refresh a session.
+    let r = h
+        .post_json(
+            "/auth/token",
+            None,
+            None,
+            &[],
+            &json!({"grant_type": "refresh", "session_token": node}),
+        )
+        .await;
+    r.expect(StatusCode::UNAUTHORIZED);
+    assert_eq!(r.error(), "invalid_grant");
+
+    // Unknown, expired, revoked and a failing lookup: the uniform 401.
+    let mut bodies = Vec::new();
+    let unknown = h
+        .ctx
+        .format()
+        .mint(TokenKind::App(h.node))
+        .to_secret_string();
+    let r = get("/api/node", unknown).await;
+    r.expect(StatusCode::UNAUTHORIZED);
+    bodies.push(r.body.clone());
+
+    let expired = h.ctx.format().mint(TokenKind::App(h.node));
+    h.nodes.rows.lock().unwrap().insert(
+        expired.hash().as_str().to_owned(),
+        AppRecord {
+            subject: subject.clone(),
+            expires: Some(NOW),
+            issued_at: None,
+        },
+    );
+    let r = get("/api/node", expired.to_secret_string()).await;
+    r.expect(StatusCode::UNAUTHORIZED);
+    bodies.push(r.body.clone());
+    assert!(h.audit.has("auth.reject.expired"));
+
+    h.nodes.broken.store(true, Ordering::SeqCst);
+    let r = get("/api/node", node.clone()).await;
+    r.expect(StatusCode::UNAUTHORIZED);
+    bodies.push(r.body.clone());
+    h.nodes.broken.store(false, Ordering::SeqCst);
+
+    h.nodes.rows.lock().unwrap().remove(token.hash().as_str());
+    let r = get("/api/node", node.clone()).await;
+    r.expect(StatusCode::UNAUTHORIZED);
+    bodies.push(r.body.clone());
+    let r = get("/api/node", "garbage".to_owned()).await;
+    bodies.push(r.body.clone());
+    assert!(bodies.windows(2).all(|w| w[0] == w[1]), "{bodies:?}");
+    assert_eq!(bodies[0], br#"{"error":"unauthorized"}"#);
+
+    // A redeem-only app kind is refused from its prefix: no lookup at all.
+    let before = h.nodes.lookups.load(Ordering::SeqCst);
+    let device = h
+        .ctx
+        .format()
+        .mint(TokenKind::App(h.node_device))
+        .to_secret_string();
+    get("/api/node", device.clone())
+        .await
+        .expect(StatusCode::FORBIDDEN);
+    get("/api/any", device).await.expect(StatusCode::FORBIDDEN);
+    assert_eq!(h.nodes.lookups.load(Ordering::SeqCst), before);
+}
+
+#[tokio::test]
+async fn app_tokens_are_unknown_without_a_hook() {
+    let store = Store::connect_in_memory(schema(), RoleLadder::new(&["member", "admin"]).unwrap())
+        .await
+        .unwrap();
+    let (format, node, _) = test_format();
+    let ctx = AuthContext::builder(store, PUBLIC, &[42; 32])
+        .format(format)
+        .clock(Arc::new(FixedClock::new(NOW)))
+        .build()
+        .unwrap();
+    let t = ctx.format().mint(TokenKind::App(node)).to_secret_string();
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        header::AUTHORIZATION,
+        format!("Bearer {t}").parse().unwrap(),
+    );
+    let allowed = [TokenKind::App(node)];
+    let r = forgs_http::authenticate_request(
+        &ctx,
+        &headers,
+        "/api/node",
+        &allowed,
+        forgs_http::Carrier::Header,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn api_key_payloads_are_validated_canonicalised_and_listed() {
+    let h = harness().await;
+    let alice = H::session(&h.signup("a", "1", "a@x.example", "alice").await);
+    let keys = |body: Value| {
+        let h = &h;
+        let t = alice.clone();
+        async move { h.post_json("/auth/keys", Some(&t), None, &[], &body).await }
+    };
+    let create = |purpose: &str, payload: Value| {
+        json!({"action": "create", "namespace": "alice", "ttl_secs": 60,
+               "purpose": purpose, "payload": payload})
+    };
+    // `ci` knows no payload; `null` is the same as absent.
+    keys(create("ci", json!({"ops": ["x"]})))
+        .await
+        .expect(StatusCode::BAD_REQUEST);
+    let plain = keys(create("ci", Value::Null)).await;
+    plain.expect(StatusCode::OK);
+    assert!(plain.json().get("payload").is_none());
+    // The hook refuses a bad shape.
+    keys(create("node", json!({"tags": [1]})))
+        .await
+        .expect(StatusCode::BAD_REQUEST);
+    // And canonicalises a good one.
+    let r = keys(create("node", json!({"tags": ["b", "a", "b"]}))).await;
+    r.expect(StatusCode::OK);
+    let created = r.json();
+    assert_eq!(created["payload"], json!({"tags": ["a", "b"]}));
+    let hash = created["key_hash"].as_str().unwrap().to_owned();
+
+    let list = keys(json!({"action": "list", "namespace": "alice"}))
+        .await
+        .json();
+    let row = list["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|k| k["key_hash"] == hash)
+        .unwrap();
+    assert_eq!(row["payload"], json!({"tags": ["a", "b"]}));
+
+    let ns = h
+        .ctx
+        .store()
+        .node_by_path(&["alice"])
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    let stored = h
+        .ctx
+        .store()
+        .scoped(ns)
+        .list_api_keys()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|k| k.key_hash.as_str() == hash)
+        .unwrap();
+    assert_eq!(stored.payload.as_deref(), Some(r#"{"tags":["a","b"]}"#));
+
+    // A shell-minted key with a non-JSON payload is listed without one.
+    h.ctx
+        .store()
+        .scoped(ns)
+        .insert_api_key(
+            &NewApiKey {
+                hash: TokenHash::from_hex("ab".repeat(32)),
+                purpose: "node".into(),
+                subject_name: None,
+                payload: Some("not json".into()),
+                single_use: true,
+                expires: None,
+                created_by: None,
+            },
+            NOW,
+        )
+        .await
+        .unwrap();
+    let list = keys(json!({"action": "list", "namespace": "alice"}))
+        .await
+        .json();
+    let odd = list["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|k| k["key_hash"] == "ab".repeat(32))
+        .unwrap();
+    assert!(odd.get("payload").is_none());
 }

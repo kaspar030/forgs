@@ -115,7 +115,8 @@ pub async fn refresh_session(
     session_token: &str,
 ) -> Result<TokenResponse, ApiError> {
     let now = ctx.now();
-    let auth = match forgs::authenticate(ctx.format(), ctx.store(), session_token, now).await {
+    let auth = match forgs::authenticate(ctx.format(), &ctx.token_store(), session_token, now).await
+    {
         Ok(a) if a.kind == TokenKind::Session => a,
         Ok(a) => {
             ctx.audit()

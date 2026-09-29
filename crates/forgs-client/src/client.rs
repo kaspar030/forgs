@@ -1,4 +1,6 @@
-//! [`ForgsClient`]: one method per `/auth/*` route.
+//! [`ForgsClient`]: one method per `/auth/*` route, plus
+//! [`ForgsClient::post_json`] / [`ForgsClient::post`] for the app's own routes
+//! over the same trust path.
 
 use std::time::Duration;
 
@@ -8,7 +10,8 @@ use serde::Serialize;
 
 use forgs::api::{
     ApiKeyCreated, ApiKeyList, ApiKeyRequest, ApiKeyRevoked, DevicePollRequest, DevicePollResponse,
-    DeviceStartRequest, DeviceStartResponse, LogoutRequest, TokenRequest, TokenResponse,
+    DeviceStartRequest, DeviceStartResponse, LogoutRequest, MemberList, MembersRequest,
+    RenameRequest, TokenRequest, TokenResponse,
 };
 
 use crate::error::ClientError;
@@ -37,7 +40,7 @@ impl std::fmt::Debug for ForgsClient {
 }
 
 /// What to mint in [`ForgsClient::create_api_key`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ApiKeySpec {
     /// The namespace (id or path) the key is scoped to.
     pub namespace: String,
@@ -49,6 +52,10 @@ pub struct ApiKeySpec {
     pub purpose: String,
     /// A stable identity name that survives rotation.
     pub subject_name: Option<String>,
+    /// App data the key carries (fleet: a node key's tags). The server's
+    /// purpose policy validates and canonicalises it; a purpose that takes
+    /// none refuses a non-null payload with `400`.
+    pub payload: Option<serde_json::Value>,
 }
 
 impl ForgsClient {
@@ -83,13 +90,39 @@ impl ForgsClient {
         &self.base
     }
 
+    /// `{base}{route}`. `route` must be an absolute path (`/...`): anything
+    /// else could splice into the authority (`"@evil/x"`, `"evil.example/x"`)
+    /// and send the request — and its bearer — to a host the pin was never
+    /// meant for.
     fn route(&self, route: &str) -> Result<http::Uri, ClientError> {
+        if !route.starts_with('/')
+            || route.contains("://")
+            || route.contains('#')
+            || route.bytes().any(|b| b.is_ascii_control() || b == b' ')
+        {
+            return Err(ClientError::Url(format!(
+                "route must be an absolute path: {route:?}"
+            )));
+        }
         format!("{}{route}", self.base)
             .parse()
             .map_err(|e: http::uri::InvalidUri| ClientError::Url(e.to_string()))
     }
 
-    async fn post_raw<Q: Serialize>(
+    /// `POST` JSON to `route` (relative to the base URL, starting with `/`)
+    /// and return the raw response body — for an app route answering `204`
+    /// or a non-JSON body.
+    ///
+    /// This is the same path every `/auth/*` call takes: the same connector
+    /// and TLS configuration (so a pin covers app routes too), the same
+    /// timeout and response-size cap. `bearer`, if any, is sent **only** as
+    /// an `Authorization: Bearer` header, never in the URL or body.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Url`] for a route that is not an absolute path (nothing
+    /// is sent); otherwise as [`ForgsClient::exchange`].
+    pub async fn post<Q: Serialize>(
         &self,
         route: &str,
         bearer: Option<&Secret>,
@@ -110,13 +143,21 @@ impl ForgsClient {
         .await
     }
 
-    async fn post_json<Q: Serialize, R: DeserializeOwned>(
+    /// `POST` JSON to `route` and decode a JSON response. See
+    /// [`ForgsClient::post`] for the trust path and the `route` rules; this is
+    /// how an app calls its own JSON routes (fleet: node enrollment).
+    ///
+    /// # Errors
+    ///
+    /// As [`ForgsClient::post`], plus [`ClientError::Malformed`] for a body
+    /// that does not decode as `R`.
+    pub async fn post_json<Q: Serialize, R: DeserializeOwned>(
         &self,
         route: &str,
         bearer: Option<&Secret>,
         request: &Q,
     ) -> Result<R, ClientError> {
-        let bytes = self.post_raw(route, bearer, request).await?;
+        let bytes = self.post(route, bearer, request).await?;
         serde_json::from_slice(&bytes).map_err(|e| ClientError::malformed(route, &e))
     }
 
@@ -237,7 +278,7 @@ impl ForgsClient {
         refresh_token: Option<&str>,
         all: bool,
     ) -> Result<(), ClientError> {
-        self.post_raw(
+        self.post(
             "/auth/logout",
             Some(&Secret::from(session_token)),
             &LogoutRequest {
@@ -292,7 +333,8 @@ impl ForgsClient {
     /// # Errors
     ///
     /// As [`ForgsClient::exchange`]: a non-member is `403 forbidden`, a zero
-    /// or over-cap TTL or unknown purpose `400 invalid_request`.
+    /// or over-cap TTL, unknown purpose or refused payload
+    /// `400 invalid_request`.
     pub async fn create_api_key(
         &self,
         session_token: &str,
@@ -306,6 +348,7 @@ impl ForgsClient {
                 multi_use: spec.multi_use,
                 purpose: spec.purpose.clone(),
                 subject_name: spec.subject_name.clone(),
+                payload: spec.payload.clone(),
             },
         )
         .await
@@ -352,6 +395,100 @@ impl ForgsClient {
             },
         )
         .await
+    }
+
+    /// List a namespace's direct members (`POST /auth/members`, `list`).
+    ///
+    /// # Errors
+    ///
+    /// As [`ForgsClient::exchange`]: a caller who may not see the namespace
+    /// is `403 forbidden`.
+    pub async fn list_members(
+        &self,
+        session_token: &str,
+        namespace: &str,
+    ) -> Result<MemberList, ClientError> {
+        self.post_json(
+            "/auth/members",
+            Some(&Secret::from(session_token)),
+            &MembersRequest::List {
+                namespace: namespace.to_owned(),
+            },
+        )
+        .await
+    }
+
+    /// Add a user to a namespace or change their role
+    /// (`POST /auth/members`, `set`). Admin only.
+    ///
+    /// # Errors
+    ///
+    /// As [`ForgsClient::exchange`]: a non-admin is `403 forbidden`, demoting
+    /// the last admin `409 last_admin`.
+    pub async fn set_member(
+        &self,
+        session_token: &str,
+        namespace: &str,
+        username: &str,
+        role: &str,
+    ) -> Result<(), ClientError> {
+        self.members(
+            session_token,
+            &MembersRequest::Set {
+                namespace: namespace.to_owned(),
+                username: username.to_owned(),
+                role: role.to_owned(),
+            },
+        )
+        .await
+    }
+
+    /// Remove a user's direct membership (`POST /auth/members`, `remove`).
+    ///
+    /// # Errors
+    ///
+    /// As [`ForgsClient::set_member`].
+    pub async fn remove_member(
+        &self,
+        session_token: &str,
+        namespace: &str,
+        username: &str,
+    ) -> Result<(), ClientError> {
+        self.members(
+            session_token,
+            &MembersRequest::Remove {
+                namespace: namespace.to_owned(),
+                username: username.to_owned(),
+            },
+        )
+        .await
+    }
+
+    /// Rename the calling user or a namespace (`POST /auth/rename`). The old
+    /// name is tombstoned forever.
+    ///
+    /// # Errors
+    ///
+    /// As [`ForgsClient::exchange`]: a taken or tombstoned name is
+    /// `409 username_taken`, an invalid one `400`.
+    pub async fn rename(
+        &self,
+        session_token: &str,
+        request: &RenameRequest,
+    ) -> Result<(), ClientError> {
+        self.post("/auth/rename", Some(&Secret::from(session_token)), request)
+            .await
+            .map(drop)
+    }
+
+    async fn members(
+        &self,
+        session_token: &str,
+        request: &MembersRequest,
+    ) -> Result<(), ClientError> {
+        self.post("/auth/members", Some(&Secret::from(session_token)), request)
+            .await
+            .map(drop)
     }
 
     async fn keys<R: DeserializeOwned>(
@@ -442,6 +579,10 @@ mod tests {
             "/auth/keys",
             "/auth/device/start",
             "/auth/device/poll",
+            "/auth/members",
+            "/auth/rename",
+            "/api/nodes/enroll",
+            "/api/x?y=1",
         ] {
             assert_eq!(
                 c.route(route).unwrap().to_string(),
@@ -453,6 +594,25 @@ mod tests {
             c.route("/auth/token").unwrap().to_string(),
             "https://example.com/forgs/auth/token"
         );
+    }
+
+    #[test]
+    fn routes_must_be_absolute_paths() {
+        let c = ForgsClient::new("https://auth.example", None).unwrap();
+        for bad in [
+            "",
+            "api/x",
+            "@evil.example/x",
+            ".evil.example/x",
+            ":8443/x",
+            "/x://y",
+            "https://evil.example/x",
+            "/a b",
+            "/a\nb",
+            "/a#f",
+        ] {
+            assert!(matches!(c.route(bad), Err(ClientError::Url(_))), "{bad:?}");
+        }
     }
 
     #[test]

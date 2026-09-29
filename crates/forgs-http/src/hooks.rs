@@ -1,11 +1,40 @@
-//! App extension points: API-key purposes and generic pending approvals.
+//! App extension points: app token kinds, API-key purposes and generic
+//! pending approvals.
 
 use async_trait::async_trait;
-use forgs::{NsNodeId, SubjectKey, UserId};
+use forgs::store::AppRecord;
+use forgs::{AppKind, NsNodeId, SubjectKey, TokenHash, UserId};
 use forgs_store::{ConsumedApiKey, PendingDevice};
 
 use crate::context::AuthContext;
 use crate::error::ApiError;
+
+/// Lookup for the app's own connection token kinds (fleet: a node).
+///
+/// [`crate::authenticate_request`] authenticates every credential through
+/// one path; for a [`forgs::TokenKind::App`] kind it asks this hook (set
+/// with [`crate::AuthContextBuilder::app_tokens`]). Without one, every app
+/// token is unknown — the uniform `401`.
+///
+/// It is consulted only for app kinds registered as
+/// [`forgs::TokenUse::Connection`]: a redeem-only kind is refused from its
+/// prefix (`403`) before any lookup. Expiry is compared by forgs against the
+/// injected clock, so return expired rows as they are (they become a `401`
+/// with an `auth.reject.expired` audit event rather than an indistinguishable
+/// unknown). The route still fences kinds with [`crate::AllowedKinds`].
+#[async_trait]
+pub trait AppTokenLookup: Send + Sync {
+    /// The row for `hash` of app kind `kind`, or `None` if unknown/revoked.
+    ///
+    /// # Errors
+    ///
+    /// A storage error description; it fails closed (uniform `401`, logged).
+    async fn lookup_app(
+        &self,
+        kind: AppKind,
+        hash: &TokenHash,
+    ) -> Result<Option<AppRecord>, String>;
+}
 
 /// What an API-key purpose redeems to at `POST /auth/token`
 /// (`grant_type: api_key`).
@@ -29,6 +58,34 @@ pub enum PurposeKind {
 pub trait ApiKeyPurposes: Send + Sync {
     /// How `purpose` redeems, or `None` if the app does not know it.
     fn kind(&self, purpose: &str) -> Option<PurposeKind>;
+
+    /// Validate and canonicalise the app payload a key of `purpose` is minted
+    /// with (fleet: a node key's tags, a CI key's ops). Called at mint time,
+    /// after the purpose is known and the caller's membership was checked.
+    ///
+    /// The returned string is stored **verbatim** in `forgs_api_key.payload`,
+    /// echoed (parsed) in the mint response and listing, and handed back in
+    /// [`ConsumedApiKey::payload`] at redemption. It must be JSON; `None`
+    /// stores no payload.
+    ///
+    /// The default knows no payloads: `None` or JSON `null` is fine, anything
+    /// else is refused with `400` (never silently dropped).
+    ///
+    /// # Errors
+    ///
+    /// Any [`ApiError`] (typically [`ApiError::BadRequest`]); it becomes the
+    /// response and nothing is minted.
+    fn check_payload(
+        &self,
+        purpose: &str,
+        payload: Option<&serde_json::Value>,
+    ) -> Result<Option<String>, ApiError> {
+        let _ = purpose;
+        match payload {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(_) => Err(ApiError::BadRequest),
+        }
+    }
 
     /// Called after a [`PurposeKind::Workload`] key was consumed and before
     /// the workload token is minted, with the subject the token will speak

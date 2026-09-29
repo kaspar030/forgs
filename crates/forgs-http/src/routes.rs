@@ -672,6 +672,7 @@ async fn api_keys(
             multi_use,
             purpose,
             subject_name,
+            payload,
         } => keys::create(
             &ctx,
             user,
@@ -680,6 +681,7 @@ async fn api_keys(
             multi_use,
             &purpose,
             subject_name.as_deref(),
+            payload.as_ref(),
         )
         .await
         .map(|v| Json(v).into_response()),

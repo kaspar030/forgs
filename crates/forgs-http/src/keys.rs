@@ -77,8 +77,10 @@ async fn require_member(
 /// # Errors
 ///
 /// `403` for a non-member; `400` for a zero or over-cap TTL, an unknown
-/// purpose, or a `subject_name` that is invalid or on a non-workload
-/// purpose; `500` on storage failure.
+/// purpose, a `subject_name` that is invalid or on a non-workload
+/// purpose, or a payload the purpose policy refuses
+/// ([`crate::ApiKeyPurposes::check_payload`]); `500` on storage failure.
+#[allow(clippy::too_many_arguments)]
 pub async fn create(
     ctx: &AuthContext,
     user: UserId,
@@ -87,6 +89,7 @@ pub async fn create(
     multi_use: bool,
     purpose: &str,
     subject_name: Option<&str>,
+    payload: Option<&serde_json::Value>,
 ) -> Result<ApiKeyCreated, ApiError> {
     let now = ctx.now();
     let (ns, _role) = require_member(ctx, user, namespace, "api_key").await?;
@@ -102,6 +105,20 @@ pub async fn create(
         Some(_) if kind != PurposeKind::Workload => return Err(ApiError::BadRequest),
         Some(raw) => Some(forgs::subject::normalise_service_name(raw).ok_or(ApiError::BadRequest)?),
     };
+    let stored = ctx.purposes().check_payload(purpose, payload)?;
+    let echoed = match stored
+        .as_deref()
+        .map(serde_json::from_str::<serde_json::Value>)
+    {
+        None => None,
+        Some(Ok(v)) => Some(v),
+        Some(Err(e)) => {
+            // The app's hook returned something that is not JSON: its bug,
+            // not the caller's. Mint nothing.
+            tracing::warn!(error = %e, purpose, "check_payload returned non-JSON");
+            return Err(ApiError::Internal);
+        }
+    };
     let expires = now.saturating_add(ttl_secs);
     let token = ctx.format().mint(TokenKind::ApiKey);
     let id = ctx
@@ -112,7 +129,7 @@ pub async fn create(
                 hash: token.hash(),
                 purpose: purpose.to_owned(),
                 subject_name: subject_name.clone(),
-                payload: None,
+                payload: stored,
                 single_use: !multi_use,
                 expires: Some(expires),
                 created_by: Some(user),
@@ -128,9 +145,10 @@ pub async fn create(
                 .subject(&forgs::SubjectKey::user(user))
                 .target(token.hash().short())
                 .detail(format!(
-                    "purpose={purpose} as={} single_use={} ttl={ttl_secs}",
+                    "purpose={purpose} as={} single_use={} ttl={ttl_secs} payload={}",
                     subject_name.as_deref().unwrap_or("-"),
-                    !multi_use
+                    !multi_use,
+                    if echoed.is_some() { "yes" } else { "-" },
                 )),
         )
         .await;
@@ -142,6 +160,7 @@ pub async fn create(
         single_use: !multi_use,
         purpose: purpose.to_owned(),
         subject_name,
+        payload: echoed,
         expires,
     })
 }
@@ -173,6 +192,15 @@ pub async fn list(
                 single_use: k.single_use,
                 purpose: k.purpose,
                 subject_name: k.subject_name,
+                payload: k.payload.as_deref().and_then(|p| {
+                    serde_json::from_str(p)
+                        .inspect_err(|e| {
+                            // A shell-minted key may carry a non-JSON payload.
+                            tracing::warn!(error = %e, key = %k.key_hash.short(),
+                                "API key payload is not JSON; not listed");
+                        })
+                        .ok()
+                }),
                 expires: k.expires,
                 consumed_at: k.consumed_at,
                 created_at: k.created_at,

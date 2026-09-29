@@ -205,6 +205,7 @@ async fn api_keys_create_list_revoke() {
                 multi_use: false,
                 purpose: "ci".into(),
                 subject_name: Some("builder".into()),
+                payload: None,
             },
         )
         .await
@@ -508,4 +509,168 @@ async fn https_fails_closed_against_a_non_tls_peer() {
             Err(ClientError::Transport(_))
         ));
     }
+}
+
+#[tokio::test]
+async fn api_key_payload_is_sent_and_echoed() {
+    let (stub, c) = setup().await;
+    stub.script(
+        "/auth/keys",
+        vec![Reply::json(
+            &json!({"key": format!("{MARK}-apikey"), "key_hash": "abcdef0123",
+            "id": "01JKEY", "namespace": "01JNS", "single_use": false, "purpose": "node",
+            "payload": {"tags": ["a", "b"]}, "expires": 99}),
+        )],
+    );
+    let created = c
+        .create_api_key(
+            "SEKRIT-s",
+            &ApiKeySpec {
+                namespace: "acme".into(),
+                ttl_secs: 60,
+                multi_use: true,
+                purpose: "node".into(),
+                payload: Some(json!({"tags": ["b", "a"]})),
+                ..ApiKeySpec::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.payload, Some(json!({"tags": ["a", "b"]})));
+    assert_redacted(&created);
+    assert_eq!(
+        stub.last().json(),
+        json!({"action": "create", "namespace": "acme", "ttl_secs": 60, "multi_use": true,
+               "purpose": "node", "payload": {"tags": ["b", "a"]}})
+    );
+}
+
+#[tokio::test]
+async fn app_routes_share_the_trust_path() {
+    let (stub, c) = setup().await;
+    stub.script(
+        "/api/nodes/enroll",
+        vec![Reply::json(&json!({"node": "n1"}))],
+    );
+    let r: serde_json::Value = c
+        .post_json(
+            "/api/nodes/enroll",
+            Some(&Secret::from("SEKRIT-n")),
+            &json!({"name": "box"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r, json!({"node": "n1"}));
+    let req = stub.last();
+    assert_eq!(req.method, "POST");
+    assert_eq!(req.path(), "/api/nodes/enroll");
+    assert_eq!(req.header("authorization"), Some("Bearer SEKRIT-n"));
+    assert!(!req.target.contains(MARK));
+    assert!(!req.body.contains(MARK));
+    assert_eq!(req.json(), json!({"name": "box"}));
+
+    // 204 through `post`, no bearer.
+    stub.script("/api/nodes/approve", vec![Reply::no_content()]);
+    let body = c
+        .post("/api/nodes/approve", None, &json!({"code": "X"}))
+        .await
+        .unwrap();
+    assert!(body.is_empty());
+    assert_eq!(stub.last().header("authorization"), None);
+
+    // Rejections map as for /auth routes.
+    stub.script("/api/nodes/enroll", vec![Reply::error(403, "forbidden")]);
+    let e = c
+        .post_json::<_, serde_json::Value>("/api/nodes/enroll", None, &json!({}))
+        .await
+        .unwrap_err();
+    assert_eq!(e.code(), Some("forbidden"));
+
+    // A route that is not an absolute path never leaves the process.
+    let before = stub.requests().len();
+    for bad in ["api/x", "@evil.example/x", "https://evil.example/x"] {
+        let e = c
+            .post(bad, Some(&Secret::from("SEKRIT-n")), &json!({}))
+            .await
+            .unwrap_err();
+        assert!(matches!(e, ClientError::Url(_)), "{bad}: {e:?}");
+    }
+    assert_eq!(stub.requests().len(), before);
+}
+
+#[tokio::test]
+async fn members_and_rename() {
+    let (stub, c) = setup().await;
+    stub.script(
+        "/auth/members",
+        vec![
+            Reply::json(&json!({"namespace": "01JNS", "members": [
+                {"subject": "user:01JU", "user_id": "01JU", "username": "alice", "role": "admin"}]})),
+            Reply::no_content(),
+            Reply::no_content(),
+            Reply::error(403, "forbidden"),
+        ],
+    );
+    let list = c.list_members("SEKRIT-s", "acme").await.unwrap();
+    assert_eq!(list.members[0].username.as_deref(), Some("alice"));
+    c.set_member("SEKRIT-s", "acme", "bob", "member")
+        .await
+        .unwrap();
+    c.remove_member("SEKRIT-s", "acme", "bob").await.unwrap();
+    let e = c
+        .remove_member("SEKRIT-s", "acme", "bob")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(e, ClientError::Rejected { status: 403, .. }),
+        "{e:?}"
+    );
+    assert_eq!(e.code(), Some("forbidden"));
+
+    stub.script("/auth/rename", vec![Reply::no_content()]);
+    c.rename(
+        "SEKRIT-s",
+        &forgs_client::api::RenameRequest::User {
+            new_username: "alice2".into(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let reqs = stub.requests();
+    assert!(reqs
+        .iter()
+        .all(|r| r.header("authorization") == Some("Bearer SEKRIT-s")));
+    let bodies: Vec<_> = reqs
+        .iter()
+        .map(|r| (r.path().to_owned(), r.json()))
+        .collect();
+    assert_eq!(
+        bodies,
+        vec![
+            (
+                "/auth/members".to_owned(),
+                json!({"action": "list", "namespace": "acme"})
+            ),
+            (
+                "/auth/members".to_owned(),
+                json!({"action": "set", "namespace": "acme",
+                "username": "bob", "role": "member"})
+            ),
+            (
+                "/auth/members".to_owned(),
+                json!({"action": "remove", "namespace": "acme",
+                "username": "bob"})
+            ),
+            (
+                "/auth/members".to_owned(),
+                json!({"action": "remove", "namespace": "acme",
+                "username": "bob"})
+            ),
+            (
+                "/auth/rename".to_owned(),
+                json!({"action": "user", "new_username": "alice2"})
+            ),
+        ]
+    );
 }

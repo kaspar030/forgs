@@ -44,6 +44,16 @@
 //! route (including a redeem-only kind, decided from the prefix alone) is
 //! `403 forbidden`: that distinction is a function of the prefix the caller
 //! supplied and leaks nothing. The reason goes to the audit sink.
+//!
+//! # App token kinds
+//!
+//! An app's own connection kinds (fleet: a node token) authenticate through
+//! this same function: the lookup goes to the app's
+//! [`crate::AppTokenLookup`] hook, the route fences kinds with
+//! [`AllowedKinds`] as for core kinds (so an app token is `403` on
+//! [`SessionOnly`] routes), and an unknown, revoked, expired or
+//! failed-lookup app token is the same uniform `401`. There is no second
+//! `Subject`-minting site for apps.
 
 use std::marker::PhantomData;
 
@@ -164,7 +174,7 @@ pub async fn authenticate_request(
         None => ("", Arrival::Header),
     };
 
-    let auth = match forgs::authenticate(ctx.format(), ctx.store(), bearer, now).await {
+    let auth = match forgs::authenticate(ctx.format(), &ctx.token_store(), bearer, now).await {
         Ok(a) => a,
         Err(e) => return Err(reject_authentication(ctx, &e).await),
     };
