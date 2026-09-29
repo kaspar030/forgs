@@ -1,0 +1,51 @@
+[workspace]
+resolver = "2"
+# forgs-store, forgs-idp, forgs-http and forgs-client join this list as they
+# land (docs/design.md §5).
+members = [
+    "crates/forgs",
+]
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+# internal
+forgs = { path = "crates/forgs" }
+
+# Dependency discipline (carried over from probe-rs-fleet):
+#
+# * Pure Rust only. fleet's agent cross-compiles to armv7-musl and consumes
+#   forgs-client, so nothing in the graph may need a C toolchain.
+# * Crypto goes through `ring` (for TLS: the rustls `ring` provider), never
+#   `aws-lc-rs`, which pulls a C crypto build that fails to cross-compile to
+#   armv7-musl.
+# * `default-features = false` wherever a crate's defaults drag in more than
+#   is used, so every feature in the tree is one somebody asked for.
+# * The core `forgs` crate is pure: no IO, no async runtime (tokio is a
+#   dev-dependency only), no clock (`now` is always a parameter).
+
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", default-features = false, features = ["std"] }
+base64 = "0.22"
+sha2 = "0.10"
+rand_core = "0.6"
+thiserror = "2"
+async-trait = "0.1"
+# `default-features = false` and no features: ulid's `std` feature (which its
+# `serde` feature needs) pulls rand 0.9, a second RNG stack. forgs builds ids
+# with `Ulid::from_parts(now_ms, random)` from `rand_core::OsRng` instead, and
+# implements serde for its id newtypes by hand.
+ulid = { version = "1.2", default-features = false }
+
+# dev / test helpers
+tokio = { version = "1", default-features = false, features = ["macros", "rt"] }

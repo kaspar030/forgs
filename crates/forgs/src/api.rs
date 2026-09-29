@@ -1,0 +1,508 @@
+//! Wire types for the `/auth/*` JSON surface.
+//!
+//! Defined once and shared by `forgs-http` and `forgs-client`, so the contract
+//! cannot drift between the two ends. JSON because this surface must be
+//! curl-able and proxy-friendly.
+//!
+//! Namespaces and users travel as opaque ids or canonical paths (strings);
+//! nothing on this surface is ever a *grant* of the thing it names — the server
+//! checks membership for every namespace a request mentions.
+
+use serde::{Deserialize, Serialize};
+
+/// Stable machine-readable codes for [`ErrorResponse::error`].
+pub mod error_code {
+    /// A credential in the body was rejected (unknown, expired, wrong kind —
+    /// deliberately not distinguished).
+    pub const INVALID_GRANT: &str = "invalid_grant";
+    /// The request was malformed or violated a rule.
+    pub const INVALID_REQUEST: &str = "invalid_request";
+    /// The bearer credential was rejected.
+    pub const UNAUTHORIZED: &str = "unauthorized";
+    /// Authenticated, but not allowed (or the target does not exist — no
+    /// oracle).
+    pub const FORBIDDEN: &str = "forbidden";
+    /// The target does not exist or is not visible to the caller.
+    pub const NOT_FOUND: &str = "not_found";
+    /// A revocation prefix matched more than one key.
+    pub const AMBIGUOUS_PREFIX: &str = "ambiguous_prefix";
+    /// The chosen username is taken (or tombstoned).
+    pub const USERNAME_TAKEN: &str = "username_taken";
+    /// The chosen username violates the policy or is reserved.
+    pub const USERNAME_INVALID: &str = "username_invalid";
+    /// The signup ticket is unknown or expired.
+    pub const TICKET_EXPIRED: &str = "ticket_expired";
+}
+
+/// A token-exchange request to `POST /auth/token`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "grant_type", rename_all = "snake_case")]
+pub enum TokenRequest {
+    /// Exchange a still-valid session token for a fresh one.
+    ///
+    /// **Replacing**: the old session stops working immediately. See
+    /// [`TokenRequest::RefreshToken`] for the non-rotating variant, which is
+    /// what a caller that may race a peer (a sidecar) wants.
+    Refresh {
+        /// The current session token.
+        session_token: String,
+    },
+    /// Redeem a long-lived **refresh token** for a fresh session token.
+    ///
+    /// Deliberately **not** [`TokenRequest::Refresh`], which exchanges a
+    /// still-valid session and replaces it. Two differences make this a
+    /// separate grant rather than an overload:
+    ///
+    /// * it works when the session has already lapsed — that is the whole
+    ///   point, since `Refresh` requires a live session and so cannot help
+    ///   after the 12h cliff; and
+    /// * **it is non-rotating**: redemption leaves the refresh token usable,
+    ///   so N concurrent redemptions all succeed and every minted session is
+    ///   independently valid.
+    RefreshToken {
+        /// The refresh token, written by `login`.
+        refresh_token: String,
+    },
+}
+
+/// A successful token exchange (and the `Granted` device-poll outcome).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenResponse {
+    /// The minted session token.
+    pub token: String,
+    /// Expiry (epoch seconds).
+    pub expires: u64,
+    /// The username, for the CLI's summary line. Display only — identity is
+    /// the immutable [`TokenResponse::user_id`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    /// The user's immutable id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+    /// A freshly minted **refresh token**, on the login paths that mint one
+    /// (the device flow).
+    ///
+    /// Absent everywhere else, including from a redemption response: the
+    /// caller already holds the refresh token it redeemed, and echoing it back
+    /// would put a durable credential on the wire for nothing and invite a
+    /// client to overwrite a good credential with a copy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<String>,
+}
+
+/// A request to `POST /auth/logout` — revoke the caller's credentials.
+///
+/// Authenticated with `Authorization: Bearer <session token>`: an ordinary
+/// authenticated call about the caller's *own* identity.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogoutRequest {
+    /// The caller's refresh token, so it can be revoked alongside the
+    /// session. A refresh token belonging to **another** user is ignored
+    /// silently: never an oracle, never a cross-user delete.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<String>,
+    /// Revoke *every* session and refresh token of the calling user, not just
+    /// the presented ones. This is the lost-machine answer.
+    #[serde(default)]
+    pub all: bool,
+}
+
+/// A request to begin forgs' own device flow (`POST /auth/device/start`).
+///
+/// Empty today; the struct exists so a future field is an additive change
+/// rather than a shape change.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceStartRequest {}
+
+/// A started device flow.
+///
+/// forgs is itself the device authorization server (docs/design.md §4): the
+/// user opens `verification_uri` in a browser, logs in with any provider
+/// (choosing a username on first login), and confirms `user_code`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceStartResponse {
+    /// This client's poll credential. Never a connection credential; it is
+    /// redeemed only at `/auth/device/poll`.
+    pub device_secret: String,
+    /// The short code the human confirms, hyphenated for display
+    /// (`ABCD-1234`).
+    pub user_code: String,
+    /// Where the human goes. Carries **no code**, so the page reflects
+    /// nothing and cannot become an injection surface.
+    pub verification_uri: String,
+    /// `verification_uri` with the code pre-filled, for clients that can open
+    /// a browser themselves. The user must still confirm the code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_uri_complete: Option<String>,
+    /// Minimum seconds between polls.
+    pub interval: u64,
+    /// Seconds until the flow expires.
+    pub expires_in: u64,
+}
+
+/// A poll for the outcome of a device flow.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DevicePollRequest {
+    /// The device secret from [`DeviceStartResponse`].
+    pub device_secret: String,
+}
+
+/// The outcome of a device-flow poll.
+///
+/// There is no "needs username" state: the username is chosen in the browser.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum DevicePollResponse {
+    /// Not yet approved; poll again after `interval`.
+    Pending,
+    /// Polling too fast; increase the interval.
+    SlowDown,
+    /// The user refused.
+    Denied,
+    /// The flow expired.
+    Expired,
+    /// Approved: a session plus a refresh token.
+    Granted(TokenResponse),
+}
+
+/// Complete a first login by choosing a username (`POST /auth/signup`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignupRequest {
+    /// The pending-signup ticket.
+    pub ticket: String,
+    /// The chosen username (canonicalised server-side).
+    pub username: String,
+}
+
+/// A request to `POST /auth/keys`, the authenticated API-key surface.
+///
+/// One route with an `action` tag rather than REST verbs: one handler, one
+/// client helper, and no key handle in a URL path (which proxies log).
+///
+/// **The caller authenticates with `Authorization: Bearer <session token>`.**
+/// The namespace named here is a *target*, checked for membership; a minted
+/// key can never exceed the caller's access.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum ApiKeyRequest {
+    /// Mint a namespace-scoped key.
+    Create {
+        /// The namespace (id or path) the key is scoped to.
+        namespace: String,
+        /// Time-to-live in seconds. Zero (never expires) is refused over the
+        /// API, and the value is capped by the server.
+        ttl_secs: u64,
+        /// Allow more than one redemption.
+        #[serde(default)]
+        multi_use: bool,
+        /// What the key is for. App-defined; an unrecognised value is a
+        /// `400`, never a silent default.
+        purpose: String,
+        /// A stable **identity** name that survives rotation: re-minting with
+        /// the same name rotates only the secret. Absent means an identity
+        /// derived from the key itself.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subject_name: Option<String>,
+    },
+    /// List a namespace's keys (hashes only).
+    List {
+        /// The namespace (id or path).
+        namespace: String,
+    },
+    /// Revoke keys whose hash starts with `prefix`.
+    Revoke {
+        /// The namespace (id or path).
+        namespace: String,
+        /// Hash prefix, from an [`ApiKeyList`]. At least 8 hex characters;
+        /// ambiguous is a `409` ([`error_code::AMBIGUOUS_PREFIX`]).
+        prefix: String,
+    },
+}
+
+/// A freshly minted API key. **The only time the secret exists.**
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApiKeyCreated {
+    /// The key itself. Stored nowhere, only its hash.
+    pub key: String,
+    /// Lowercase-hex SHA-256 of the key — the handle for revocation.
+    pub key_hash: String,
+    /// The key's id.
+    pub id: String,
+    /// The namespace id the key is scoped to.
+    pub namespace: String,
+    /// Whether redeeming the key consumes it.
+    pub single_use: bool,
+    /// What the key is for, echoed so the CLI can print it.
+    pub purpose: String,
+    /// The identity the key speaks as, echoed so the CLI can tell a server
+    /// that **ignored** the field from one that honoured it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_name: Option<String>,
+    /// Expiry (epoch seconds). Always set on this path.
+    pub expires: u64,
+}
+
+/// One API key as a listing shows it. Hash-only, never a secret.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApiKeyInfo {
+    /// The key's id.
+    pub id: String,
+    /// Lowercase-hex SHA-256 of the key.
+    pub key_hash: String,
+    /// Whether redeeming the key consumes it.
+    pub single_use: bool,
+    /// What the key is for.
+    pub purpose: String,
+    /// The identity the key speaks as. Keys sharing a name are **one
+    /// identity**, so revoking any of them affects that identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_name: Option<String>,
+    /// Expiry (epoch seconds), or `None` for a key that never expires.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires: Option<u64>,
+    /// When the key was consumed (epoch seconds), if it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consumed_at: Option<u64>,
+    /// When the key was minted (epoch seconds).
+    pub created_at: u64,
+    /// The user who minted it, or `None` for a shell-minted key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<String>,
+}
+
+/// A namespace's API keys, newest first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApiKeyList {
+    /// The namespace id listed.
+    pub namespace: String,
+    /// The keys, newest first.
+    pub keys: Vec<ApiKeyInfo>,
+}
+
+/// The outcome of a revocation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApiKeyRevoked {
+    /// The namespace id the keys were revoked from.
+    pub namespace: String,
+    /// The hashes deleted.
+    pub revoked: Vec<String>,
+}
+
+/// A rejected request.
+///
+/// Deliberately coarse: the body never distinguishes "unknown" from "expired"
+/// (no oracle). Detail lives in the server's audit log. Candidate hashes for
+/// an ambiguous prefix are *not* on the wire either; the CLI turns the code
+/// into "list the keys and use a longer prefix".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ErrorResponse {
+    /// A short machine-readable code from [`error_code`].
+    pub error: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{json, to_value, Value};
+
+    fn round_trip<T>(v: &T, expected: &Value)
+    where
+        T: Serialize + for<'de> Deserialize<'de> + PartialEq + std::fmt::Debug,
+    {
+        assert_eq!(&to_value(v).unwrap(), expected);
+        let back: T = serde_json::from_value(expected.clone()).unwrap();
+        assert_eq!(&back, v);
+    }
+
+    #[test]
+    fn token_request_shapes() {
+        round_trip(
+            &TokenRequest::Refresh {
+                session_token: "s".into(),
+            },
+            &json!({"grant_type": "refresh", "session_token": "s"}),
+        );
+        round_trip(
+            &TokenRequest::RefreshToken {
+                refresh_token: "r".into(),
+            },
+            &json!({"grant_type": "refresh_token", "refresh_token": "r"}),
+        );
+        assert!(serde_json::from_value::<TokenRequest>(
+            json!({"grant_type": "auth_key", "auth_key": "k"})
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn token_response_omits_absent_fields() {
+        let r = TokenResponse {
+            token: "t".into(),
+            expires: 5,
+            username: None,
+            user_id: None,
+            refresh_token: None,
+        };
+        round_trip(&r, &json!({"token": "t", "expires": 5}));
+    }
+
+    #[test]
+    fn logout_defaults() {
+        let r: LogoutRequest = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(r, LogoutRequest::default());
+        round_trip(
+            &LogoutRequest {
+                refresh_token: Some("r".into()),
+                all: true,
+            },
+            &json!({"refresh_token": "r", "all": true}),
+        );
+    }
+
+    #[test]
+    fn device_poll_shapes() {
+        round_trip(&DevicePollResponse::Pending, &json!({"status": "pending"}));
+        round_trip(
+            &DevicePollResponse::SlowDown,
+            &json!({"status": "slow_down"}),
+        );
+        round_trip(&DevicePollResponse::Denied, &json!({"status": "denied"}));
+        round_trip(&DevicePollResponse::Expired, &json!({"status": "expired"}));
+        round_trip(
+            &DevicePollResponse::Granted(TokenResponse {
+                token: "t".into(),
+                expires: 1,
+                username: Some("alice".into()),
+                user_id: Some("01J".into()),
+                refresh_token: Some("r".into()),
+            }),
+            &json!({"status": "granted", "token": "t", "expires": 1,
+                    "username": "alice", "user_id": "01J", "refresh_token": "r"}),
+        );
+        assert!(
+            serde_json::from_value::<DevicePollResponse>(json!({"status": "needs_username"}))
+                .is_err()
+        );
+        round_trip(&DeviceStartRequest {}, &json!({}));
+        round_trip(
+            &DevicePollRequest {
+                device_secret: "d".into(),
+            },
+            &json!({"device_secret": "d"}),
+        );
+        round_trip(
+            &DeviceStartResponse {
+                device_secret: "d".into(),
+                user_code: "ABCD-1234".into(),
+                verification_uri: "https://x/device".into(),
+                verification_uri_complete: None,
+                interval: 5,
+                expires_in: 900,
+            },
+            &json!({"device_secret": "d", "user_code": "ABCD-1234",
+                    "verification_uri": "https://x/device", "interval": 5,
+                    "expires_in": 900}),
+        );
+    }
+
+    #[test]
+    fn signup_shape() {
+        round_trip(
+            &SignupRequest {
+                ticket: "t".into(),
+                username: "alice".into(),
+            },
+            &json!({"ticket": "t", "username": "alice"}),
+        );
+    }
+
+    #[test]
+    fn api_key_request_shapes() {
+        round_trip(
+            &ApiKeyRequest::Create {
+                namespace: "acme".into(),
+                ttl_secs: 60,
+                multi_use: false,
+                purpose: "ci".into(),
+                subject_name: Some("builder".into()),
+            },
+            &json!({"action": "create", "namespace": "acme", "ttl_secs": 60,
+                    "multi_use": false, "purpose": "ci", "subject_name": "builder"}),
+        );
+        let c: ApiKeyRequest = serde_json::from_value(
+            json!({"action": "create", "namespace": "a", "ttl_secs": 1, "purpose": "ci"}),
+        )
+        .unwrap();
+        assert!(matches!(
+            c,
+            ApiKeyRequest::Create {
+                multi_use: false,
+                subject_name: None,
+                ..
+            }
+        ));
+        round_trip(
+            &ApiKeyRequest::List {
+                namespace: "acme".into(),
+            },
+            &json!({"action": "list", "namespace": "acme"}),
+        );
+        round_trip(
+            &ApiKeyRequest::Revoke {
+                namespace: "acme".into(),
+                prefix: "deadbeef".into(),
+            },
+            &json!({"action": "revoke", "namespace": "acme", "prefix": "deadbeef"}),
+        );
+    }
+
+    #[test]
+    fn api_key_responses_round_trip() {
+        let info = ApiKeyInfo {
+            id: "01J".into(),
+            key_hash: "ab".into(),
+            single_use: true,
+            purpose: "ci".into(),
+            subject_name: None,
+            expires: Some(9),
+            consumed_at: None,
+            created_at: 1,
+            created_by: None,
+        };
+        round_trip(
+            &ApiKeyList {
+                namespace: "n".into(),
+                keys: vec![info],
+            },
+            &json!({"namespace": "n", "keys": [{"id": "01J", "key_hash": "ab",
+                    "single_use": true, "purpose": "ci", "expires": 9, "created_at": 1}]}),
+        );
+        round_trip(
+            &ApiKeyCreated {
+                key: "k".into(),
+                key_hash: "h".into(),
+                id: "i".into(),
+                namespace: "n".into(),
+                single_use: false,
+                purpose: "ci".into(),
+                subject_name: None,
+                expires: 3,
+            },
+            &json!({"key": "k", "key_hash": "h", "id": "i", "namespace": "n",
+                    "single_use": false, "purpose": "ci", "expires": 3}),
+        );
+        round_trip(
+            &ApiKeyRevoked {
+                namespace: "n".into(),
+                revoked: vec!["h".into()],
+            },
+            &json!({"namespace": "n", "revoked": ["h"]}),
+        );
+        round_trip(
+            &ErrorResponse {
+                error: error_code::INVALID_GRANT.into(),
+            },
+            &json!({"error": "invalid_grant"}),
+        );
+    }
+}
