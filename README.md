@@ -4,7 +4,7 @@ Reusable identity, namespace, membership and authentication for forge-shaped
 applications — extracted from [probe-rs-fleet] and generalised so that fleet,
 forgefront and future projects can share it.
 
-Status: early. Only the pure core crate exists so far.
+Status: early. The pure core crate and the identity-provider crate exist so far.
 
 - Design: [`docs/design.md`](docs/design.md)
 - What fleet has today, and what moves: [`docs/fleet-survey.md`](docs/fleet-survey.md)
@@ -15,7 +15,7 @@ Status: early. Only the pure core crate exists so far.
 |---|---|---|
 | `forgs` | ids, opaque tokens + verification, user codes, rotation policy, namespace schema, username policy, role ladders, `Subject`, authz evaluation, `/auth/*` wire types. **Pure: no IO, no clock.** | ✅ |
 | `forgs-store` | sqlx/SQLite: `forgs_`-prefixed tables, migrations, `Store` trait + impl | planned |
-| `forgs-idp` | `IdentityProvider` trait; GitHub, OIDC (GHA workload issuer) | planned |
+| `forgs-idp` | `IdentityProvider` trait; GitHub (OAuth2), generic OIDC with Codeberg/Forgejo and GitLab presets, GitHub Actions workload issuer + runner-side token fetch. Features `client` (HTTPS egress) and `oidc` (JWT verification). | ✅ |
 | `forgs-http` | axum routes, `Authenticated` extractor, cookies + CSRF | planned |
 | `forgs-client` | HTTP client for login/refresh/logout/keys (no server deps) | planned |
 

@@ -1,9 +1,10 @@
 [workspace]
 resolver = "2"
-# forgs-store, forgs-idp, forgs-http and forgs-client join this list as they
-# land (docs/design.md §5).
+# forgs-store, forgs-http and forgs-client join this list as they land
+# (docs/design.md §5).
 members = [
     "crates/forgs",
+    "crates/forgs-idp",
 ]
 
 [workspace.lints.rust]
@@ -21,6 +22,7 @@ license = "MIT OR Apache-2.0"
 [workspace.dependencies]
 # internal
 forgs = { path = "crates/forgs" }
+forgs-idp = { path = "crates/forgs-idp" }
 
 # Dependency discipline (carried over from probe-rs-fleet):
 #
@@ -46,6 +48,19 @@ async-trait = "0.1"
 # with `Ulid::from_parts(now_ms, random)` from `rand_core::OsRng` instead, and
 # implements serde for its id newtypes by hand.
 ulid = { version = "1.2", default-features = false }
+
+# HTTPS egress (forgs-idp's `client` feature). Everything pinned to
+# `default-features = false` and the rustls `ring` provider; see above.
+hyper = { version = "1", default-features = false }
+hyper-util = { version = "0.1", default-features = false }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "ring", "tls12", "webpki-tokio"] }
+http-body-util = { version = "0.1", default-features = false }
+http = { version = "1", default-features = false, features = ["std"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+webpki-roots = { version = "1", default-features = false }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+# `rust_crypto`, not `aws_lc_rs`: the same cross-compilation reason as rustls.
+jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto"] }
 
 # dev / test helpers
 tokio = { version = "1", default-features = false, features = ["macros", "rt"] }
