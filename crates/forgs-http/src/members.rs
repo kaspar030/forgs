@@ -5,10 +5,15 @@
 //! leave a namespace with no direct admin is refused (`409 last_admin`) —
 //! otherwise one click orphans a tenant. Renames tombstone the old name
 //! forever.
+//!
+//! [`create_namespace`] creates a node and makes its creator the admin in one
+//! store transaction, optionally capped by how many such nodes the creator
+//! already owns; [`delete_namespace`] deletes an empty, non-personal node.
 
 use forgs::api::{MemberInfo, MemberList, SessionInfo, SessionMembership};
 use forgs::schema::NameOrigin;
 use forgs::{NsNodeId, SubjectKey, UserId};
+use forgs_store::StoreError;
 
 use crate::audit::AuditEvent;
 use crate::auth::{resolve_ns, Caller};
@@ -223,6 +228,107 @@ pub async fn rename_user(
     Ok(())
 }
 
+/// Create a namespace node of `kind` named `name` under `parent` (`None`:
+/// the root), owned by `user`, with `user` as a member holding the ladder's
+/// highest role — atomically.
+///
+/// Under a parent the caller needs the highest role there (inherited roles
+/// count); at the root any authenticated user may create. With
+/// `max_owned = Some(cap)` the creation is refused once `user` owns `cap`
+/// non-personal nodes of `kind` under `parent` (a hard cap).
+///
+/// # Errors
+///
+/// `403` for an unknown parent or a non-admin there, `403 namespace_limit`
+/// at the cap, `400` for an unknown kind or a kind not allowed under the
+/// parent, `400 username_invalid` for a bad name, `409 username_taken` for a
+/// taken or released name.
+pub async fn create_namespace(
+    ctx: &AuthContext,
+    user: UserId,
+    parent: Option<&str>,
+    kind: &str,
+    name: &str,
+    max_owned: Option<u64>,
+) -> Result<NsNodeId, ApiError> {
+    let parent_id = match parent {
+        Some(p) => Some(require_admin(ctx, user, p, "namespace.create").await?),
+        None => None,
+    };
+    let now = ctx.now();
+    let ns = ctx
+        .store()
+        .create_node_with_admin(
+            parent_id,
+            kind,
+            name,
+            NameOrigin::User,
+            user,
+            max_owned,
+            now,
+        )
+        .await
+        .map_err(|e| match e {
+            StoreError::UnknownKind(_) | StoreError::BadPlacement { .. } => {
+                tracing::debug!(error = %e, "create_node_with_admin: bad kind");
+                ApiError::BadRequest
+            }
+            other => store_err("create_node_with_admin")(other),
+        })?;
+    ctx.audit()
+        .record(
+            AuditEvent::new(now, "namespace.create")
+                .ns(ns)
+                .subject(&SubjectKey::user(user))
+                .target(name.trim().to_owned())
+                .detail(format!("kind={kind}")),
+        )
+        .await;
+    Ok(ns)
+}
+
+/// How a failed node deletion is reported.
+fn delete_err(e: StoreError) -> ApiError {
+    match e {
+        StoreError::HasChildren | StoreError::Dangling => ApiError::NOT_EMPTY,
+        StoreError::PersonalNode => ApiError::CONFLICT,
+        other => store_err("delete_node")(other),
+    }
+}
+
+/// Delete a non-personal namespace node the caller administers. Its name is
+/// tombstoned; memberships, keys and grants bound to it go with it.
+///
+/// # Errors
+///
+/// `403` for an unknown namespace or a non-admin, `409 conflict` for a
+/// personal node (delete the user instead), `409 not_empty` while the node
+/// has children or app data still references it.
+pub async fn delete_namespace(
+    ctx: &AuthContext,
+    user: UserId,
+    namespace: &str,
+) -> Result<(), ApiError> {
+    let ns = require_admin(ctx, user, namespace, "namespace.delete").await?;
+    let name = ctx
+        .store()
+        .node(ns)
+        .await
+        .map_err(store_err("node"))?
+        .map_or_else(|| namespace.to_owned(), |n| n.name);
+    let now = ctx.now();
+    ctx.store().delete_node(ns, now).await.map_err(delete_err)?;
+    ctx.audit()
+        .record(
+            AuditEvent::new(now, "namespace.delete")
+                .ns(ns)
+                .subject(&SubjectKey::user(user))
+                .target(name),
+        )
+        .await;
+    Ok(())
+}
+
 /// Rename a non-personal namespace node the caller administers.
 ///
 /// # Errors
@@ -282,4 +388,17 @@ pub async fn whoami(ctx: &AuthContext, caller: &Caller) -> Result<SessionInfo, A
             .collect();
     }
     Ok(info)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delete_errors_map_to_conflicts() {
+        assert_eq!(delete_err(StoreError::HasChildren), ApiError::NOT_EMPTY);
+        assert_eq!(delete_err(StoreError::Dangling), ApiError::NOT_EMPTY);
+        assert_eq!(delete_err(StoreError::PersonalNode), ApiError::CONFLICT);
+        assert_eq!(delete_err(StoreError::NotFound), ApiError::NotFound);
+    }
 }

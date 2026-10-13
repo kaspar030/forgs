@@ -145,10 +145,30 @@ impl Store {
         if self.schema.kind(kind).is_none() {
             return Err(StoreError::UnknownKind(kind.to_owned()));
         }
-        let parent_s = parent.map(|p| p.to_string());
         let mut tx = self.begin().await?;
+        let id = self
+            .insert_node_tx(&mut tx, parent, kind, raw_name, origin, owner, now)
+            .await?;
+        tx.commit().await?;
+        Ok(id)
+    }
+
+    /// The body of [`Store::create_node`] inside `conn`; the caller has
+    /// checked that `kind` is in the schema.
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_node_tx(
+        &self,
+        conn: &mut SqliteConnection,
+        parent: Option<NsNodeId>,
+        kind: &str,
+        raw_name: &str,
+        origin: NameOrigin,
+        owner: Option<UserId>,
+        now: u64,
+    ) -> Result<NsNodeId> {
+        let parent_s = parent.map(|p| p.to_string());
         let parent_kind = match &parent_s {
-            Some(p) => Some(Self::kind_of(&mut tx, p).await?.0),
+            Some(p) => Some(Self::kind_of(conn, p).await?.0),
             None => None,
         };
         if !self.schema.can_place(kind, parent_kind.as_deref()) {
@@ -158,7 +178,7 @@ impl Store {
             });
         }
         let canonical = self.schema.canonical_name(kind, raw_name, origin)?;
-        check_name_free(&mut tx, parent_s.as_deref(), &canonical, None, None).await?;
+        check_name_free(conn, parent_s.as_deref(), &canonical, None, None).await?;
         let id = NsNodeId::generate(now_ms(now));
         sqlx::query(
             "INSERT INTO forgs_ns_node (id, parent_id, kind, name, name_canonical, owner_user_id, created_at)
@@ -170,6 +190,74 @@ impl Store {
         .bind(raw_name.trim())
         .bind(&canonical)
         .bind(owner.map(|o| o.to_string()))
+        .bind(ts(now)?)
+        .execute(&mut *conn)
+        .await?;
+        Ok(id)
+    }
+
+    /// Create a namespace node owned by `admin` and make `admin` a member
+    /// with the ladder's highest role, in **one** transaction.
+    ///
+    /// With `max_owned = Some(cap)`, the creation is refused when `admin`
+    /// already owns `cap` or more non-personal nodes of `kind` directly under
+    /// `parent`. The count and the insert share a `BEGIN IMMEDIATE`
+    /// transaction, so concurrent creations cannot overshoot the cap.
+    /// `Some(0)` refuses every creation.
+    ///
+    /// The checks and naming rules are those of [`Store::create_node`].
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Store::create_node`] (a missing `admin` user reports
+    /// [`StoreError::Dangling`]), [`StoreError::OwnedLimit`], or
+    /// [`StoreError::BadRole`] if the ladder has no label for its top role.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_node_with_admin(
+        &self,
+        parent: Option<NsNodeId>,
+        kind: &str,
+        raw_name: &str,
+        origin: NameOrigin,
+        admin: UserId,
+        max_owned: Option<u64>,
+        now: u64,
+    ) -> Result<NsNodeId> {
+        if self.schema.kind(kind).is_none() {
+            return Err(StoreError::UnknownKind(kind.to_owned()));
+        }
+        let role = self
+            .roles
+            .label(self.roles.highest())
+            .ok_or(StoreError::BadRole)?;
+        let admin_s = admin.to_string();
+        let mut tx = self.begin().await?;
+        if let Some(cap) = max_owned {
+            let (owned,): (i64,) = sqlx::query_as(
+                "SELECT COUNT(*) FROM forgs_ns_node
+                 WHERE parent_id IS ?1 AND kind = ?2 AND owner_user_id = ?3
+                   AND personal_of_user_id IS NULL",
+            )
+            .bind(parent.map(|p| p.to_string()))
+            .bind(kind)
+            .bind(&admin_s)
+            .fetch_one(&mut *tx)
+            .await?;
+            if u64::try_from(owned).unwrap_or(0) >= cap {
+                return Err(StoreError::OwnedLimit);
+            }
+        }
+        let id = self
+            .insert_node_tx(&mut tx, parent, kind, raw_name, origin, Some(admin), now)
+            .await?;
+        sqlx::query(
+            "INSERT INTO forgs_membership (ns_node_id, subject, user_id, role, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )
+        .bind(id.to_string())
+        .bind(SubjectKey::user(admin).to_string())
+        .bind(&admin_s)
+        .bind(role)
         .bind(ts(now)?)
         .execute(&mut *tx)
         .await?;

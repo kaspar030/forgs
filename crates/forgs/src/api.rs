@@ -46,6 +46,10 @@ pub mod error_code {
     pub const WORKLOAD_UNCONFIGURED: &str = "workload_unconfigured";
     /// The change would leave a namespace without an admin.
     pub const LAST_ADMIN: &str = "last_admin";
+    /// The caller already owns the maximum number of such namespaces.
+    pub const NAMESPACE_LIMIT: &str = "namespace_limit";
+    /// The namespace still has children or app data referencing it.
+    pub const NOT_EMPTY: &str = "not_empty";
     /// The login provider is unknown or not configured.
     pub const UNKNOWN_PROVIDER: &str = "unknown_provider";
     /// The identity provider could not complete the login.

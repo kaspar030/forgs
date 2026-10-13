@@ -96,6 +96,11 @@ impl ApiError {
     pub const IDENTITY_TAKEN: ApiError = ApiError::Code(StatusCode::CONFLICT, code::IDENTITY_TAKEN);
     /// `409 conflict`.
     pub const CONFLICT: ApiError = ApiError::Code(StatusCode::CONFLICT, code::CONFLICT);
+    /// `403 namespace_limit`.
+    pub const NAMESPACE_LIMIT: ApiError =
+        ApiError::Code(StatusCode::FORBIDDEN, code::NAMESPACE_LIMIT);
+    /// `409 not_empty`.
+    pub const NOT_EMPTY: ApiError = ApiError::Code(StatusCode::CONFLICT, code::NOT_EMPTY);
     /// `409 last_admin`.
     pub const LAST_ADMIN: ApiError = ApiError::Code(StatusCode::CONFLICT, code::LAST_ADMIN);
     /// `409 ambiguous_prefix`.
@@ -138,6 +143,7 @@ impl From<StoreError> for ApiError {
             StoreError::IdentityTaken => ApiError::IDENTITY_TAKEN,
             StoreError::BadRole | StoreError::BadPrefix => ApiError::BadRequest,
             StoreError::PersonalNode | StoreError::HasChildren => ApiError::CONFLICT,
+            StoreError::OwnedLimit => ApiError::NAMESPACE_LIMIT,
             other => {
                 tracing::warn!(error = %other, "store operation failed");
                 ApiError::Internal
@@ -181,6 +187,12 @@ mod tests {
             ApiError::from(StoreError::CorruptRow("secret detail".into())),
             ApiError::Internal
         );
+        assert_eq!(
+            ApiError::from(StoreError::OwnedLimit),
+            ApiError::NAMESPACE_LIMIT
+        );
+        assert_eq!(ApiError::NAMESPACE_LIMIT.status(), StatusCode::FORBIDDEN);
+        assert_eq!(ApiError::NOT_EMPTY.status(), StatusCode::CONFLICT);
         assert_eq!(ApiError::Internal.code(), "server_error");
         assert_eq!(ApiError::TICKET_EXPIRED.status(), StatusCode::GONE);
     }

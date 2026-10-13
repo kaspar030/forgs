@@ -53,6 +53,10 @@ pub enum StoreError {
     /// A node with children cannot be deleted.
     #[error("namespace node has children")]
     HasChildren,
+    /// The owner already holds the maximum number of such nodes (see
+    /// [`crate::Store::create_node_with_admin`]).
+    #[error("the owner already holds the maximum number of such nodes")]
+    OwnedLimit,
     /// A personal node is renamed and deleted only together with its user.
     #[error("a personal namespace node follows its user")]
     PersonalNode,

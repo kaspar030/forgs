@@ -1715,3 +1715,91 @@ async fn a_file_database_round_trips() {
     s.pool().close().await;
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[tokio::test]
+async fn create_node_with_admin_is_atomic_and_capped() {
+    let s = store(forge()).await;
+    let (alice, _) = s.create_local_user("alice", None, NOW).await.unwrap();
+    let (bob, _) = s.create_local_user("bob", None, NOW).await.unwrap();
+    let alice_key = SubjectKey::user(alice);
+
+    // Alice's personal org does not count towards the cap.
+    let team = s
+        .create_node_with_admin(None, "org", "Team", NameOrigin::User, alice, Some(1), NOW)
+        .await
+        .unwrap();
+    let node = s.node(team).await.unwrap().unwrap();
+    assert_eq!(node.owner, Some(alice));
+    assert_eq!(node.personal_of, None);
+    assert_eq!(node.name, "Team");
+    assert_eq!(
+        s.effective_role(team, &alice_key).await.unwrap(),
+        Some(s.roles().highest())
+    );
+
+    let nodes = count(&s, "forgs_ns_node").await;
+    let members = count(&s, "forgs_membership").await;
+    // At the cap: refused, nothing left behind.
+    let r = s
+        .create_node_with_admin(None, "org", "team2", NameOrigin::User, alice, Some(1), NOW)
+        .await;
+    assert!(matches!(r, Err(StoreError::OwnedLimit)), "{r:?}");
+    let r = s
+        .create_node_with_admin(None, "org", "zero", NameOrigin::User, bob, Some(0), NOW)
+        .await;
+    assert!(matches!(r, Err(StoreError::OwnedLimit)), "{r:?}");
+    // A name failure leaves no membership behind.
+    let r = s
+        .create_node_with_admin(None, "org", "team", NameOrigin::User, bob, None, NOW)
+        .await;
+    assert!(matches!(r, Err(StoreError::NameTaken)), "{r:?}");
+    let r = s
+        .create_node_with_admin(None, "nope", "x", NameOrigin::User, bob, None, NOW)
+        .await;
+    assert!(matches!(r, Err(StoreError::UnknownKind(_))), "{r:?}");
+    assert_eq!(count(&s, "forgs_ns_node").await, nodes);
+    assert_eq!(count(&s, "forgs_membership").await, members);
+
+    // Another user's nodes do not count; nor do Alice's under another parent.
+    s.create_node_with_admin(None, "org", "bobs", NameOrigin::User, bob, Some(1), NOW)
+        .await
+        .unwrap();
+    s.create_node_with_admin(
+        Some(team),
+        "project",
+        "p1",
+        NameOrigin::User,
+        alice,
+        Some(1),
+        NOW,
+    )
+    .await
+    .unwrap();
+    let r = s
+        .create_node_with_admin(
+            Some(team),
+            "project",
+            "p2",
+            NameOrigin::User,
+            alice,
+            Some(1),
+            NOW,
+        )
+        .await;
+    assert!(matches!(r, Err(StoreError::OwnedLimit)), "{r:?}");
+    s.create_node_with_admin(
+        Some(team),
+        "project",
+        "p2",
+        NameOrigin::User,
+        bob,
+        Some(1),
+        NOW,
+    )
+    .await
+    .unwrap();
+
+    // A parent with children cannot be deleted.
+    let r = s.delete_node(team, NOW).await;
+    assert!(matches!(r, Err(StoreError::HasChildren)), "{r:?}");
+}

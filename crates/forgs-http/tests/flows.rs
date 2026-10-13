@@ -1934,3 +1934,86 @@ async fn api_key_payloads_are_validated_canonicalised_and_listed() {
         .unwrap();
     assert!(odd.get("payload").is_none());
 }
+
+#[tokio::test]
+async fn create_and_delete_namespace() {
+    use forgs_http::members::{create_namespace, delete_namespace};
+
+    let h = harness().await;
+    h.signup("a", "1", "a@x.example", "alice").await;
+    h.signup("b", "2", "b@x.example", "bob").await;
+    let id = |name: &'static str| {
+        let h = &h;
+        async move {
+            h.ctx
+                .store()
+                .user_by_username(name)
+                .await
+                .unwrap()
+                .unwrap()
+                .id
+        }
+    };
+    let alice = id("alice").await;
+    let bob = id("bob").await;
+
+    let team = create_namespace(&h.ctx, alice, None, "org", "team", Some(1))
+        .await
+        .unwrap();
+    assert_eq!(
+        h.ctx
+            .store()
+            .effective_role(team, &SubjectKey::user(alice))
+            .await
+            .unwrap(),
+        Some(h.ctx.store().roles().highest())
+    );
+    assert!(h.audit.has("namespace.create"));
+
+    let e = create_namespace(&h.ctx, alice, None, "org", "team2", Some(1))
+        .await
+        .unwrap_err();
+    assert_eq!(e, ApiError::NAMESPACE_LIMIT);
+    assert_eq!(e.status(), StatusCode::FORBIDDEN);
+    let e = create_namespace(&h.ctx, bob, None, "org", "TEAM", None)
+        .await
+        .unwrap_err();
+    assert_eq!(e.code(), "username_taken");
+    let e = create_namespace(&h.ctx, bob, None, "nope", "x", None)
+        .await
+        .unwrap_err();
+    assert_eq!(e.status(), StatusCode::BAD_REQUEST);
+    // The schema's org kind is a leaf: nothing can go under it, and only an
+    // admin of the parent gets that far.
+    let e = create_namespace(&h.ctx, bob, Some("team"), "org", "x", None)
+        .await
+        .unwrap_err();
+    assert_eq!(e, ApiError::Forbidden);
+    let e = create_namespace(&h.ctx, alice, Some("team"), "org", "x", None)
+        .await
+        .unwrap_err();
+    assert_eq!(e.status(), StatusCode::BAD_REQUEST);
+
+    let e = delete_namespace(&h.ctx, bob, "team").await.unwrap_err();
+    assert_eq!(e, ApiError::Forbidden);
+    // A plain member is refused too, and that refusal is audited.
+    forgs_http::members::set(&h.ctx, alice, "team", "bob", "member")
+        .await
+        .unwrap();
+    let e = delete_namespace(&h.ctx, bob, "team").await.unwrap_err();
+    assert_eq!(e, ApiError::Forbidden);
+    assert!(h.audit.has("namespace.delete.denied"));
+    let e = delete_namespace(&h.ctx, alice, "alice").await.unwrap_err();
+    assert_eq!(e, ApiError::CONFLICT);
+    delete_namespace(&h.ctx, alice, "team").await.unwrap();
+    assert!(h.audit.has("namespace.delete"));
+    assert!(h.ctx.store().node(team).await.unwrap().is_none());
+    // The name is released forever; the cap no longer counts the old node.
+    let e = create_namespace(&h.ctx, alice, None, "org", "team", Some(1))
+        .await
+        .unwrap_err();
+    assert_eq!(e.code(), "username_taken");
+    create_namespace(&h.ctx, alice, None, "org", "team2", Some(1))
+        .await
+        .unwrap();
+}
