@@ -599,6 +599,64 @@ async fn app_routes_share_the_trust_path() {
 }
 
 #[tokio::test]
+async fn app_get_routes_share_the_trust_path() {
+    let (stub, c) = setup().await;
+    let nodes = json!({"nodes": ["n1"]});
+    stub.script("/api/nodes", vec![Reply::json(&nodes), Reply::json(&nodes)]);
+    let r: serde_json::Value = c
+        .get_json("/api/nodes?x=1", Some(&Secret::from("SEKRIT-g")))
+        .await
+        .unwrap();
+    assert_eq!(r, nodes);
+    let req = stub.last();
+    assert_eq!(req.method, "GET");
+    assert_eq!(req.path(), "/api/nodes");
+    assert_eq!(req.query(), "x=1");
+    assert_eq!(req.header("authorization"), Some("Bearer SEKRIT-g"));
+    assert!(!req.target.contains(MARK));
+    assert!(req.body.is_empty());
+
+    // Raw bytes through `get`, no bearer.
+    let body = c.get("/api/nodes", None).await.unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+        nodes
+    );
+    assert_eq!(stub.last().header("authorization"), None);
+
+    // Non-2xx maps to Rejected.
+    stub.script("/api/nodes", vec![Reply::error(403, "forbidden")]);
+    let e = c
+        .get_json::<serde_json::Value>("/api/nodes", None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(e, ClientError::Rejected { status: 403, .. }),
+        "{e:?}"
+    );
+    assert_eq!(e.code(), Some("forbidden"));
+
+    // A 2xx that is not JSON is Malformed.
+    stub.script("/api/nodes", vec![Reply::status(200, "nope")]);
+    let e = c
+        .get_json::<serde_json::Value>("/api/nodes", None)
+        .await
+        .unwrap_err();
+    assert!(matches!(e, ClientError::Malformed(_)), "{e:?}");
+
+    // A route that is not an absolute path never leaves the process.
+    let before = stub.requests().len();
+    for bad in ["api/x", "@evil.example/x", "https://evil.example/x"] {
+        let e = c
+            .get(bad, Some(&Secret::from("SEKRIT-g")))
+            .await
+            .unwrap_err();
+        assert!(matches!(e, ClientError::Url(_)), "{bad}: {e:?}");
+    }
+    assert_eq!(stub.requests().len(), before);
+}
+
+#[tokio::test]
 async fn members_and_rename() {
     let (stub, c) = setup().await;
     stub.script(

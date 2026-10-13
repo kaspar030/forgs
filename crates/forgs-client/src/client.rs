@@ -161,6 +161,39 @@ impl ForgsClient {
         serde_json::from_slice(&bytes).map_err(|e| ClientError::malformed(route, &e))
     }
 
+    /// `GET` `route` (relative to the base URL, starting with `/`) and return
+    /// the raw response body. A query string in `route` is allowed
+    /// (`/api/x?y=1`).
+    ///
+    /// Same trust path as [`ForgsClient::post`]: the same connector and TLS
+    /// configuration (so a pin covers it), the same timeout and response-size
+    /// cap. `bearer`, if any, is sent **only** as an `Authorization: Bearer`
+    /// header, never in the URL.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Url`] for a route that is not an absolute path (nothing
+    /// is sent); otherwise as [`ForgsClient::exchange`].
+    pub async fn get(&self, route: &str, bearer: Option<&Secret>) -> Result<Bytes, ClientError> {
+        self.get_absolute(self.route(route)?, bearer).await
+    }
+
+    /// `GET` `route` and decode a JSON response. See [`ForgsClient::get`] for
+    /// the trust path and the `route` rules.
+    ///
+    /// # Errors
+    ///
+    /// As [`ForgsClient::get`], plus [`ClientError::Malformed`] for a body
+    /// that does not decode as `R`.
+    pub async fn get_json<R: DeserializeOwned>(
+        &self,
+        route: &str,
+        bearer: Option<&Secret>,
+    ) -> Result<R, ClientError> {
+        let bytes = self.get(route, bearer).await?;
+        serde_json::from_slice(&bytes).map_err(|e| ClientError::malformed(route, &e))
+    }
+
     /// `GET` an absolute URL through the same connector and trust config.
     pub(crate) async fn get_absolute(
         &self,
