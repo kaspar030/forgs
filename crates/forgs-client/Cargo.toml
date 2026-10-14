@@ -4,6 +4,12 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories = ["authentication", "web-programming::http-client"]
 description = "forgs HTTP client: device login, refresh, logout, API keys and workload token exchange. No server dependencies."
 
 # Runs on the fleet agent (armv7-musl): pure Rust, rustls `ring` provider, and

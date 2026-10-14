@@ -4,6 +4,12 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "forgs identity providers: GitHub (OAuth2), generic OIDC with Codeberg/Forgejo and GitLab presets, and GitHub Actions workload identity."
 
 [dependencies]

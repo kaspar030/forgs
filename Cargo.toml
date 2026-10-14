@@ -19,6 +19,12 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
+authors = ["Kaspar Schleiser <kaspar@schleiser.de>"]
+repository = "https://github.com/kaspar030/forgs"
+homepage = "https://github.com/kaspar030/forgs"
+readme = "README.md"
+keywords = ["auth", "identity", "oauth", "oidc", "authorization"]
+categories = ["authentication", "web-programming"]
 
 [workspace.dependencies]
 # internal

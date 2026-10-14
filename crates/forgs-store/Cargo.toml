@@ -4,6 +4,12 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords = ["auth", "identity", "sqlite", "sqlx", "authorization"]
+categories = ["authentication", "database"]
 description = "forgs storage: SQLite schema, migrations, and the Store / scoped handles over sqlx."
 
 [dependencies]
