@@ -409,9 +409,9 @@ impl Store {
     ///
     /// A database error, or [`StoreError::CorruptRow`].
     pub async fn node(&self, node: NsNodeId) -> Result<Option<NsNode>> {
-        let row: Option<NodeRow> = sqlx::query_as(&format!(
+        let row: Option<NodeRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT {NODE_COLS} FROM forgs_ns_node n WHERE n.id = ?1"
-        ))
+        )))
         .bind(node.to_string())
         .fetch_optional(&self.pool)
         .await?;
@@ -424,9 +424,9 @@ impl Store {
     ///
     /// A database error, or [`StoreError::CorruptRow`].
     pub async fn children(&self, parent: Option<NsNodeId>) -> Result<Vec<NsNode>> {
-        let rows: Vec<NodeRow> = sqlx::query_as(&format!(
+        let rows: Vec<NodeRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT {NODE_COLS} FROM forgs_ns_node n WHERE n.parent_id IS ?1 ORDER BY n.name_canonical"
-        ))
+        )))
         .bind(parent.map(|p| p.to_string()))
         .fetch_all(&self.pool)
         .await?;
@@ -461,20 +461,20 @@ impl Store {
             for name in candidates {
                 let row: Option<NodeRow> = match &current {
                     Some(p) => {
-                        sqlx::query_as(&format!(
+                        sqlx::query_as(sqlx::AssertSqlSafe(format!(
                             "SELECT {NODE_COLS} FROM forgs_ns_node n
                           WHERE n.parent_id = ?1 AND n.name_canonical = ?2"
-                        ))
+                        )))
                         .bind(p.id.to_string())
                         .bind(&name)
                         .fetch_optional(&self.pool)
                         .await?
                     }
                     None => {
-                        sqlx::query_as(&format!(
+                        sqlx::query_as(sqlx::AssertSqlSafe(format!(
                             "SELECT {NODE_COLS} FROM forgs_ns_node n
                           WHERE n.parent_id IS NULL AND n.name_canonical = ?1"
-                        ))
+                        )))
                         .bind(&name)
                         .fetch_optional(&self.pool)
                         .await?
@@ -500,7 +500,7 @@ impl Store {
     ///
     /// A database error, or [`StoreError::CorruptRow`].
     pub async fn ancestors(&self, node: NsNodeId) -> Result<Vec<NsNode>> {
-        let rows: Vec<NodeRow> = sqlx::query_as(&format!(
+        let rows: Vec<NodeRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "WITH RECURSIVE chain(depth, id) AS (
                  SELECT 0, ?1
                  UNION ALL
@@ -511,7 +511,7 @@ impl Store {
              SELECT {NODE_COLS}
                FROM chain JOIN forgs_ns_node n ON n.id = chain.id
               ORDER BY chain.depth DESC"
-        ))
+        )))
         .bind(node.to_string())
         .fetch_all(&self.pool)
         .await?;

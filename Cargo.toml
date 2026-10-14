@@ -17,7 +17,8 @@ pedantic = { level = "warn", priority = -1 }
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+# 1.94: sqlx 0.9's MSRV.
+rust-version = "1.94"
 license = "MIT OR Apache-2.0"
 authors = ["Kaspar Schleiser <kaspar@schleiser.de>"]
 repository = "https://github.com/kaspar030/forgs"
@@ -76,12 +77,17 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "logg
 webpki-roots = { version = "1", default-features = false }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 # `rust_crypto`, not `aws_lc_rs`: the same cross-compilation reason as rustls.
-jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto"] }
+# Note: jsonwebtoken 11 `rust_crypto` still pulls rand 0.8 / rand_core 0.6 (via
+# rsa, p256, p384); server-side only (forgs-idp `oidc`), never in `forgs`.
+jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto"] }
 
 # Storage (forgs-store). No `macros` / `migrate`: queries are runtime-checked
 # (the crate builds without a live database) and forgs runs its own migrator
 # so apps keep `_sqlx_migrations` to themselves.
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
+# `sqlite-bundled`, not `sqlite`: in 0.9 `sqlite` also enables load-extension,
+# deserialize and unlock-notify, none of which forgs uses. Dynamic SQL (column
+# lists spliced from constants) is wrapped in `sqlx::AssertSqlSafe`.
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite-bundled"] }
 
 # HTTP server surface (forgs-http only; forgs-client must never see these).
 # No `tokio` / `http1`: the app owns the listener and nests forgs' router.

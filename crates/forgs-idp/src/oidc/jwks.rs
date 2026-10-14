@@ -53,9 +53,9 @@ impl std::fmt::Debug for JwksCache {
 
 impl JwksCache {
     /// Default ordinary staleness horizon.
-    pub const DEFAULT_REFRESH_AFTER: Duration = Duration::from_secs(3600);
+    pub const DEFAULT_REFRESH_AFTER: Duration = Duration::from_hours(1);
     /// Default floor between any two fetches.
-    pub const DEFAULT_MIN_REFETCH: Duration = Duration::from_secs(60);
+    pub const DEFAULT_MIN_REFETCH: Duration = Duration::from_mins(1);
 
     /// Build a cache over `url`.
     ///
@@ -206,7 +206,7 @@ mod tests {
             Reply::json(&jwks_json(&[("a", KEY_A_N)])),
         )])
         .await;
-        let cache = JwksCache::new(stub.url("/jwks"), Duration::from_secs(3600), Duration::ZERO);
+        let cache = JwksCache::new(stub.url("/jwks"), Duration::from_hours(1), Duration::ZERO);
         assert!(has(&cache.get().await.unwrap(), "a"));
         assert!(has(&cache.get().await.unwrap(), "a"));
         assert_eq!(stub.count("/jwks"), 1, "fresh set is served from cache");
@@ -228,7 +228,7 @@ mod tests {
         )])
         .await;
         // Always stale, but a long floor.
-        let cache = JwksCache::new(stub.url("/jwks"), Duration::ZERO, Duration::from_secs(3600));
+        let cache = JwksCache::new(stub.url("/jwks"), Duration::ZERO, Duration::from_hours(1));
         cache.get().await.unwrap();
         for _ in 0..5 {
             cache.get().await.unwrap();
@@ -244,7 +244,7 @@ mod tests {
             Reply::status(503, "text/plain", "down"),
         )])
         .await;
-        let cache = JwksCache::new(stub.url("/jwks"), Duration::ZERO, Duration::from_secs(3600));
+        let cache = JwksCache::new(stub.url("/jwks"), Duration::ZERO, Duration::from_hours(1));
         assert!(matches!(cache.get().await, Err(OidcError::Jwks(_))));
         for _ in 0..5 {
             assert!(matches!(cache.get().await, Err(OidcError::Jwks(_))));

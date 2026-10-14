@@ -179,9 +179,9 @@ pub(crate) async fn take_pending_signup_tx(
     id: PendingId,
     now: u64,
 ) -> Result<Option<PendingSignup>> {
-    let row: Option<SignupRow> = sqlx::query_as(&format!(
+    let row: Option<SignupRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "DELETE FROM forgs_pending_signup WHERE id = ?1 AND expires > ?2 RETURNING {SIGNUP_COLS}"
-    ))
+    )))
     .bind(id.to_string())
     .bind(ts(now)?)
     .fetch_optional(&mut *conn)
@@ -228,9 +228,9 @@ impl Store {
     ///
     /// A database error.
     pub async fn pending_signup(&self, id: PendingId, now: u64) -> Result<Option<PendingSignup>> {
-        let row: Option<SignupRow> = sqlx::query_as(&format!(
+        let row: Option<SignupRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT {SIGNUP_COLS} FROM forgs_pending_signup WHERE id = ?1 AND expires > ?2"
-        ))
+        )))
         .bind(id.to_string())
         .bind(ts(now)?)
         .fetch_optional(&self.pool)
@@ -330,9 +330,9 @@ impl Store {
         code: &str,
         now: u64,
     ) -> Result<Option<PendingDevice>> {
-        let row: Option<DeviceRow> = sqlx::query_as(&format!(
+        let row: Option<DeviceRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT {DEVICE_COLS} FROM forgs_pending_device WHERE user_code = ?1 AND expires > ?2"
-        ))
+        )))
         .bind(code)
         .bind(ts(now)?)
         .fetch_optional(&self.pool)
@@ -351,9 +351,9 @@ impl Store {
         device_hash: &TokenHash,
         now: u64,
     ) -> Result<Option<PendingDevice>> {
-        let row: Option<DeviceRow> = sqlx::query_as(&format!(
+        let row: Option<DeviceRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT {DEVICE_COLS} FROM forgs_pending_device WHERE device_hash = ?1 AND expires > ?2"
-        ))
+        )))
         .bind(device_hash.as_str())
         .bind(ts(now)?)
         .fetch_optional(&self.pool)

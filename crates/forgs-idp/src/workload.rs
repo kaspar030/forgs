@@ -458,7 +458,7 @@ mod tests {
         .await;
         let issuer = GithubActionsIssuer::with_parts(
             policy(),
-            JwksCache::new(stub.url("/jwks"), Duration::from_secs(3600), Duration::ZERO),
+            JwksCache::new(stub.url("/jwks"), Duration::from_hours(1), Duration::ZERO),
         );
         assert_eq!(issuer.name(), "github-actions");
         issuer

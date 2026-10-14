@@ -90,6 +90,6 @@ mod tests {
     fn default_policy_is_weekly_with_a_minute_of_ack_slack() {
         let d = RotationPolicy::default();
         assert_eq!(d.max_age_secs, 604_800);
-        assert_eq!(d.ack_timeout(), Duration::from_secs(60));
+        assert_eq!(d.ack_timeout(), Duration::from_mins(1));
     }
 }

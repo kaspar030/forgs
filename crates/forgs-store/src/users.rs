@@ -394,11 +394,11 @@ impl Store {
     ///
     /// A database error, or [`StoreError::CorruptRow`].
     pub async fn user_by_identity(&self, provider: &str, subject: &str) -> Result<Option<User>> {
-        let row: Option<UserRow> = sqlx::query_as(&format!(
+        let row: Option<UserRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT {USER_COLS} FROM forgs_user u
                JOIN forgs_identity i ON i.user_id = u.id
               WHERE i.provider = ?1 AND i.provider_subject = ?2"
-        ))
+        )))
         .bind(provider)
         .bind(subject)
         .fetch_optional(&self.pool)
@@ -462,9 +462,9 @@ impl Store {
     ///
     /// A database error, or [`StoreError::CorruptRow`].
     pub async fn user_by_id(&self, user: UserId) -> Result<Option<User>> {
-        let row: Option<UserRow> = sqlx::query_as(&format!(
+        let row: Option<UserRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT {USER_COLS} FROM forgs_user u WHERE u.id = ?1"
-        ))
+        )))
         .bind(user.to_string())
         .fetch_optional(&self.pool)
         .await?;
@@ -477,9 +477,9 @@ impl Store {
     ///
     /// A database error, or [`StoreError::CorruptRow`].
     pub async fn user_by_username(&self, username: &str) -> Result<Option<User>> {
-        let row: Option<UserRow> = sqlx::query_as(&format!(
+        let row: Option<UserRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT {USER_COLS} FROM forgs_user u WHERE u.username = ?1"
-        ))
+        )))
         .bind(username.trim().to_ascii_lowercase())
         .fetch_optional(&self.pool)
         .await?;

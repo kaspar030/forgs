@@ -509,9 +509,9 @@ impl<'a> NsScope<'a> {
     ///
     /// [`StoreError::CorruptRow`] or a database error.
     pub async fn list_grants(&self) -> Result<Vec<GrantRow>> {
-        let rows: Vec<GrantDbRow> = sqlx::query_as(&format!(
+        let rows: Vec<GrantDbRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT {GRANT_COLS} FROM forgs_grant WHERE ns_node_id = ?1 ORDER BY created_at DESC, id DESC"
-        ))
+        )))
         .bind(self.ns_s())
         .fetch_all(self.store.pool())
         .await?;
@@ -526,9 +526,9 @@ impl<'a> NsScope<'a> {
     ///
     /// [`StoreError::CorruptRow`] or a database error.
     pub async fn delete_grant(&self, id: GrantId) -> Result<Option<GrantRow>> {
-        let row: Option<GrantDbRow> = sqlx::query_as(&format!(
+        let row: Option<GrantDbRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "DELETE FROM forgs_grant WHERE ns_node_id = ?1 AND id = ?2 RETURNING {GRANT_COLS}"
-        ))
+        )))
         .bind(self.ns_s())
         .bind(id.to_string())
         .fetch_optional(self.store.pool())
@@ -554,10 +554,10 @@ impl<'a> NsScope<'a> {
         {
             return Err(StoreError::BadPrefix);
         }
-        let rows: Vec<GrantDbRow> = sqlx::query_as(&format!(
+        let rows: Vec<GrantDbRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "DELETE FROM forgs_grant WHERE ns_node_id = ?1 AND substr(id, 1, length(?2)) = ?2
              RETURNING {GRANT_COLS}"
-        ))
+        )))
         .bind(self.ns_s())
         .bind(&prefix)
         .fetch_all(self.store.pool())

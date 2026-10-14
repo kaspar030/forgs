@@ -225,7 +225,7 @@ mod tests {
         let idp = OidcProvider::discover(forgejo("forgejo-test", issuer, CLIENT, "s3cret"))
             .await
             .unwrap()
-            .with_jwks_timing(Duration::from_secs(3600), min_refetch);
+            .with_jwks_timing(Duration::from_hours(1), min_refetch);
         let req = AuthRequest::generate();
         Fixture { stub, idp, req }
     }
@@ -370,7 +370,7 @@ mod tests {
 
     #[tokio::test]
     async fn rotation_refetch_is_rate_limited() {
-        let f = fixture(Duration::from_secs(3600)).await;
+        let f = fixture(Duration::from_hours(1)).await;
         serve_token(
             &f,
             &sign("zz", KEY_B_DER_B64, &claims(&f.stub.base(), &f.req.nonce)),

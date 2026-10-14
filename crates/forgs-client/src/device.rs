@@ -41,7 +41,7 @@ impl Default for PollPolicy {
         Self {
             min_interval: Duration::from_secs(5),
             slow_down_step: Duration::from_secs(5),
-            default_expires_in: Duration::from_secs(900),
+            default_expires_in: Duration::from_mins(15),
             max_transport_retries: 5,
         }
     }

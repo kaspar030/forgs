@@ -42,7 +42,7 @@ fn fast() -> PollPolicy {
     PollPolicy {
         min_interval: Duration::from_millis(5),
         slow_down_step: Duration::from_millis(40),
-        default_expires_in: Duration::from_secs(900),
+        default_expires_in: Duration::from_mins(15),
         max_transport_retries: 2,
     }
 }

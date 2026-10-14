@@ -67,7 +67,7 @@ pub async fn migrate(pool: &SqlitePool) -> Result<()> {
         if current >= *version {
             continue;
         }
-        sqlx::raw_sql(sql).execute(&mut *tx).await?;
+        sqlx::raw_sql(*sql).execute(&mut *tx).await?;
         sqlx::query(
             "INSERT INTO forgs_schema_version (version, applied_at) VALUES (?1, unixepoch())",
         )

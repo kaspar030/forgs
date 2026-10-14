@@ -272,9 +272,9 @@ impl Store {
     ///
     /// [`crate::StoreError::CorruptRow`] or a database error.
     pub async fn api_key_by_hash(&self, hash: &TokenHash) -> Result<Option<ConsumedApiKey>> {
-        let row: Option<ApiKeyRecordRow> = sqlx::query_as(&format!(
+        let row: Option<ApiKeyRecordRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT {API_KEY_COLS} FROM forgs_api_key WHERE key_hash = ?1 AND consumed_at IS NULL"
-        ))
+        )))
         .bind(hash.as_str())
         .fetch_optional(&self.pool)
         .await?;
@@ -300,14 +300,14 @@ impl Store {
         hash: &TokenHash,
         now: u64,
     ) -> Result<Option<ConsumedApiKey>> {
-        let row: Option<ApiKeyRecordRow> = sqlx::query_as(&format!(
+        let row: Option<ApiKeyRecordRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "UPDATE forgs_api_key
                 SET consumed_at = CASE WHEN single_use != 0 THEN ?2 ELSE consumed_at END
               WHERE key_hash = ?1
                 AND consumed_at IS NULL
                 AND (expires IS NULL OR expires > ?2)
              RETURNING {API_KEY_COLS}"
-        ))
+        )))
         .bind(hash.as_str())
         .bind(ts(now)?)
         .fetch_optional(&self.pool)
@@ -343,11 +343,11 @@ impl Store {
         subject: &SubjectKey,
         now: u64,
     ) -> Result<Vec<GrantRow>> {
-        let rows: Vec<GrantDbRow> = sqlx::query_as(&format!(
+        let rows: Vec<GrantDbRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT {GRANT_COLS} FROM forgs_grant
               WHERE subject = ?1 AND (expires IS NULL OR expires > ?2)
               ORDER BY created_at DESC, id DESC"
-        ))
+        )))
         .bind(subject.to_string())
         .bind(ts(now)?)
         .fetch_all(&self.pool)

@@ -98,7 +98,7 @@ fn signup(username: &str, subject: &str, email: Option<&str>) -> NewSignup {
 }
 
 async fn count(s: &Store, table: &str) -> i64 {
-    let (n,): (i64,) = sqlx::query_as(&format!("SELECT COUNT(*) FROM {table}"))
+    let (n,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
         .fetch_one(s.pool())
         .await
         .unwrap();
