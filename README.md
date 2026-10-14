@@ -33,7 +33,7 @@ fleet's agent cross-compiles to armv7-musl and consumes `forgs-client`, so:
 - crypto via `ring` (rustls' `ring` provider), never `aws-lc-rs`;
 - `default-features = false` wherever defaults pull in more than is used;
 - `forgs` has no async runtime (tokio is a dev-dependency) and one RNG stack
-  (`rand_core` 0.6; `ulid` is used without its `std`/`rand` feature).
+  (`getrandom`; `ulid` is used without its `std`/`rand` feature).
 
 Workspace lints: `unsafe_code = "forbid"`, `clippy::pedantic` warn.
 

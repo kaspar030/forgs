@@ -387,9 +387,8 @@ impl TokenFormat {
     /// format (see [`TokenFormat::prefix`]).
     #[must_use]
     pub fn mint(&self, kind: TokenKind) -> OpaqueToken {
-        use rand_core::RngCore as _;
         let mut secret = [0u8; SECRET_LEN];
-        rand_core::OsRng.fill_bytes(&mut secret);
+        getrandom::fill(&mut secret).expect("OS random source failed");
         OpaqueToken {
             kind,
             prefix: self.prefix(kind).to_owned(),

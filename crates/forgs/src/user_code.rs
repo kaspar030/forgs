@@ -38,15 +38,13 @@ pub const CODE_LEN: usize = 8;
 /// takes.
 #[must_use]
 pub fn generate() -> String {
-    use rand_core::RngCore as _;
-
     // 256 % 32 == 0, so masking off five bits is a uniform draw. Asserted
     // rather than assumed: an alphabet whose length stops dividing 256 must
     // fail here loudly, not silently skew the distribution.
     debug_assert!(256 % ALPHABET.len() == 0, "alphabet length must divide 256");
 
     let mut buf = [0u8; CODE_LEN];
-    rand_core::OsRng.fill_bytes(&mut buf);
+    getrandom::fill(&mut buf).expect("OS random source failed");
     buf.iter()
         .map(|byte| char::from(ALPHABET[usize::from(byte & 0x1f)]))
         .collect()

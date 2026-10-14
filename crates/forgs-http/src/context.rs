@@ -17,7 +17,7 @@ use forgs::store::{
 use forgs::{AppKind, TokenFormat, TokenHash, TokenStore};
 use forgs_idp::{IdentityProvider, WorkloadIssuer};
 use forgs_store::Store;
-use hmac::{Hmac, Mac as _};
+use hmac::{Hmac, KeyInit as _, Mac as _};
 use sha2::Sha256;
 
 use crate::audit::{AuditSink, StoreAuditSink};

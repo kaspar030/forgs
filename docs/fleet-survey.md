@@ -110,7 +110,7 @@ handle that binds `org_id` into every query. Deliberate non-org-scoped queries:
 * Prefix is load-bearing: selects table *before* DB access; wrong kind → 403 not 401.
 * Stored only as lowercase-hex SHA-256 (`TokenHash`, `short()` = 8 hex for logs; `Debug` redacts).
 * `OpaqueToken::{mint, parse, kind, hash, to_secret_string}`; `Debug` never prints secret.
-* Deps: `base64`, `sha2`, `rand_core`, `thiserror`. No fleet coupling except the kind enum
+* Deps: `base64`, `sha2`, `getrandom`, `thiserror`. No fleet coupling except the kind enum
   (Node/NodeDevice are fleet concepts; prefix `prf` is fleet branding).
 * No signing on these: ed25519 is only for **capability tokens** (`fleet-proto/src/token.rs`,
   `fleet-coordinator/src/auth.rs::Ed25519Signer`) — lease/board-bound, fleet-specific.

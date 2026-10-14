@@ -18,7 +18,7 @@
 //! and friends, which reject anything that is not a well-formed ULID. Test
 //! fixtures use the same production constructors (survey §5.4).
 //!
-//! Randomness comes from `rand_core::OsRng` rather than ulid's own generator
+//! Randomness comes from `getrandom::fill` rather than ulid's own generator
 //! so that the dependency graph has one RNG stack (see the workspace
 //! `Cargo.toml`).
 
@@ -54,9 +54,8 @@ fn parse_ulid(s: &str) -> Result<Ulid, IdError> {
 /// can meaningfully recover from — the same stance
 /// [`crate::token::TokenFormat::mint`] takes.
 fn random_u128() -> u128 {
-    use rand_core::RngCore as _;
     let mut buf = [0u8; 16];
-    rand_core::OsRng.fill_bytes(&mut buf);
+    getrandom::fill(&mut buf).expect("OS random source failed");
     u128::from_le_bytes(buf)
 }
 

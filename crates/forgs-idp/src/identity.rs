@@ -4,7 +4,6 @@
 use std::fmt;
 
 use base64::Engine as _;
-use rand_core::RngCore as _;
 use sha2::Digest as _;
 
 /// Who a provider says the user is.
@@ -148,7 +147,7 @@ impl fmt::Debug for AuthRequest {
 
 fn random_b64() -> String {
     let mut bytes = [0u8; 32];
-    rand_core::OsRng.fill_bytes(&mut bytes);
+    getrandom::fill(&mut bytes).expect("OS random source failed");
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 

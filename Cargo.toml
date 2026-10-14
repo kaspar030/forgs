@@ -53,16 +53,17 @@ forgs-store = { path = "crates/forgs-store", version = "0.1.0" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
-base64 = "0.22"
-sha2 = "0.10"
-rand_core = "0.6"
+base64 = "0.23"
+sha2 = "0.11"
+# OS randomness. `getrandom::fill` directly: rand_core 0.10 dropped `OsRng`.
+getrandom = "0.4"
 thiserror = "2"
 async-trait = "0.1"
 # `default-features = false` and no features: ulid's `std` feature (which its
 # `serde` feature needs) pulls rand 0.9, a second RNG stack. forgs builds ids
-# with `Ulid::from_parts(now_ms, random)` from `rand_core::OsRng` instead, and
+# with `Ulid::from_parts(now_ms, random)` from `getrandom::fill` instead, and
 # implements serde for its id newtypes by hand.
-ulid = { version = "1.2", default-features = false }
+ulid = { version = "3.0", default-features = false }
 
 # HTTPS egress (forgs-idp's `client` feature). Everything pinned to
 # `default-features = false` and the rustls `ring` provider; see above.
@@ -87,7 +88,7 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio",
 # `original-uri` lets the cookie-prefix fence see the full path under a nest.
 axum = { version = "0.8", default-features = false, features = ["json", "query", "form", "original-uri"] }
 # CSRF / cookie MACs and constant-time comparison. Both pure Rust.
-hmac = "0.12"
+hmac = "0.13"
 subtle = "2"
 # Parsing `application/x-www-form-urlencoded` bodies on routes that accept
 # either JSON or a no-JS HTML form. Already in the graph via axum's `form`.
@@ -97,5 +98,5 @@ serde_urlencoded = "0.7"
 # `oneshot` for driving a Router in forgs-http's integration tests.
 tower = { version = "0.5", default-features = false, features = ["util"] }
 # Test certificates for forgs-client's pinned-TLS test; `ring`, not aws-lc.
-rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 tokio = { version = "1", default-features = false, features = ["macros", "rt"] }
