@@ -2,9 +2,8 @@
 //! and workload-token exchange against a forgs server's `/auth/*` JSON
 //! surface (docs/design.md §4–§5).
 //!
-//! Extracted from probe-rs-fleet's `fleet-auth::http_client` and the CLI flow
-//! pieces of `fleet-bin`. Wire types come from [`forgs::api`], so the contract
-//! cannot drift from `forgs-http`.
+//! Wire types come from [`forgs::api`], so the contract cannot drift from
+//! `forgs-http`.
 //!
 //! # Why hyper rather than reqwest
 //!

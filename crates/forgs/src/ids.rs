@@ -150,8 +150,8 @@ macro_rules! ulid_id {
 ulid_id!(
     /// A user: the principal behind a username.
     ///
-    /// Separate from the id of the user's personal namespace node, fixing
-    /// fleet's "personal org id == user id" wart.
+    /// Distinct from the id of the user's personal namespace node: a user and
+    /// its personal node never share an id.
     UserId
 );
 ulid_id!(

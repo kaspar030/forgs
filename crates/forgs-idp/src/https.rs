@@ -1,9 +1,9 @@
 //! The HTTPS egress every provider call goes through (feature `client`).
 //!
 //! `hyper` + `hyper-rustls` with an explicitly built [`rustls::ClientConfig`]
-//! over the `webpki-roots` bundle and the `ring` provider — the same stack
-//! and discipline as probe-rs-fleet. `reqwest` is out for the reason fleet
-//! gave: ~37 crates nothing else needs, including the `icu_*` unicode stack.
+//! over the `webpki-roots` bundle and the `ring` provider. `reqwest` is not
+//! used: it pulls ~37 crates nothing else needs, including the `icu_*`
+//! unicode stack.
 //!
 //! No certificate pinning: providers are public Web PKI hosts whose leaves
 //! rotate. Every endpoint has passed [`crate::url::check_endpoint_url`] before

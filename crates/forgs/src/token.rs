@@ -12,7 +12,7 @@
 //! ```
 //!
 //! Apps register extra kinds on a [`TokenFormat`] (probe-rs-fleet: `node` with
-//! tag `n`, `node_device` with tag `nd`), and pick the brand (fleet keeps
+//! tag `n`, `node_device` with tag `nd`), and pick the brand (fleet uses
 //! `prf`), so the prefix is `<brand><tag>1_`.
 //!
 //! The prefix is load-bearing, not decoration: it tells the server which

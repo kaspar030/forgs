@@ -19,8 +19,8 @@
 //! and `:` (a repo, `agent:<name>`) and still round-trip, while a namespace
 //! can contain neither.
 //!
-//! Compared to fleet, the org slot became optional (a user is no longer
-//! addressed "in their personal org") and the unused `Group` is gone.
+//! The namespace slot is optional (a user is not addressed "in their personal
+//! namespace"), and there are no group subjects.
 
 use std::fmt;
 
@@ -203,8 +203,8 @@ impl fmt::Display for SubjectKey {
 /// `Default`, no `From<String>`): it is minted at the server's single
 /// resolution seam from a verified credential.
 ///
-/// `acting_in` is the namespace the *request* targets. A session is no longer
-/// bound to one org at mint time (docs/design.md §3): the request names its
+/// `acting_in` is the namespace the *request* targets. A session is not
+/// bound to a namespace (docs/design.md §3): the request names its
 /// target and authz checks membership there. It is a claim to be checked,
 /// never a grant of anything.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

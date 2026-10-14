@@ -28,7 +28,7 @@ forgs-http = { path = "crates/forgs-http", version = "0.1.0" }
 forgs-idp = { path = "crates/forgs-idp", version = "0.1.0" }
 forgs-store = { path = "crates/forgs-store", version = "0.1.0" }
 
-# Dependency discipline (carried over from probe-rs-fleet):
+# Dependency discipline:
 #
 # * Pure Rust only. fleet's agent cross-compiles to armv7-musl and consumes
 #   forgs-client, so nothing in the graph may need a C toolchain.

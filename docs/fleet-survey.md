@@ -1,5 +1,10 @@
 # probe-rs-fleet → "forgs" extraction survey
 
+> **Note:** this is a snapshot of probe-rs-fleet at the time forgs was extracted
+> from it. It describes fleet, not forgs. Its "proposed" and "warts to fix"
+> sections are realized in [`design.md`](design.md), which describes forgs as
+> it is.
+
 Read-only survey of `/home/kaspar/src/ai/probe-rs-fleet` (paths below are relative to it).
 Goal: identify everything identity/org/user/auth/authz-related that could move to a
 reusable forge-style crate ("forgs"), and pin down exactly how GitHub names become identity.

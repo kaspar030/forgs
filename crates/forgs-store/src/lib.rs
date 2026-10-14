@@ -13,7 +13,7 @@
 //! # Tenancy
 //!
 //! A namespace is a security boundary between tenants, so tenancy is
-//! **structural, not advisory** (fleet's `OrgDb` rule, carried over). Rather
+//! **structural, not advisory**. Rather
 //! than an `ns` parameter on each method — which a caller can pass the wrong
 //! value to as easily as it can forget a `WHERE` clause — every
 //! namespace-owned row (memberships, API key listing and revocation, grant

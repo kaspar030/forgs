@@ -2,8 +2,8 @@
 //!
 //! Roles are stored as labels and compared by rank. The default ladder is
 //! `read < triage < write < maintain < admin`; fleet configures
-//! `member < admin`. [`Role::satisfies`] has the same semantics as fleet's
-//! `Role::satisfies`: a higher role implies every lower one.
+//! `member < admin`. [`Role::satisfies`] compares by rank: a higher role
+//! implies every lower one.
 //!
 //! Parsing is **fail closed**: an unknown label (a row written by a newer
 //! ladder, a typo in config) is `None`, never a default role.

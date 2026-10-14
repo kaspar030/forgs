@@ -17,8 +17,8 @@
 //!
 //! [`AuthError::label`] is a fixed `&'static str` per variant
 //! (`auth.reject.unknown` for every kind); the kind involved, including an app
-//! kind's label, is available separately from [`AuthError::kind`]. fleet's
-//! distinct `auth.reject.node_unknown` becomes `auth.reject.unknown` with
+//! kind's label, is available separately from [`AuthError::kind`]. App kinds
+//! such as fleet's node also report `auth.reject.unknown`, with
 //! `kind() == Some(node)`.
 
 use crate::store::{ApiKeyRecord, DeviceSecretRecord, RefreshRecord, TokenStore};

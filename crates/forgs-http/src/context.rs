@@ -140,9 +140,9 @@ impl CookieNames {
 /// The keys the browser surface MACs with.
 ///
 /// Derived from a secret **the app injects for this purpose** — not from any
-/// signing key the app has for something else. fleet derived its CSRF key
-/// from its ed25519 signing seed; forgs cannot see an app's keys and should
-/// not, so the app persists a dedicated secret (≥ 32 random bytes) and hands
+/// signing key the app has for something else. forgs cannot see an app's
+/// keys and should not, and reusing a signing key across purposes couples
+/// their compromise and rotation, so the app persists a dedicated secret (≥ 32 random bytes) and hands
 /// it in. Rotating it logs every open tab out, which is correct.
 ///
 /// Two keys come out of it, domain-separated by label and by the app label:
