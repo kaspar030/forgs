@@ -7,7 +7,6 @@
 //! `X-Frame-Options: DENY` against clickjacking the approve button,
 //! `Referrer-Policy: same-origin` so a code in the URL never leaks to another
 //! origin (while same-origin form posts still carry a real `Origin`), and
-
 //! `Cache-Control: no-store`.
 
 use axum::http::{header, HeaderValue, StatusCode};
