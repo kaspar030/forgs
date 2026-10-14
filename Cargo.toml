@@ -22,11 +22,11 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 # internal
-forgs = { path = "crates/forgs" }
-forgs-client = { path = "crates/forgs-client" }
-forgs-http = { path = "crates/forgs-http" }
-forgs-idp = { path = "crates/forgs-idp" }
-forgs-store = { path = "crates/forgs-store" }
+forgs = { path = "crates/forgs", version = "0.1.0" }
+forgs-client = { path = "crates/forgs-client", version = "0.1.0" }
+forgs-http = { path = "crates/forgs-http", version = "0.1.0" }
+forgs-idp = { path = "crates/forgs-idp", version = "0.1.0" }
+forgs-store = { path = "crates/forgs-store", version = "0.1.0" }
 
 # Dependency discipline (carried over from probe-rs-fleet):
 #
