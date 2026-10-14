@@ -152,6 +152,9 @@ async fn optional_caller(ctx: &AuthContext, headers: &HeaderMap) -> Option<Calle
 
 /// Authenticate a no-JS form POST: session by header or cookie, and for a
 /// cookie arrival the CSRF token from the header **or** the `csrf` field.
+// `Response` is axum's native rejection type (see `FromRequestParts::Rejection`);
+// boxing it would only add unboxing at every call site on the error path.
+#[allow(clippy::result_large_err)]
 async fn form_caller(
     ctx: &AuthContext,
     headers: &HeaderMap,

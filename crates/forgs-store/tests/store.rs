@@ -13,8 +13,8 @@ use forgs::{
     TokenKind, TokenStore, UserId,
 };
 use forgs_store::{
-    AuditEntry, NewApiKey, NewGrant, NewIdentity, NewSignup, Store, StoreError, SweepCounts,
-    UserState,
+    AuditEntry, AuditRow, GrantRow, NewApiKey, NewGrant, NewIdentity, NewSignup, NsNode, Store,
+    StoreError, SweepCounts, UserState,
 };
 use sqlx::sqlite::SqlitePoolOptions;
 
@@ -810,7 +810,10 @@ async fn ancestor_chains_and_role_inheritance() {
         .map(|n| n.id)
         .collect();
     assert_eq!(chain, vec![gh, owner, repo]);
-    assert!(s.ancestors(NsNodeId::generate(1)).await.unwrap().is_empty());
+    assert_eq!(
+        s.ancestors(NsNodeId::generate(1)).await.unwrap(),
+        Vec::<NsNode>::new()
+    );
 
     let (alice, _) = s.create_local_user("alice", None, NOW).await.unwrap();
     let key = SubjectKey::user(alice);
@@ -923,12 +926,13 @@ async fn api_key_listing_and_revocation_are_scoped() {
     assert_eq!(list[0].id, id_a);
     assert_eq!(list[0].payload.as_deref(), Some(r#"{"tags":["a"]}"#));
     // B cannot revoke A's key by prefix or id.
-    assert!(s
-        .scoped(b)
-        .delete_api_keys_by_prefix("aaaaaaaa")
-        .await
-        .unwrap()
-        .is_empty());
+    assert_eq!(
+        s.scoped(b)
+            .delete_api_keys_by_prefix("aaaaaaaa")
+            .await
+            .unwrap(),
+        Vec::<TokenHash>::new()
+    );
     assert!(!s.scoped(b).delete_api_key(id_a).await.unwrap());
     assert!(matches!(
         s.scoped(a).delete_api_keys_by_prefix("aaaa").await,
@@ -979,12 +983,10 @@ async fn audit_is_scoped() {
         rows.iter().map(|r| r.action.as_str()).collect::<Vec<_>>(),
         ["key.mint", "member.add"]
     );
-    assert!(s
-        .scoped(b.unwrap())
-        .recent_audit(10)
-        .await
-        .unwrap()
-        .is_empty());
+    assert_eq!(
+        s.scoped(b.unwrap()).recent_audit(10).await.unwrap(),
+        Vec::<AuditRow>::new()
+    );
     assert_eq!(s.scoped(a.unwrap()).recent_audit(1).await.unwrap().len(), 1);
 }
 
@@ -1402,12 +1404,10 @@ async fn grant_upsert_and_revocation() {
     // Revocation is scoped by namespace.
     assert!(s.scoped(b).delete_grant(id).await.unwrap().is_none());
     let prefix = id.to_string()[..10].to_ascii_lowercase();
-    assert!(s
-        .scoped(b)
-        .delete_grants_by_prefix(&prefix)
-        .await
-        .unwrap()
-        .is_empty());
+    assert_eq!(
+        s.scoped(b).delete_grants_by_prefix(&prefix).await.unwrap(),
+        Vec::<GrantRow>::new()
+    );
     assert!(matches!(
         s.scoped(a).delete_grants_by_prefix("01").await,
         Err(StoreError::BadPrefix)

@@ -152,6 +152,9 @@ fn forbidden() -> Response {
 /// # Errors
 ///
 /// The response to return: the uniform `401`, or `403` for a wrong kind.
+// `Response` is axum's native rejection type (see `FromRequestParts::Rejection`);
+// boxing it would only add unboxing at every call site on the error path.
+#[allow(clippy::result_large_err)]
 pub async fn authenticate_request(
     ctx: &AuthContext,
     headers: &HeaderMap,
@@ -245,6 +248,9 @@ async fn reject_authentication(ctx: &AuthContext, e: &AuthError) -> Response {
 /// # Errors
 ///
 /// `403 forbidden` when it is missing or wrong.
+// `Response` is axum's native rejection type (see `FromRequestParts::Rejection`);
+// boxing it would only add unboxing at every call site on the error path.
+#[allow(clippy::result_large_err)]
 pub async fn require_csrf(
     ctx: &AuthContext,
     method: &Method,

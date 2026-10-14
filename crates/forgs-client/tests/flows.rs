@@ -614,7 +614,7 @@ async fn app_get_routes_share_the_trust_path() {
     assert_eq!(req.query(), "x=1");
     assert_eq!(req.header("authorization"), Some("Bearer SEKRIT-g"));
     assert!(!req.target.contains(MARK));
-    assert!(req.body.is_empty());
+    assert_eq!(req.body, "");
 
     // Raw bytes through `get`, no bearer.
     let body = c.get("/api/nodes", None).await.unwrap();

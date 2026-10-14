@@ -538,7 +538,7 @@ mod tests {
         let none = Access::<Sel, TOp>::none();
         assert!(none.is_empty());
         assert!(!none.may_use(&b, NOW));
-        assert!(none.effective_ops(&b, NOW).is_empty());
+        assert_eq!(none.effective_ops(&b, NOW), Vec::<TOp>::new());
         assert!(none.matching_grant(&b, NOW).is_none());
     }
 

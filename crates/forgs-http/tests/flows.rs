@@ -88,7 +88,7 @@ impl IdentityProvider for StubIdp {
         redirect_uri: &str,
         pkce_verifier: &str,
     ) -> Result<ProviderTokens, IdpError> {
-        assert!(!pkce_verifier.is_empty());
+        assert_ne!(pkce_verifier, "");
         self.redirect_uris
             .lock()
             .unwrap()
