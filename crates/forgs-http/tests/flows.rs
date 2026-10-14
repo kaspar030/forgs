@@ -329,6 +329,10 @@ async fn app_any(auth: Authenticated<AnyConnection, HeaderOnly>) -> String {
 }
 
 async fn harness_with(issuer: bool) -> H {
+    harness_at(issuer, &format!("{PUBLIC}/")).await
+}
+
+async fn harness_at(issuer: bool, public_url: &str) -> H {
     let store = Store::connect_in_memory(schema(), RoleLadder::new(&["member", "admin"]).unwrap())
         .await
         .unwrap();
@@ -338,7 +342,7 @@ async fn harness_with(issuer: bool) -> H {
     let audit = Arc::new(Collect::default());
     let nodes = Arc::new(NodeTokens::default());
     let (format, node, node_device) = test_format();
-    let mut b = AuthContext::builder(store, &format!("{PUBLIC}/"), &[42; 32])
+    let mut b = AuthContext::builder(store, public_url, &[42; 32])
         .app_label("test")
         .format(format)
         .app_tokens(nodes.clone())
@@ -428,15 +432,26 @@ impl H {
     }
 
     async fn post_form(&self, uri: &str, jar: &Jar, form: &[(&str, &str)]) -> Resp {
+        self.post_form_with(uri, jar, &[], form).await
+    }
+
+    async fn post_form_with(
+        &self,
+        uri: &str,
+        jar: &Jar,
+        extra: &[(&str, &str)],
+        form: &[(&str, &str)],
+    ) -> Resp {
         let body = serde_urlencoded::to_string(form).unwrap();
-        let req = Request::builder()
+        let mut b = Request::builder()
             .method(Method::POST)
             .uri(uri)
             .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-            .header(header::COOKIE, jar.header())
-            .body(Body::from(body))
-            .unwrap();
-        self.send(req).await
+            .header(header::COOKIE, jar.header());
+        for (k, v) in extra {
+            b = b.header(*k, *v);
+        }
+        self.send(b.body(Body::from(body)).unwrap()).await
     }
 
     /// Start + callback with `code`; returns the callback response.
@@ -498,6 +513,77 @@ fn query_param(url: &str, key: &str) -> String {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+async fn signup_origin_checks() {
+    // Each case: (extra headers, expected status).
+    let cases: &[(&[(&str, &str)], StatusCode)] = &[
+        (&[("origin", PUBLIC)], StatusCode::SEE_OTHER),
+        (
+            &[("origin", PUBLIC), ("sec-fetch-site", "same-origin")],
+            StatusCode::SEE_OTHER,
+        ),
+        (
+            &[("origin", "null"), ("sec-fetch-site", "same-origin")],
+            StatusCode::SEE_OTHER,
+        ),
+        (&[("origin", "null")], StatusCode::FORBIDDEN),
+        (
+            &[("origin", "null"), ("sec-fetch-site", "same-site")],
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            &[("origin", "null"), ("sec-fetch-site", "cross-site")],
+            StatusCode::FORBIDDEN,
+        ),
+        (&[("origin", "https://evil.example")], StatusCode::FORBIDDEN),
+        (
+            &[
+                ("origin", "https://evil.example"),
+                ("sec-fetch-site", "same-origin"),
+            ],
+            StatusCode::FORBIDDEN,
+        ),
+        (&[("sec-fetch-site", "cross-site")], StatusCode::FORBIDDEN),
+        (
+            &[("origin", PUBLIC), ("sec-fetch-site", "cross-site")],
+            StatusCode::FORBIDDEN,
+        ),
+    ];
+    // A trailing slash or a path in public_url still yields the bare origin.
+    for public_url in [format!("{PUBLIC}/"), format!("{PUBLIC}/app/")] {
+        let h = harness_at(true, &public_url).await;
+        for (i, (extra, want)) in cases.iter().enumerate() {
+            let name = format!("user{i}");
+            h.idp.add(
+                &format!("code{i}"),
+                &format!("sub{i}"),
+                &format!("{name}@example.com"),
+                Some(&name),
+            );
+            let mut jar = Jar::default();
+            let cb = h.browser_login(&mut jar, "stub", &format!("code{i}")).await;
+            cb.expect(StatusCode::FOUND);
+            assert_eq!(cb.location(), "/auth/signup");
+            let r = h
+                .post_form_with("/auth/signup", &jar, extra, &[("username", &name)])
+                .await;
+            assert_eq!(r.status, *want, "{public_url} {extra:?}");
+            if *want == StatusCode::FORBIDDEN {
+                // The ticket is unspent: a proper same-origin retry succeeds.
+                let r = h
+                    .post_form_with(
+                        "/auth/signup",
+                        &jar,
+                        &[("origin", PUBLIC)],
+                        &[("username", &name)],
+                    )
+                    .await;
+                r.expect(StatusCode::SEE_OTHER);
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn first_login_signup_then_second_login() {
     let h = harness().await;
     h.idp.add("c1", "100", "alice@example.com", Some("Alice"));
@@ -521,6 +607,7 @@ async fn first_login_signup_then_second_login() {
         .to_str()
         .unwrap()
         .starts_with("default-src 'none'"));
+    assert_eq!(page.headers[header::REFERRER_POLICY], "same-origin");
 
     let r = h
         .post_form("/auth/signup", &jar, &[("username", "alice")])

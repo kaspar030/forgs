@@ -125,17 +125,23 @@ fn is_json(headers: &HeaderMap) -> bool {
 
 /// For a browser POST that is not otherwise CSRF-protected (no session yet):
 /// refuse a cross-origin `Origin` or `Sec-Fetch-Site: cross-site`.
+///
+/// `Origin: null` (an opaque origin, e.g. from a document with a
+/// `no-referrer` policy or a privacy setting) is accepted only when the
+/// browser's own fetch metadata says `Sec-Fetch-Site: same-origin`; pages
+/// cannot forge that header. A missing `Origin` passes (non-browser clients).
 fn same_origin(ctx: &AuthContext, headers: &HeaderMap) -> bool {
-    if headers
-        .get("sec-fetch-site")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.eq_ignore_ascii_case("cross-site"))
-    {
+    let site = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok());
+    if site.is_some_and(|v| v.eq_ignore_ascii_case("cross-site")) {
         return false;
     }
     match headers.get(header::ORIGIN) {
         None => true,
-        Some(v) => v.to_str().ok() == Some(ctx.public_origin()),
+        Some(v) => match v.to_str() {
+            Ok("null") => site.is_some_and(|s| s.eq_ignore_ascii_case("same-origin")),
+            Ok(o) => o == ctx.public_origin(),
+            Err(_) => false,
+        },
     }
 }
 

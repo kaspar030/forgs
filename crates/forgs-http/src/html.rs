@@ -5,7 +5,9 @@
 //! with a strict CSP (`default-src 'none'`: no scripts, styles, images or
 //! frames of any origin; forms may only post back to this origin), plus
 //! `X-Frame-Options: DENY` against clickjacking the approve button,
-//! `Referrer-Policy: no-referrer` so a code in the URL never leaks, and
+//! `Referrer-Policy: same-origin` so a code in the URL never leaks to another
+//! origin (while same-origin form posts still carry a real `Origin`), and
+
 //! `Cache-Control: no-store`.
 
 use axum::http::{header, HeaderValue, StatusCode};
@@ -55,7 +57,7 @@ pub fn page(status: StatusCode, title: &str, body: &str) -> Response {
     h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
     h.insert(
         header::REFERRER_POLICY,
-        HeaderValue::from_static("no-referrer"),
+        HeaderValue::from_static("same-origin"),
     );
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     h.insert(
