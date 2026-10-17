@@ -2300,6 +2300,30 @@ async fn device_approval_state_machine() {
     assert_eq!(n, 1);
 }
 
+#[tokio::test]
+async fn workload_jti_is_single_use_per_issuer() {
+    let s = store(fleet()).await;
+    let w = forgs::subject::workload_subject_key("gha", "1", "2").unwrap();
+    assert!(s
+        .record_workload_jti("github-actions", "j1", &w, NOW, NOW + 60)
+        .await
+        .unwrap());
+    assert!(!s
+        .record_workload_jti("github-actions", "j1", &w, NOW + 1, NOW + 60)
+        .await
+        .unwrap());
+    // jti is only unique within one issuer.
+    let g = forgs::subject::workload_subject_key("ghes", "1", "2").unwrap();
+    assert!(s
+        .record_workload_jti("ghes", "j1", &g, NOW, NOW + 60)
+        .await
+        .unwrap());
+    assert!(s
+        .record_workload_jti("github-actions", "j2", &w, NOW, NOW + 60)
+        .await
+        .unwrap());
+}
+
 // ---------------------------------------------------------------------------
 // Sweep
 // ---------------------------------------------------------------------------
@@ -2329,6 +2353,14 @@ async fn sweep_removes_exactly_the_dead_rows() {
     s.insert_workload_token(&hash(6), &w, "github_oidc", None, NOW, t + 1)
         .await
         .unwrap();
+    assert!(s
+        .record_workload_jti("github-actions", "j-dead", &w, NOW, t)
+        .await
+        .unwrap()); // dead
+    assert!(s
+        .record_workload_jti("github-actions", "j-live", &w, NOW, t + 1)
+        .await
+        .unwrap());
     scope
         .insert_api_key(&key(hash(7), true, Some(t)), NOW)
         .await
@@ -2370,6 +2402,7 @@ async fn sweep_removes_exactly_the_dead_rows() {
             sessions: 1,
             refresh_tokens: 1,
             workload_tokens: 1,
+            workload_jtis: 1,
             api_keys: 2,
             pending_signups: 1,
             pending_devices: 2,
@@ -2381,6 +2414,16 @@ async fn sweep_removes_exactly_the_dead_rows() {
     assert!(s.lookup_session(&hash(2)).await.unwrap().is_some());
     assert!(s.lookup_refresh_token(&hash(4)).await.unwrap().is_some());
     assert!(s.lookup_workload(&hash(6)).await.unwrap().is_some());
+    // The live replay record survives: re-recording it is still a replay,
+    // while the swept one may be recorded afresh.
+    assert!(!s
+        .record_workload_jti("github-actions", "j-live", &w, t, t + 1)
+        .await
+        .unwrap());
+    assert!(s
+        .record_workload_jti("github-actions", "j-dead", &w, t, t + 1)
+        .await
+        .unwrap());
     assert_eq!(scope.list_api_keys().await.unwrap().len(), 2);
     assert!(s.lookup_device_secret(&hash(13)).await.unwrap().is_some());
 }

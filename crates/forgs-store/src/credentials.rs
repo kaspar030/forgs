@@ -371,6 +371,38 @@ impl Store {
             .await
     }
 
+    /// Record the first exchange of the workload JWT `jti` from `issuer`, kept
+    /// until `expires` (the JWT's `exp` + leeway; swept afterwards).
+    ///
+    /// One atomic conditional insert: `true` means first use, `false` means
+    /// the `(issuer, jti)` pair was already recorded, i.e. a replay.
+    ///
+    /// # Errors
+    ///
+    /// A database error.
+    pub async fn record_workload_jti(
+        &self,
+        issuer: &str,
+        jti: &str,
+        subject: &SubjectKey,
+        now: u64,
+        expires: u64,
+    ) -> Result<bool> {
+        let done = sqlx::query(
+            "INSERT INTO forgs_workload_jti (issuer, jti, subject, created_at, expires)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT (issuer, jti) DO NOTHING",
+        )
+        .bind(issuer)
+        .bind(jti)
+        .bind(subject.to_string())
+        .bind(ts(now)?)
+        .bind(ts(expires)?)
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected() == 1)
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn insert_workload_token_row(
         &self,

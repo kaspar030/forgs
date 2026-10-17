@@ -112,7 +112,9 @@ impl IdentityProvider for StubIdp {
 }
 
 /// Accepts `<prefix>:<owner_id>/<repo_id>/<owner>/<repo>` (prefix `good` for
-/// the default issuer), keyed under `ns`.
+/// the default issuer), keyed under `ns`. The `jti` is everything after the
+/// prefix, so the same string is the same token, and two issuers can share a
+/// `jti`.
 struct StubIssuer {
     name: &'static str,
     ns: &'static str,
@@ -163,6 +165,8 @@ impl WorkloadIssuer for StubIssuer {
                 run_id: None,
                 sub: "repo:x".into(),
                 exp: NOW + 300,
+                jti: rest.to_owned(),
+                accept_until: NOW + 360,
             },
         })
     }
@@ -2210,9 +2214,17 @@ async fn workload_exchange() {
         )
         .await
         .unwrap();
+    // The no-grant refusal above did not burn the jti: this first success
+    // is the same JWT.
     let r = token(json!({"grant_type": "github_oidc", "oidc_token": jwt})).await;
     r.expect(StatusCode::OK);
     assert_eq!(r.json()["expires"], NOW + 3600);
+    // Single use: a replay of the same JWT is refused, flat, and audited.
+    assert!(!h.audit.has("workload.reject.replay"));
+    let replay = token(json!({"grant_type": "github_oidc", "oidc_token": jwt})).await;
+    replay.expect(StatusCode::UNAUTHORIZED);
+    assert_eq!(replay.error(), "invalid_grant");
+    assert!(h.audit.has("workload.reject.replay"));
     let me = h.whoami(r.json()["token"].as_str().unwrap()).await.json();
     assert_eq!(
         me["subject"],
@@ -2282,6 +2294,7 @@ async fn workload_exchange() {
         )
         .await
         .unwrap();
+    // Same jti as the replayed `gha` JWT, but another issuer: independent.
     let r = token(json!({"grant_type": "github_oidc", "oidc_token": ghes})).await;
     r.expect(StatusCode::OK);
     let me = h.whoami(r.json()["token"].as_str().unwrap()).await.json();

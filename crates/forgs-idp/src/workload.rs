@@ -9,8 +9,8 @@
 //! # What is verified, and what is merely recorded
 //!
 //! Verified: signature (JWKS key by mandatory `kid`), algorithm (exactly
-//! `[RS256]`), issuer and audience (exact), `exp`/`nbf` against an injected
-//! `now`, and that `repository_id` and `repository_owner_id` are present,
+//! `[RS256]`), issuer and audience (exact), `exp`/`nbf`/`iat` against an
+//! injected `now`, a non-empty `jti`, and that `repository_id` and `repository_owner_id` are present,
 //! canonical numeric ids ([`forgs::subject::normalise_github_id`]).
 //!
 //! **Authorizing**: only the immutable ids. The subject is
@@ -27,6 +27,11 @@
 //! `repository_owner`, `run_id`, `workflow`, `ref_type`,
 //! `runner_environment`. A fork, or a new repo under a granted owner, has a
 //! different `repository_id` and so matches no grant.
+//!
+//! **Single use** is the caller's job: this module is pure, so it only
+//! requires the `jti` and reports [`WorkloadClaims::accept_until`]. forgs-http
+//! records `(issuer, jti)` until then and refuses a second exchange, so a
+//! leaked id token is worth at most one workload token.
 //!
 //! # Claim constraints: which jobs of a granted repo may exchange
 //!
@@ -278,6 +283,12 @@ pub struct WorkloadClaims {
     pub sub: String,
     /// The token's expiry, epoch seconds.
     pub exp: u64,
+    /// The token's `jti`, verbatim and non-empty. Unique per issuer; the
+    /// caller enforces single use with it.
+    pub jti: String,
+    /// `exp` + the policy's (clamped) leeway: the last second this JWT
+    /// verifies. A replay record must be kept until then.
+    pub accept_until: u64,
 }
 
 /// A verified workload: the subject it authenticates as, plus its claims.
@@ -317,6 +328,8 @@ struct RawClaims {
     job_workflow_ref: Option<String>,
     #[serde(default)]
     run_id: Option<String>,
+    #[serde(default)]
+    jti: Option<String>,
     sub: Option<String>,
     exp: Option<u64>,
 }
@@ -373,6 +386,11 @@ pub fn verify_github_actions(
         .sub
         .filter(|s| !s.is_empty())
         .ok_or(OidcError::MissingClaim("sub"))?;
+    let jti = claims
+        .jti
+        .filter(|s| !s.is_empty())
+        .ok_or(OidcError::MissingClaim("jti"))?;
+    let accept_until = exp.saturating_add(policy.leeway_secs.min(crate::oidc::MAX_LEEWAY_SECS));
     let repository = claims
         .repository
         .as_deref()
@@ -418,6 +436,8 @@ pub fn verify_github_actions(
         run_id: claims.run_id,
         sub,
         exp,
+        jti,
+        accept_until,
     };
     policy.constraints.check(&claims)?;
     Ok(WorkloadIdentity { subject, claims })
@@ -580,6 +600,7 @@ mod tests {
             "workflow": "hil",
             "job_workflow_ref": "ariel-os/ariel-os/.github/workflows/hil.yml@refs/heads/main",
             "run_id": "12345",
+            "jti": "c0ffee-1",
         })
     }
 
@@ -619,6 +640,45 @@ mod tests {
         );
         assert_eq!(out.claims.run_id.as_deref(), Some("12345"));
         assert_eq!(out.claims.exp, 2_000);
+        assert_eq!(out.claims.jti, "c0ffee-1");
+        assert_eq!(out.claims.accept_until, 2_060);
+    }
+
+    #[test]
+    fn a_missing_or_empty_jti_is_refused() {
+        let keys = jwks(&[("k1", KEY_A_N)]);
+        let mut c = claims();
+        c["jti"] = json!("");
+        assert_eq!(
+            verify(&sign("k1", KEY_A_DER_B64, &c), &keys, 1_000),
+            Err(OidcError::MissingClaim("jti"))
+        );
+        c.as_object_mut().unwrap().remove("jti");
+        assert_eq!(
+            verify(&sign("k1", KEY_A_DER_B64, &c), &keys, 1_000),
+            Err(OidcError::MissingClaim("jti"))
+        );
+    }
+
+    #[test]
+    fn accept_until_uses_the_clamped_leeway_and_a_future_iat_is_refused() {
+        let keys = jwks(&[("k1", KEY_A_N)]);
+        let lax = OidcPolicy {
+            leeway_secs: 10_000,
+            ..policy()
+        };
+        let out = verify_github_actions(&sign("k1", KEY_A_DER_B64, &claims()), &keys, &lax, 1_000)
+            .unwrap();
+        assert_eq!(
+            out.claims.accept_until,
+            2_000 + crate::oidc::MAX_LEEWAY_SECS
+        );
+        let mut c = claims();
+        c["iat"] = json!(1_500u64);
+        assert_eq!(
+            verify(&sign("k1", KEY_A_DER_B64, &c), &keys, 1_000),
+            Err(OidcError::NotYetValid)
+        );
     }
 
     fn verify_with(c: &serde_json::Value, constraints: ClaimConstraints) -> Result<(), OidcError> {

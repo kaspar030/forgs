@@ -476,10 +476,13 @@ impl ForgsClient {
     /// Exchange a GitHub Actions OIDC JWT for a short-lived workload token.
     /// Fetch the JWT with [`crate::gha::fetch_id_token`].
     ///
+    /// An id token is **single use**: the server refuses a second exchange
+    /// of the same JWT. To retry after an error, fetch a fresh id token.
+    ///
     /// # Errors
     ///
-    /// As [`ForgsClient::exchange`]. Every verification failure is a flat
-    /// `401 invalid_grant`.
+    /// As [`ForgsClient::exchange`]. Every verification failure (including a
+    /// replayed JWT) is a flat `401 invalid_grant`.
     pub async fn exchange_github_oidc(
         &self,
         oidc_token: &str,

@@ -240,6 +240,13 @@ forgs_membership { ns_node_id, subject (SubjectKey), user_id NULL, role }
   constraint whose claim is absent fails closed. By default only
   `pull_request_target` is denied. The extra claims are recorded in
   `WorkloadClaims` and the minted token's claims for audit.
+  Each workload JWT is **single use**: the `jti` (required) is recorded per
+  issuer in `forgs_workload_jti` just before the mint, kept until the JWT's
+  `exp` + leeway and swept afterwards; a second exchange is a flat
+  `invalid_grant` audited as `workload.reject.replay`. A refusal before the
+  mint (no grant yet) does not burn it. The minted token deliberately
+  outlives the JWT, so keep `Ttls::workload` close to the expected job
+  duration: a leaked id token is then worth one token of that lifetime.
   **Breaking (2026-10):** the earlier name-keyed subjects
   (`gha/workload:<owner>/<repo>`) no longer match any token. Existing grants
   on them are inert and are not migrated; recreate them against the id-keyed

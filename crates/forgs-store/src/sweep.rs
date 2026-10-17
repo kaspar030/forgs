@@ -23,6 +23,9 @@ pub struct SweepCounts {
     pub refresh_tokens: u64,
     /// Expired workload tokens.
     pub workload_tokens: u64,
+    /// Expired workload JWT replay records
+    /// ([`Store::record_workload_jti`]).
+    pub workload_jtis: u64,
     /// Expired or consumed API keys.
     pub api_keys: u64,
     /// Expired pending signups.
@@ -38,7 +41,9 @@ pub struct SweepCounts {
 
 impl Store {
     /// Delete every credential row that expired at or before `now`
-    /// (`expires <= now`, matching verification's exclusive expiry), consumed
+    /// (`expires <= now`, matching verification's exclusive expiry) —
+    /// including workload JWT replay records, whose JWT no longer verifies —
+    /// consumed
     /// single-use API keys no live workload token still references, and
     /// decided device approvals; and audit rows with `ts < now - retention`
     /// unless retention is `None` ([`Store::with_audit_retention`]); and, when
@@ -79,6 +84,7 @@ impl Store {
             sessions: run("DELETE FROM forgs_session WHERE expires <= ?1").await?,
             refresh_tokens: run("DELETE FROM forgs_refresh_token WHERE expires <= ?1").await?,
             workload_tokens: run("DELETE FROM forgs_workload_token WHERE expires <= ?1").await?,
+            workload_jtis: run("DELETE FROM forgs_workload_jti WHERE expires <= ?1").await?,
             api_keys: run("DELETE FROM forgs_api_key WHERE expires <= ?1
                      OR (consumed_at IS NOT NULL AND NOT EXISTS (
                          SELECT 1 FROM forgs_workload_token w

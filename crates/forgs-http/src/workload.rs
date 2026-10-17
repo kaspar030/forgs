@@ -10,7 +10,11 @@
 //!   covers **every workflow on every branch** of the repo unless the
 //!   issuer's [`forgs_idp::ClaimConstraints`] (ref, environment,
 //!   `job_workflow_ref`, event, `ref_protected`) narrow it; a refused job is
-//!   `oidc.reject.claim_not_allowed` in the audit.
+//!   `oidc.reject.claim_not_allowed` in the audit. Each JWT is **single
+//!   use**: its `(issuer, jti)` is recorded (until the JWT's `exp` + leeway)
+//!   just before the mint, and a second exchange is
+//!   `workload.reject.replay`. A token refused earlier (e.g. no grant yet)
+//!   is not burnt.
 //! * `api_key` — the weak path for a runner with no workload identity: a
 //!   long-lived bearer secret in somebody's CI config. Bounded by being
 //!   namespace-scoped, expiring and revocable; the workload token it mints
@@ -77,6 +81,44 @@ async fn mint_workload(
         user_id: None,
         refresh_token: None,
     })
+}
+
+/// Record the JWT's `(issuer, jti)`; a replay is `401 invalid_grant`,
+/// audited as `workload.reject.replay`. Fails closed: if the mint after it
+/// fails, the jti stays used and the job fetches a fresh id token.
+async fn claim_jti(
+    ctx: &AuthContext,
+    issuer: &str,
+    identity: &forgs_idp::WorkloadIdentity,
+) -> Result<(), ApiError> {
+    let now = ctx.now();
+    let c = &identity.claims;
+    if ctx
+        .store()
+        .record_workload_jti(
+            issuer,
+            &c.jti,
+            &identity.subject,
+            now,
+            c.accept_until.max(now),
+        )
+        .await
+        .map_err(store_err("record_workload_jti"))?
+    {
+        return Ok(());
+    }
+    ctx.audit()
+        .record(
+            AuditEvent::new(now, "workload.reject.replay")
+                .subject(&identity.subject)
+                .detail(format!(
+                    "issuer={issuer} repository_id={} run_id={}",
+                    c.repository_id,
+                    c.run_id.as_deref().unwrap_or("-")
+                )),
+        )
+        .await;
+    Err(ApiError::InvalidGrant)
 }
 
 /// Exchange a workload OIDC JWT.
@@ -148,6 +190,9 @@ pub async fn exchange_oidc(ctx: &AuthContext, jwt: &str) -> Result<TokenResponse
         return Err(ApiError::InvalidGrant);
     }
     let c = &identity.claims;
+    // Single use, recorded last so an earlier refusal (no grant) does not
+    // burn the JWT.
+    claim_jti(ctx, &issuer, &identity).await?;
     let claims = serde_json::json!({
         "repository": c.repository,
         "repository_id": c.repository_id,
@@ -163,9 +208,12 @@ pub async fn exchange_oidc(ctx: &AuthContext, jwt: &str) -> Result<TokenResponse
         "runner_environment": c.runner_environment,
         "run_id": c.run_id,
         "sub": c.sub,
+        "jti": c.jti,
     })
     .to_string();
-    // Not capped by the JWT's `exp` (minutes): the job outlives its id token.
+    // Deliberately not capped by the JWT's `exp` (minutes): the job outlives
+    // its id token. The extension is bounded by the jti's single use above
+    // and by `Ttls::workload`.
     let detail = format!(
         "issuer={issuer} repository={} repository_id={} owner_id={} ref={} event={} environment={}",
         c.repository,

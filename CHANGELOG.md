@@ -4,6 +4,12 @@
 
 ### Security
 
+- A GitHub Actions id token can be exchanged for a workload token only once
+  (per issuer and `jti`, remembered until the JWT's `exp` + leeway). A leaked
+  id token can no longer be replayed for fresh workload tokens until it
+  expires; a replay is a flat `401 invalid_grant` audited as
+  `workload.reject.replay`. Keep `Ttls::workload` short (close to the job
+  duration).
 - GitHub Actions workload exchange can be restricted to specific jobs of a
   granted repo: `forgs_idp::ClaimConstraints` on the issuer policy
   (`GithubActionsIssuer::with_constraints`) allows-lists `ref`,
@@ -39,6 +45,10 @@
 
 ### Breaking
 
+- Workload JWTs must carry a non-empty `jti` (GitHub Actions and GHES tokens
+  do). `WorkloadClaims` gains `jti` and `accept_until`; `SweepCounts` gains
+  `workload_jtis`. Migration 0006 adds `forgs_workload_jti`. A client
+  retrying an exchange must fetch a fresh id token.
 - Cookies are renamed from `{brand}_session`/`_csrf`/`_oauth`/`_signup` to
   `__Host-{brand}_session` etc. Existing browser sessions are logged out
   once, and app JavaScript reading `{brand}_csrf` must read
