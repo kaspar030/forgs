@@ -93,8 +93,13 @@ pub use users::{Identity, NewIdentity, NewSignup, User, UserState};
 /// `sqlite::memory:`): foreign keys **on**, and the file created if missing.
 ///
 /// Foreign keys are enabled explicitly because `SQLite` defaults them off,
-/// which would silently reduce every `REFERENCES` in the schema to a comment;
-/// [`migrate`] refuses a pool without them.
+/// which would silently reduce every `REFERENCES` in the schema to a comment
+/// (and a deleted user's sessions and refresh tokens would outlive them).
+/// **Every** connection of the pool must have them: [`migrate`] refuses a
+/// pool without them, and every [`Store`] write transaction re-checks the
+/// connection it runs on. An app that builds its own pool must set
+/// `foreign_keys(true)` on its connect options (sqlx's default) and must not
+/// turn the pragma off on a pooled connection.
 ///
 /// # Errors
 ///
@@ -249,8 +254,16 @@ impl Store {
 
     /// Begin a write transaction that takes the write lock up front, so the
     /// check-then-write sequences in this crate cannot interleave.
+    ///
+    /// Also verifies that the connection it landed on enforces foreign keys
+    /// ([`StoreError::ForeignKeysOff`] otherwise): [`migrate`] checks one
+    /// connection of the pool, and every multi-row write here (user and node
+    /// deletion above all) relies on `ON DELETE CASCADE` to end the sessions,
+    /// refresh tokens and memberships that hang off the deleted row.
     async fn begin(&self) -> Result<sqlx::Transaction<'static, sqlx::Sqlite>, StoreError> {
-        Ok(self.pool.begin_with("BEGIN IMMEDIATE").await?)
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        migrate::ensure_foreign_keys(&mut tx).await?;
+        Ok(tx)
     }
 }
 

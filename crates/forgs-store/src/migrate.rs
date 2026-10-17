@@ -23,6 +23,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (5, include_str!("../migrations/0005_tombstone_actor.sql")),
     (6, include_str!("../migrations/0006_workload_jti.sql")),
     (7, include_str!("../migrations/0007_child_names_nocase.sql")),
+    (8, include_str!("../migrations/0008_token_hash_checks.sql")),
 ];
 
 /// The newest schema version this build knows.
@@ -33,25 +34,25 @@ pub const SCHEMA_VERSION: i64 = MIGRATIONS[MIGRATIONS.len() - 1].0;
 /// Idempotent. Each migration runs in its own `BEGIN IMMEDIATE` transaction
 /// together with its version row, so a failing migration leaves nothing
 /// behind and two processes migrating at once serialise rather than both
-/// applying.
+/// applying. Foreign keys are verified on the connection running each
+/// migration, and `PRAGMA foreign_key_check` must report no violation in a
+/// `forgs_` table before that migration commits.
 ///
 /// # Errors
 ///
 /// * [`StoreError::ForeignKeysOff`] if the pool's connections do not enforce
 ///   foreign keys: the schema's cascades and `REFERENCES` would silently be
 ///   comments, so this is refused loudly rather than discovered later.
+/// * [`StoreError::ForeignKeyViolations`] if a migration leaves (or finds) a
+///   `forgs_` row whose foreign key points nowhere — e.g. rows written while
+///   foreign keys were off. Nothing of that migration is applied.
 /// * [`StoreError::SchemaTooNew`] if the database was migrated by a newer
 ///   forgs.
 /// * [`StoreError::Db`] if a statement fails.
 pub async fn migrate(pool: &SqlitePool) -> Result<()> {
     {
         let mut conn = pool.acquire().await?;
-        let (fk,): (i64,) = sqlx::query_as("PRAGMA foreign_keys")
-            .fetch_one(&mut *conn)
-            .await?;
-        if fk == 0 {
-            return Err(StoreError::ForeignKeysOff);
-        }
+        ensure_foreign_keys(&mut conn).await?;
     }
     sqlx::raw_sql(
         "CREATE TABLE IF NOT EXISTS forgs_schema_version (
@@ -64,6 +65,7 @@ pub async fn migrate(pool: &SqlitePool) -> Result<()> {
 
     for (version, sql) in MIGRATIONS {
         let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+        ensure_foreign_keys(&mut tx).await?;
         let (current,): (Option<i64>,) =
             sqlx::query_as("SELECT MAX(version) FROM forgs_schema_version")
                 .fetch_one(&mut *tx)
@@ -79,6 +81,7 @@ pub async fn migrate(pool: &SqlitePool) -> Result<()> {
             continue;
         }
         sqlx::raw_sql(*sql).execute(&mut *tx).await?;
+        foreign_key_check(&mut tx, *version).await?;
         sqlx::query(
             "INSERT INTO forgs_schema_version (version, applied_at) VALUES (?1, unixepoch())",
         )
@@ -88,4 +91,41 @@ pub async fn migrate(pool: &SqlitePool) -> Result<()> {
         tx.commit().await?;
     }
     Ok(())
+}
+
+/// Refuse a connection whose `PRAGMA foreign_keys` is off.
+///
+/// Reading the pragma works inside a transaction (only *setting* it is a
+/// no-op there), so this is also how [`Store`](crate::Store) checks the
+/// connection each write transaction landed on: a pool is a set of
+/// connections, and one configured differently (or re-configured by the app)
+/// would otherwise run its writes with every `ON DELETE CASCADE` silently
+/// skipped.
+pub(crate) async fn ensure_foreign_keys(conn: &mut sqlx::SqliteConnection) -> Result<()> {
+    let (fk,): (i64,) = sqlx::query_as("PRAGMA foreign_keys")
+        .fetch_one(&mut *conn)
+        .await?;
+    if fk == 0 {
+        return Err(StoreError::ForeignKeysOff);
+    }
+    Ok(())
+}
+
+/// Fail migration `version` if any `forgs_` table holds a row whose foreign
+/// key points nowhere. App tables are not judged: their integrity is the
+/// app's, and a pre-existing violation there must not block a forgs upgrade.
+async fn foreign_key_check(conn: &mut sqlx::SqliteConnection, version: i64) -> Result<()> {
+    let tables: Vec<(String,)> = sqlx::query_as(
+        "SELECT DISTINCT \"table\" FROM pragma_foreign_key_check
+          WHERE \"table\" LIKE 'forgs\\_%' ESCAPE '\\' ORDER BY 1",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    if tables.is_empty() {
+        return Ok(());
+    }
+    Err(StoreError::ForeignKeyViolations {
+        version,
+        tables: tables.into_iter().map(|(t,)| t).collect(),
+    })
 }

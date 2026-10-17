@@ -4,6 +4,14 @@
 
 ### Security
 
+- `PRAGMA foreign_keys` is verified on the connection of every `Store` write
+  transaction (`StoreError::ForeignKeysOff`), not just one connection at
+  migration, and each migration runs `PRAGMA foreign_key_check` on the
+  `forgs_` tables before committing (`StoreError::ForeignKeyViolations`).
+  Migration 8 refuses credential hashes that are not 64 lowercase hex
+  (`StoreError::MalformedHash`) in sessions, refresh / workload tokens, API
+  keys and pending devices. Subject lifecycle limits are documented in
+  docs/design.md §2.
 - API keys minted over `/auth/keys` are capped by live keys per namespace
   (`AuthContextBuilder::max_api_keys_per_namespace`, default 1000) and per
   user in a namespace (`max_api_keys_per_user`, default 100); past a cap a

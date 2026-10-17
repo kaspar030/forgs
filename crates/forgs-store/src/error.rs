@@ -108,6 +108,20 @@ pub enum StoreError {
     /// The pool's connections have `PRAGMA foreign_keys` off.
     #[error("foreign keys are off; connect with foreign_keys(true)")]
     ForeignKeysOff,
+    /// A migration found `forgs_` rows whose foreign keys point nowhere
+    /// (`PRAGMA foreign_key_check`), typically written while foreign keys
+    /// were off. The migration was rolled back.
+    #[error("foreign key violations in {tables:?} at schema version {version}")]
+    ForeignKeyViolations {
+        /// The migration that was refused.
+        version: i64,
+        /// The `forgs_` tables holding violating rows.
+        tables: Vec<String>,
+    },
+    /// A credential hash is not 64 lowercase hex characters (the SHA-256
+    /// [`forgs::TokenHash`] form); refused by the schema.
+    #[error("malformed token hash")]
+    MalformedHash,
     /// The database was migrated by a newer forgs.
     #[error("database schema version {found} is newer than this build knows ({known})")]
     SchemaTooNew {
@@ -143,6 +157,9 @@ impl From<sqlx::Error> for StoreError {
         }
         if msg.contains("forgs: name is taken") {
             return StoreError::NameTaken;
+        }
+        if msg.contains("forgs: malformed token hash") {
+            return StoreError::MalformedHash;
         }
         // `ON DELETE RESTRICT` reports as SQLITE_CONSTRAINT_TRIGGER (1811),
         // which sqlx does not classify as a foreign-key violation.

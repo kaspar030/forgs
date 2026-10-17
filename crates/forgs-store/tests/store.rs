@@ -245,6 +245,143 @@ async fn foreign_keys_are_enforced() {
     ));
 }
 
+/// SC-6: a pooled connection with foreign keys turned off after migration is
+/// refused at the next write transaction, rather than deleting a user without
+/// cascading their sessions.
+#[tokio::test]
+async fn a_write_on_a_connection_without_foreign_keys_is_refused() {
+    let s = store(fleet()).await;
+    let (user, _) = s.create_local_user("alice", None, NOW).await.unwrap();
+    s.insert_session(&hash(1), user, NOW, NOW, NOW + 10)
+        .await
+        .unwrap();
+    sqlx::query("PRAGMA foreign_keys = OFF")
+        .execute(s.pool())
+        .await
+        .unwrap();
+    assert!(matches!(
+        s.delete_user(user, None, NOW).await,
+        Err(StoreError::ForeignKeysOff)
+    ));
+    assert_eq!(count(&s, "forgs_session").await, 1);
+    assert_eq!(count(&s, "forgs_user").await, 1);
+    sqlx::query("PRAGMA foreign_keys = ON")
+        .execute(s.pool())
+        .await
+        .unwrap();
+    s.delete_user(user, None, NOW).await.unwrap();
+    assert_eq!(count(&s, "forgs_session").await, 0);
+}
+
+/// SC-6: a migration that finds dangling `forgs_` rows (written with foreign
+/// keys off) is rolled back.
+#[tokio::test]
+async fn a_migration_refuses_dangling_forgs_rows() {
+    let opts = forgs_store::connect_options("sqlite::memory:").unwrap();
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(opts)
+        .await
+        .unwrap();
+    sqlx::raw_sql(
+        "CREATE TABLE forgs_schema_version (
+             version INTEGER NOT NULL PRIMARY KEY, applied_at INTEGER NOT NULL) STRICT",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::raw_sql(include_str!("../migrations/0001_init.sql"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO forgs_schema_version VALUES (1, 0)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql(
+        "PRAGMA foreign_keys = OFF;
+         INSERT INTO forgs_session (token_hash, user_id, issued_at, expires)
+              VALUES ('00', 'ghost', 0, 1);
+         PRAGMA foreign_keys = ON;",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    match forgs_store::migrate(&pool).await {
+        Err(StoreError::ForeignKeyViolations { version, tables }) => {
+            assert_eq!(version, 2);
+            assert_eq!(tables, ["forgs_session"]);
+        }
+        other => panic!("expected ForeignKeyViolations, got {other:?}"),
+    }
+    let (v,): (i64,) = sqlx::query_as("SELECT MAX(version) FROM forgs_schema_version")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(v, 1);
+}
+
+/// SC-7: every credential-hash column refuses anything but 64 lowercase hex.
+#[tokio::test]
+async fn malformed_token_hashes_are_refused() {
+    let s = store(fleet()).await;
+    let (user, ns) = s.create_local_user("alice", None, NOW).await.unwrap();
+    let ns = ns.unwrap();
+    for bad in [
+        "ab".repeat(31),
+        "ab".repeat(33),
+        "AB".repeat(32),
+        format!("{}g", "a".repeat(63)),
+        "secret_token_plaintext".to_owned(),
+    ] {
+        let bad = TokenHash::from_hex(bad);
+        assert!(matches!(
+            s.insert_session(&bad, user, NOW, NOW, NOW + 10).await,
+            Err(StoreError::MalformedHash)
+        ));
+        assert!(matches!(
+            s.insert_refresh_token(&bad, user, NOW, NOW + 10).await,
+            Err(StoreError::MalformedHash)
+        ));
+        assert!(matches!(
+            s.scoped(ns)
+                .insert_api_key(&key(bad.clone(), true, None), NOW)
+                .await,
+            Err(StoreError::MalformedHash)
+        ));
+        for (table, col) in [
+            ("forgs_workload_token", "token_hash"),
+            ("forgs_pending_device", "device_hash"),
+        ] {
+            let sql = if table == "forgs_workload_token" {
+                "INSERT INTO forgs_workload_token (token_hash, subject, issuer, issued_at, expires)
+                 VALUES (?1, 'user:x', 'app', 0, 1)"
+            } else {
+                "INSERT INTO forgs_pending_device (id, user_code, device_hash, created_at, expires)
+                 VALUES ('d', 'CODE', ?1, 0, 1)"
+            };
+            let e = sqlx::query(sql)
+                .bind(bad.as_str())
+                .execute(s.pool())
+                .await
+                .unwrap_err();
+            assert!(
+                e.to_string().contains("malformed token hash"),
+                "{table}.{col}: {e}"
+            );
+        }
+    }
+    // Updating a stored hash to a malformed one is refused too.
+    s.insert_session(&hash(1), user, NOW, NOW, NOW + 10)
+        .await
+        .unwrap();
+    let e = sqlx::query("UPDATE forgs_session SET token_hash = 'x'")
+        .execute(s.pool())
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("malformed token hash"));
+}
+
 // ---------------------------------------------------------------------------
 // Signup and local users
 // ---------------------------------------------------------------------------

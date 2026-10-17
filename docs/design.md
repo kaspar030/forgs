@@ -202,6 +202,22 @@ forgs_membership { ns_node_id, subject (SubjectKey), user_id NULL, role }
   ops O over selector X within N's subtree, expiring". The namespace fence
   requires the resource to lie within the granting node's subtree; a grant
   never reaches outside it.
+- **Subjects have no lifecycle link** (security audit 2026-10, SC-8).
+  `forgs_grant.subject`, and `forgs_membership.subject` for anything but a
+  user, are rendered `SubjectKey` text with no foreign key: a workload or app
+  subject has no row of its own to reference. Only a `user:` membership
+  carries `user_id` and cascades with the user. Consequences:
+  - Deleting what a subject names (an API key, a repo, an app node) does not
+    remove its grants or memberships. They stay until revoked or expired, and
+    apply again to anything that later renders the **same** key.
+  - A subject is therefore exactly as stable as the value it is keyed on.
+    Id-derived keys (`user:<id>`, `<ns>/workload:key:<ApiKeyId>`,
+    `gha/workload:id:<owner_id>/<repo_id>`) are never reissued, so a stale
+    row is inert. Name-derived keys are not: a named API-key identity
+    (`subject_name`) or an app subject built from a name is inherited by
+    whoever next mints that name. Name-keyed subjects are a deliberate
+    "survives rotation" feature; revoke their grants when the identity is
+    retired, and prefer id-derived subjects for app kinds.
 
 ### Renames and handles
 
@@ -469,6 +485,20 @@ discipline. `forgs-client` must not pull axum, sqlx or forgs-store.
 own migrations in `forgs_store::migrate(&pool)`, independently of sqlx's
 `_sqlx_migrations`. Apps call it (or build a `Store`, which does) before
 running their own migrator.
+
+**Foreign keys on every connection**: the schema's cascades (a deleted user's
+sessions, refresh tokens and memberships) only run with `PRAGMA foreign_keys`
+on, and SQLite sets it per connection. `migrate` verifies it on the connection
+running each migration and runs `PRAGMA foreign_key_check` on the `forgs_`
+tables before committing; every `Store` write transaction re-checks the
+connection it landed on and fails `ForeignKeysOff` instead of writing. Apps
+building their own pool keep `foreign_keys(true)` (`forgs_store::connect_options`)
+and never switch it off on a pooled connection.
+
+**Credential hashes are shape-checked**: the hash columns of sessions,
+refresh tokens, workload tokens, API keys and pending devices accept only 64
+lowercase hex characters (migration 8, by trigger, since adding a CHECK needs
+a table rebuild), so a raw secret or upper-case hex cannot be stored.
 
 ## 6. Key constraints
 
