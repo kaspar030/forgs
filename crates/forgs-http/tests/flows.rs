@@ -152,9 +152,14 @@ impl WorkloadIssuer for StubIssuer {
                 repository_owner_id: oid.to_owned(),
                 repository: format!("{owner}/{name}"),
                 repository_owner: owner.to_owned(),
-                git_ref: None,
+                git_ref: Some("refs/heads/main".into()),
+                ref_type: None,
+                ref_protected: None,
+                environment: None,
+                event_name: Some("push".into()),
                 workflow: None,
                 job_workflow_ref: None,
+                runner_environment: None,
                 run_id: None,
                 sub: "repo:x".into(),
                 exp: NOW + 300,
@@ -2228,6 +2233,10 @@ async fn workload_exchange() {
     let detail = mint.detail.unwrap();
     assert!(detail.contains("repository_id=2"), "{detail}");
     assert!(detail.contains("owner_id=1"), "{detail}");
+    assert!(
+        detail.contains("ref=refs/heads/main event=push"),
+        "{detail}"
+    );
 
     // The same ids from another issuer are another subject: the grant to
     // `gha/…` does not reach it.

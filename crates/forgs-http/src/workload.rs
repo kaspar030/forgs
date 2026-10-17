@@ -6,7 +6,11 @@
 //!   the reassignable `owner/repo` name, and namespaced by the issuer that
 //!   verified it — and it must hold at least one live grant: a workload
 //!   belongs to no tenant and reaches anything only through grants, so a
-//!   token for a grantless repo would be useless and is not minted.
+//!   token for a grantless repo would be useless and is not minted. A grant
+//!   covers **every workflow on every branch** of the repo unless the
+//!   issuer's [`forgs_idp::ClaimConstraints`] (ref, environment,
+//!   `job_workflow_ref`, event, `ref_protected`) narrow it; a refused job is
+//!   `oidc.reject.claim_not_allowed` in the audit.
 //! * `api_key` — the weak path for a runner with no workload identity: a
 //!   long-lived bearer secret in somebody's CI config. Bounded by being
 //!   namespace-scoped, expiring and revocable; the workload token it mints
@@ -150,16 +154,26 @@ pub async fn exchange_oidc(ctx: &AuthContext, jwt: &str) -> Result<TokenResponse
         "repository_owner_id": c.repository_owner_id,
         "repository_owner": c.repository_owner,
         "ref": c.git_ref,
+        "ref_type": c.ref_type,
+        "ref_protected": c.ref_protected,
+        "environment": c.environment,
+        "event_name": c.event_name,
         "workflow": c.workflow,
         "job_workflow_ref": c.job_workflow_ref,
+        "runner_environment": c.runner_environment,
         "run_id": c.run_id,
         "sub": c.sub,
     })
     .to_string();
     // Not capped by the JWT's `exp` (minutes): the job outlives its id token.
     let detail = format!(
-        "issuer={issuer} repository={} repository_id={} owner_id={}",
-        c.repository, c.repository_id, c.repository_owner_id
+        "issuer={issuer} repository={} repository_id={} owner_id={} ref={} event={} environment={}",
+        c.repository,
+        c.repository_id,
+        c.repository_owner_id,
+        c.git_ref.as_deref().unwrap_or("-"),
+        c.event_name.as_deref().unwrap_or("-"),
+        c.environment.as_deref().unwrap_or("-"),
     );
     mint_workload(
         ctx,

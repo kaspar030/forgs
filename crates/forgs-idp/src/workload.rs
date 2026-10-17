@@ -24,9 +24,42 @@
 //!
 //! Recorded but **never authorizing**: `repository` (still required and
 //! validated via [`forgs::subject::normalise_repo`], for display and audit),
-//! `repository_owner`, `ref`, `workflow`, `job_workflow_ref`, `run_id`. A fork,
-//! or a new repo under a granted owner, has a different `repository_id` and
-//! so matches no grant.
+//! `repository_owner`, `run_id`, `workflow`, `ref_type`,
+//! `runner_environment`. A fork, or a new repo under a granted owner, has a
+//! different `repository_id` and so matches no grant.
+//!
+//! # Claim constraints: which jobs of a granted repo may exchange
+//!
+//! A grant names a repository, not a job. **Without constraints, every
+//! workflow on every branch of a granted repo gets the full grant set**:
+//! feature branches any collaborator can push, Dependabot runs,
+//! `workflow_dispatch` on an arbitrary ref, and `pull_request_target` /
+//! `workflow_run` jobs that may be running untrusted PR code with
+//! `id-token: write`.
+//!
+//! [`OidcPolicy::constraints`] ([`ClaimConstraints`]) narrows that, at
+//! verification time, before any grant is looked up: allowed `ref`s,
+//! `environment`s and `job_workflow_ref`s, an `event_name` allow- and
+//! deny-list, and `ref_protected == true`. A configured constraint whose
+//! claim is absent fails closed. The constructors deny
+//! `pull_request_target` by default ([`DEFAULT_DENIED_EVENTS`]); everything
+//! else is opt-in. Typical hardening:
+//!
+//! ```
+//! # use forgs_idp::workload::{ClaimConstraints, OidcPolicy};
+//! let mut policy = OidcPolicy::github_actions("https://forgs.example");
+//! policy.constraints = ClaimConstraints {
+//!     refs: vec!["refs/heads/main".into(), "refs/tags/v*".into()],
+//!     require_ref_protected: true,
+//!     ..policy.constraints
+//! };
+//! ```
+//!
+//! The constraints apply to every repo verified by the issuer; the extra
+//! claims (`ref`, `environment`, `event_name`, `ref_protected`,
+//! `job_workflow_ref`, …) are also recorded in [`WorkloadClaims`] and in the
+//! minted token's claims, for audit and for apps that want a finer,
+//! per-grant rule.
 
 use forgs::subject::{normalise_github_id, normalise_repo, workload_subject_key, WORKLOAD_NS_GHA};
 use forgs::SubjectKey;
@@ -38,6 +71,110 @@ use crate::oidc::{decode_verified, AlgPolicy, JwkSet, OidcError, VerifyParams};
 pub const GHA_ISSUER: &str = "https://token.actions.githubusercontent.com";
 /// The GitHub Actions JWKS endpoint.
 pub const GHA_JWKS_URL: &str = "https://token.actions.githubusercontent.com/.well-known/jwks";
+
+/// The `event_name`s [`OidcPolicy`]'s constructors deny by default:
+/// `pull_request_target` runs in the base repo's context — with
+/// `id-token: write` if the workflow asks — while commonly checking out and
+/// running the PR's untrusted code.
+pub const DEFAULT_DENIED_EVENTS: &[&str] = &["pull_request_target"];
+
+/// Which jobs of a granted repository may exchange their token, evaluated
+/// against the verified claims before any grant lookup.
+///
+/// Every list is empty = unconstrained. A pattern is an exact match, or a
+/// prefix match when it ends in `*` (`refs/tags/v*`; a bare `*` matches
+/// any present value). A constraint whose claim is **absent** refuses the
+/// token (fail closed); so does a configured `denied_events` when
+/// `event_name` is absent.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ClaimConstraints {
+    /// Allowed `ref` values (`refs/heads/main`, `refs/tags/v*`).
+    pub refs: Vec<String>,
+    /// Allowed `environment` values. Since GitHub only issues an
+    /// `environment` claim to a job that targets one, and an environment's
+    /// protection rules (required reviewers, branch policy) gate the job,
+    /// this is the strongest of the constraints.
+    pub environments: Vec<String>,
+    /// Allowed `job_workflow_ref` values
+    /// (`owner/repo/.github/workflows/deploy.yml@refs/heads/main`, or with a
+    /// trailing `*` to allow any ref of that workflow file).
+    pub job_workflow_refs: Vec<String>,
+    /// Allowed `event_name` values (`push`, `release`, …).
+    pub events: Vec<String>,
+    /// Refused `event_name` values; checked after [`Self::events`].
+    pub denied_events: Vec<String>,
+    /// Require `ref_protected == true`: the job ran on a ref covered by a
+    /// branch-protection rule or ruleset.
+    pub require_ref_protected: bool,
+}
+
+impl ClaimConstraints {
+    /// The constructors' default: only [`DEFAULT_DENIED_EVENTS`] denied.
+    #[must_use]
+    pub fn github_default() -> Self {
+        Self {
+            denied_events: DEFAULT_DENIED_EVENTS
+                .iter()
+                .map(|e| (*e).to_owned())
+                .collect(),
+            ..Self::default()
+        }
+    }
+
+    /// Check `claims`.
+    ///
+    /// # Errors
+    ///
+    /// [`OidcError::ClaimNotAllowed`] naming the first failing claim.
+    pub fn check(&self, claims: &WorkloadClaims) -> Result<(), OidcError> {
+        fn allowed(
+            patterns: &[String],
+            value: Option<&str>,
+            claim: &'static str,
+        ) -> Result<(), OidcError> {
+            if patterns.is_empty() {
+                return Ok(());
+            }
+            match value {
+                Some(v) if patterns.iter().any(|p| pattern_matches(p, v)) => Ok(()),
+                _ => Err(OidcError::ClaimNotAllowed(claim)),
+            }
+        }
+        allowed(&self.refs, claims.git_ref.as_deref(), "ref")?;
+        allowed(
+            &self.environments,
+            claims.environment.as_deref(),
+            "environment",
+        )?;
+        allowed(
+            &self.job_workflow_refs,
+            claims.job_workflow_ref.as_deref(),
+            "job_workflow_ref",
+        )?;
+        allowed(&self.events, claims.event_name.as_deref(), "event_name")?;
+        if !self.denied_events.is_empty() {
+            match claims.event_name.as_deref() {
+                Some(e) if !self.denied_events.iter().any(|p| pattern_matches(p, e)) => {}
+                _ => return Err(OidcError::ClaimNotAllowed("event_name")),
+            }
+        }
+        if self.require_ref_protected && claims.ref_protected != Some(true) {
+            return Err(OidcError::ClaimNotAllowed("ref_protected"));
+        }
+        Ok(())
+    }
+}
+
+/// Exact, or prefix when `pattern` ends in `*`. Empty values never match.
+fn pattern_matches(pattern: &str, value: &str) -> bool {
+    if value.is_empty() {
+        return false;
+    }
+    match pattern.strip_suffix('*') {
+        Some(prefix) => value.starts_with(prefix),
+        None => pattern == value,
+    }
+}
 
 /// What a workload verifier accepts.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,6 +198,10 @@ pub struct OidcPolicy {
     /// issuer**: [`WORKLOAD_NS_GHA`] for github.com, something distinct
     /// (`ghes-corp`) for a GHES or enterprise custom issuer.
     pub subject_ns: String,
+    /// Which jobs of a granted repo may exchange (module docs, "Claim
+    /// constraints"). The constructors set
+    /// [`ClaimConstraints::github_default`].
+    pub constraints: ClaimConstraints,
 }
 
 impl OidcPolicy {
@@ -72,6 +213,7 @@ impl OidcPolicy {
             audience: audience.into(),
             leeway_secs: 60,
             subject_ns: WORKLOAD_NS_GHA.to_owned(),
+            constraints: ClaimConstraints::github_default(),
         }
     }
 
@@ -89,6 +231,7 @@ impl OidcPolicy {
             audience: audience.into(),
             leeway_secs: 60,
             subject_ns: subject_ns.into(),
+            constraints: ClaimConstraints::github_default(),
         }
     }
 }
@@ -108,12 +251,27 @@ pub struct WorkloadClaims {
     pub repository: String,
     /// The repository's owner, lowercased. Audit only; **never** authorizing.
     pub repository_owner: String,
-    /// The git ref the job ran on. Recorded, not evaluated.
+    /// The git ref the job ran on. Evaluated only by
+    /// [`ClaimConstraints::refs`].
     pub git_ref: Option<String>,
-    /// The workflow's name.
+    /// `branch` or `tag`. Audit only.
+    pub ref_type: Option<String>,
+    /// Whether `ref` is protected (branch protection or a ruleset).
+    /// Evaluated only by [`ClaimConstraints::require_ref_protected`].
+    pub ref_protected: Option<bool>,
+    /// The deployment environment the job targets, if any. Evaluated only
+    /// by [`ClaimConstraints::environments`].
+    pub environment: Option<String>,
+    /// The triggering event (`push`, `pull_request_target`, …). Evaluated
+    /// only by [`ClaimConstraints::events`] / `denied_events`.
+    pub event_name: Option<String>,
+    /// The workflow's name. Audit only.
     pub workflow: Option<String>,
-    /// The fully-qualified workflow reference.
+    /// The fully-qualified workflow reference. Evaluated only by
+    /// [`ClaimConstraints::job_workflow_refs`].
     pub job_workflow_ref: Option<String>,
+    /// `github-hosted` or `self-hosted`. Audit only.
+    pub runner_environment: Option<String>,
     /// The Actions run id.
     pub run_id: Option<String>,
     /// The token's `sub` claim, verbatim.
@@ -144,6 +302,16 @@ struct RawClaims {
     #[serde(default, rename = "ref")]
     git_ref: Option<String>,
     #[serde(default)]
+    ref_type: Option<String>,
+    #[serde(default, deserialize_with = "lenient_bool")]
+    ref_protected: Option<bool>,
+    #[serde(default)]
+    environment: Option<String>,
+    #[serde(default)]
+    event_name: Option<String>,
+    #[serde(default)]
+    runner_environment: Option<String>,
+    #[serde(default)]
     workflow: Option<String>,
     #[serde(default)]
     job_workflow_ref: Option<String>,
@@ -163,13 +331,25 @@ fn lenient_id<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Erro
     })
 }
 
+/// A boolean claim: GitHub sends `"true"`/`"false"`, a JSON bool is
+/// accepted too. Anything else reads as missing.
+fn lenient_bool<'de, D: Deserializer<'de>>(d: D) -> Result<Option<bool>, D::Error> {
+    Ok(match serde_json::Value::deserialize(d)? {
+        serde_json::Value::Bool(b) => Some(b),
+        serde_json::Value::String(s) if s == "true" => Some(true),
+        serde_json::Value::String(s) if s == "false" => Some(false),
+        _ => None,
+    })
+}
+
 /// Verify a GitHub Actions OIDC JWT against `jwks` and `policy` at `now`.
 ///
-/// Pure: no I/O, no clock.
+/// Pure: no I/O, no clock. Applies [`OidcPolicy::constraints`] last.
 ///
 /// # Errors
 ///
-/// [`OidcError`]. Every variant should map to the same flat `invalid_grant`
+/// [`OidcError`] ([`OidcError::ClaimNotAllowed`] for a verified token the
+/// constraints refuse). Every variant should map to the same flat `invalid_grant`
 /// at the HTTP boundary; the distinction exists for the log.
 pub fn verify_github_actions(
     jwt: &str,
@@ -222,21 +402,25 @@ pub fn verify_github_actions(
                 policy.subject_ns
             ))
         })?;
-    Ok(WorkloadIdentity {
-        subject,
-        claims: WorkloadClaims {
-            repository_id,
-            repository_owner_id,
-            repository,
-            repository_owner,
-            git_ref: claims.git_ref,
-            workflow: claims.workflow,
-            job_workflow_ref: claims.job_workflow_ref,
-            run_id: claims.run_id,
-            sub,
-            exp,
-        },
-    })
+    let claims = WorkloadClaims {
+        repository_id,
+        repository_owner_id,
+        repository,
+        repository_owner,
+        git_ref: claims.git_ref,
+        ref_type: claims.ref_type,
+        ref_protected: claims.ref_protected,
+        environment: claims.environment,
+        event_name: claims.event_name,
+        workflow: claims.workflow,
+        job_workflow_ref: claims.job_workflow_ref,
+        runner_environment: claims.runner_environment,
+        run_id: claims.run_id,
+        sub,
+        exp,
+    };
+    policy.constraints.check(&claims)?;
+    Ok(WorkloadIdentity { subject, claims })
 }
 
 /// An issuer of workload tokens forgs can exchange for a session.
@@ -325,6 +509,14 @@ mod issuer {
             }
         }
 
+        /// The same issuer with `constraints` in place of the policy's
+        /// (module docs, "Claim constraints").
+        #[must_use]
+        pub fn with_constraints(mut self, constraints: super::ClaimConstraints) -> Self {
+            self.policy.constraints = constraints;
+            self
+        }
+
         /// The policy.
         #[must_use]
         pub fn policy(&self) -> &OidcPolicy {
@@ -380,6 +572,11 @@ mod tests {
             "repository_id": "67890",
             "repository_owner_id": "12345",
             "ref": "refs/heads/main",
+            "ref_type": "branch",
+            "ref_protected": "true",
+            "event_name": "push",
+            "environment": "hil",
+            "runner_environment": "github-hosted",
             "workflow": "hil",
             "job_workflow_ref": "ariel-os/ariel-os/.github/workflows/hil.yml@refs/heads/main",
             "run_id": "12345",
@@ -412,8 +609,118 @@ mod tests {
         assert_eq!(out.claims.repository_owner, "ariel-os");
         assert_eq!(out.claims.git_ref.as_deref(), Some("refs/heads/main"));
         assert_eq!(out.claims.workflow.as_deref(), Some("hil"));
+        assert_eq!(out.claims.ref_type.as_deref(), Some("branch"));
+        assert_eq!(out.claims.ref_protected, Some(true));
+        assert_eq!(out.claims.event_name.as_deref(), Some("push"));
+        assert_eq!(out.claims.environment.as_deref(), Some("hil"));
+        assert_eq!(
+            out.claims.runner_environment.as_deref(),
+            Some("github-hosted")
+        );
         assert_eq!(out.claims.run_id.as_deref(), Some("12345"));
         assert_eq!(out.claims.exp, 2_000);
+    }
+
+    fn verify_with(c: &serde_json::Value, constraints: ClaimConstraints) -> Result<(), OidcError> {
+        let p = OidcPolicy {
+            constraints,
+            ..policy()
+        };
+        verify_github_actions(
+            &sign("k1", KEY_A_DER_B64, c),
+            &jwks(&[("k1", KEY_A_N)]),
+            &p,
+            1_000,
+        )
+        .map(|_| ())
+    }
+
+    #[test]
+    fn pull_request_target_is_denied_by_default() {
+        assert_eq!(policy().constraints, ClaimConstraints::github_default());
+        let mut c = claims();
+        c["event_name"] = json!("pull_request_target");
+        assert_eq!(
+            verify_with(&c, ClaimConstraints::github_default()),
+            Err(OidcError::ClaimNotAllowed("event_name"))
+        );
+        // A configured deny-list fails closed on a missing event_name.
+        c.as_object_mut().unwrap().remove("event_name");
+        assert_eq!(
+            verify_with(&c, ClaimConstraints::github_default()),
+            Err(OidcError::ClaimNotAllowed("event_name"))
+        );
+        // Explicitly unconstrained: anything goes.
+        assert!(verify_with(&c, ClaimConstraints::default()).is_ok());
+        assert_eq!(
+            OidcError::ClaimNotAllowed("ref").label(),
+            "oidc.reject.claim_not_allowed"
+        );
+    }
+
+    #[test]
+    fn claim_constraints_are_each_enforced_and_fail_closed() {
+        let ok = claims();
+        let all = ClaimConstraints {
+            refs: vec!["refs/heads/main".into(), "refs/tags/v*".into()],
+            environments: vec!["hil".into()],
+            job_workflow_refs: vec!["ariel-os/ariel-os/.github/workflows/hil.yml@*".into()],
+            events: vec!["push".into(), "release".into()],
+            denied_events: vec!["pull_request_target".into()],
+            require_ref_protected: true,
+        };
+        verify_with(&ok, all.clone()).unwrap();
+        let mut tag = claims();
+        tag["ref"] = json!("refs/tags/v1.2");
+        verify_with(&tag, all.clone()).unwrap();
+        for (claim, bad) in [
+            ("ref", json!("refs/heads/feature")),
+            ("ref", json!("refs/heads/main2")),
+            ("ref", json!("")),
+            ("environment", json!("staging")),
+            (
+                "job_workflow_ref",
+                json!("ariel-os/ariel-os/.github/workflows/evil.yml@refs/heads/main"),
+            ),
+            ("event_name", json!("workflow_dispatch")),
+            ("ref_protected", json!("false")),
+            ("ref_protected", json!("yes")),
+        ] {
+            let mut c = claims();
+            c[claim] = bad.clone();
+            let label: &'static str = match claim {
+                "ref" => "ref",
+                "environment" => "environment",
+                "job_workflow_ref" => "job_workflow_ref",
+                "event_name" => "event_name",
+                _ => "ref_protected",
+            };
+            assert_eq!(
+                verify_with(&c, all.clone()),
+                Err(OidcError::ClaimNotAllowed(label)),
+                "{claim}={bad}"
+            );
+            // Absent fails closed too.
+            let mut c = claims();
+            c.as_object_mut().unwrap().remove(claim);
+            assert_eq!(
+                verify_with(&c, all.clone()),
+                Err(OidcError::ClaimNotAllowed(label)),
+                "{claim} absent"
+            );
+        }
+        // A JSON bool is accepted for ref_protected.
+        let mut c = claims();
+        c["ref_protected"] = json!(true);
+        verify_with(&c, all.clone()).unwrap();
+        // Unconstrained claims stay optional.
+        let mut bare = claims();
+        for k in ["ref", "environment", "job_workflow_ref", "ref_protected"] {
+            bare.as_object_mut().unwrap().remove(k);
+        }
+        verify_with(&bare, ClaimConstraints::github_default()).unwrap();
+        assert!(pattern_matches("*", "x"));
+        assert!(!pattern_matches("*", ""));
     }
 
     #[test]
@@ -694,6 +1001,11 @@ mod tests {
             .unwrap();
         assert_eq!(out.subject.to_string(), "gha/workload:id:12345/67890");
         assert_eq!(stub.count("/jwks"), 2);
+        let strict = GithubActionsIssuer::new(AUDIENCE).with_constraints(ClaimConstraints {
+            refs: vec!["refs/heads/main".into()],
+            ..ClaimConstraints::default()
+        });
+        assert_eq!(strict.policy().constraints.refs, ["refs/heads/main"]);
         let renamed = GithubActionsIssuer::new(AUDIENCE).with_name("github-com");
         assert_eq!(renamed.name(), "github-com");
         assert_eq!(renamed.subject_ns(), "gha");

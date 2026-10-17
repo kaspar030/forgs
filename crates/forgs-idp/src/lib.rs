@@ -61,4 +61,4 @@ pub use oidc::OidcProvider;
 #[cfg(all(feature = "client", feature = "oidc"))]
 pub use workload::GithubActionsIssuer;
 #[cfg(feature = "oidc")]
-pub use workload::{WorkloadIdentity, WorkloadIssuer};
+pub use workload::{ClaimConstraints, WorkloadClaims, WorkloadIdentity, WorkloadIssuer};

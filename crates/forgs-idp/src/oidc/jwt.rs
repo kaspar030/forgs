@@ -51,6 +51,11 @@ pub enum OidcError {
     /// A multi-audience token's `azp` is not our client id.
     #[error("authorized party mismatch")]
     AzpMismatch,
+    /// A verified token whose claim (`ref`, `environment`, `event_name`,
+    /// `job_workflow_ref`, `ref_protected`) fails the issuer's configured
+    /// claim constraints. Names the claim, never its value.
+    #[error("claim `{0}` not allowed by policy")]
+    ClaimNotAllowed(&'static str),
 }
 
 impl OidcError {
@@ -70,6 +75,7 @@ impl OidcError {
             OidcError::Jwks(_) => "oidc.reject.jwks_unavailable",
             OidcError::NonceMismatch => "oidc.reject.nonce_mismatch",
             OidcError::AzpMismatch => "oidc.reject.azp_mismatch",
+            OidcError::ClaimNotAllowed(_) => "oidc.reject.claim_not_allowed",
         }
     }
 }
@@ -711,6 +717,7 @@ mod tests {
             OidcError::Jwks("x".to_owned()),
             OidcError::NonceMismatch,
             OidcError::AzpMismatch,
+            OidcError::ClaimNotAllowed("ref"),
         ]
         .map(|e| e.label());
         let unique: HashSet<&str> = labels.iter().copied().collect();

@@ -230,6 +230,16 @@ forgs_membership { ns_node_id, subject (SubjectKey), user_id NULL, role }
   never share a subject. To grant a repo, resolve the typed `owner/repo` to
   its ids with `forgs_idp::github::resolve_repo_ids` and build the subject
   with `forgs::subject::workload_subject_key(ns, owner_id, repo_id)`.
+  A grant covers **every workflow on every branch** of the repo (feature
+  branches, Dependabot, `workflow_dispatch` on any ref) unless the issuer's
+  `forgs_idp::ClaimConstraints` (`OidcPolicy::constraints`,
+  `GithubActionsIssuer::with_constraints`) narrow it: allowed `ref`s,
+  `environment`s, `job_workflow_ref`s and `event_name`s (exact or trailing-`*`
+  prefix), an `event_name` deny-list, and `ref_protected == true`. They are
+  checked at verification, before any grant lookup, and a configured
+  constraint whose claim is absent fails closed. By default only
+  `pull_request_target` is denied. The extra claims are recorded in
+  `WorkloadClaims` and the minted token's claims for audit.
   **Breaking (2026-10):** the earlier name-keyed subjects
   (`gha/workload:<owner>/<repo>`) no longer match any token. Existing grants
   on them are inert and are not migrated; recreate them against the id-keyed

@@ -4,6 +4,17 @@
 
 ### Security
 
+- GitHub Actions workload exchange can be restricted to specific jobs of a
+  granted repo: `forgs_idp::ClaimConstraints` on the issuer policy
+  (`GithubActionsIssuer::with_constraints`) allows-lists `ref`,
+  `environment`, `job_workflow_ref` and `event_name`, deny-lists events, and
+  can require `ref_protected`. Unconstrained, a grant still covers every
+  workflow on every branch. **Behaviour change:** `pull_request_target` jobs
+  (and tokens without `event_name`) are now refused by default; set
+  `constraints` to `ClaimConstraints::default()` to restore the old
+  behaviour. `WorkloadClaims` gains `ref_type`, `ref_protected`,
+  `environment`, `event_name` and `runner_environment` (recorded in the
+  token's claims and the mint audit).
 - Browser cookies carry the `__Host-` prefix, so a sibling subdomain or an
   on-path attacker can no longer toss (plant or shadow) a session, CSRF,
   login-state or signup-ticket cookie. Deploy with HSTS.
