@@ -280,6 +280,8 @@ mod tests {
         assert_eq!(id.subject(), "4242");
         assert_eq!(id.email(), "alice@example.com");
         assert_eq!(id.suggested_username(), Some("alice"));
+        // A generic Forgejo instance's `email_verified` is not trusted.
+        assert!(!id.email_verified());
 
         let token_req = f
             .stub

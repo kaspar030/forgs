@@ -36,11 +36,20 @@ pub struct OidcConfig {
     /// Clock-skew margin for `exp`/`nbf`/`iat`, seconds; at most
     /// [`MAX_LEEWAY_SECS`](super::MAX_LEEWAY_SECS).
     pub leeway_secs: u64,
+    /// Whether this provider's `email_verified` claim is trusted. When it is
+    /// not, a login still needs the claim (and an email), but the address is
+    /// kept on the identity only: it is never recorded as a verified user
+    /// email, so it cannot claim (squat) an address in the globally unique
+    /// user-email table. `false` unless the issuer is vetted: Forgejo/Gitea
+    /// derive the claim from the account's *active* flag, so an instance with
+    /// `REGISTER_EMAIL_CONFIRM=false` lets any account assert any address.
+    /// [`codeberg`] and [`gitlab_com`] set it.
+    pub trust_email_verified: bool,
 }
 
 impl OidcConfig {
-    /// A generic configuration with default scopes, `[RS256]`, 60 s leeway
-    /// and no username claim.
+    /// A generic configuration with default scopes, `[RS256]`, 60 s leeway,
+    /// no username claim and an untrusted `email_verified` claim.
     #[must_use]
     pub fn new(
         name: impl Into<String>,
@@ -57,6 +66,7 @@ impl OidcConfig {
             username_claim: None,
             algs: AlgPolicy::rs256(),
             leeway_secs: 60,
+            trust_email_verified: false,
         }
     }
 
@@ -64,6 +74,15 @@ impl OidcConfig {
     #[must_use]
     pub fn with_username_claim(mut self, claim: impl Into<String>) -> Self {
         self.username_claim = Some(claim.into());
+        self
+    }
+
+    /// Set whether the `email_verified` claim is trusted (see
+    /// [`Self::trust_email_verified`]). Only for an issuer known to verify
+    /// addresses before asserting them.
+    #[must_use]
+    pub fn with_trusted_email_verified(mut self, trust: bool) -> Self {
+        self.trust_email_verified = trust;
         self
     }
 
@@ -116,7 +135,9 @@ impl OidcConfig {
 
     /// Map verified `id_token` claims to an [`ExternalIdentity`]: `sub` is
     /// the subject, `email` + `email_verified` the email, and the configured
-    /// [`Self::username_claim`] (string claims only) the suggestion.
+    /// [`Self::username_claim`] (string claims only) the suggestion. Without
+    /// [`Self::trust_email_verified`] the email is marked untrusted
+    /// ([`ExternalIdentity::distrust_email`]).
     ///
     /// # Errors
     ///
@@ -130,13 +151,18 @@ impl OidcConfig {
             .as_deref()
             .and_then(|c| claims.string_claim(c))
             .map(str::to_owned);
-        ExternalIdentity::verified(
+        let id = ExternalIdentity::verified(
             self.name.clone(),
             claims.sub.clone(),
             claims.email.clone(),
             claims.email_verified,
             suggestion,
-        )
+        )?;
+        Ok(if self.trust_email_verified {
+            id
+        } else {
+            id.distrust_email()
+        })
     }
 
     /// `{issuer}/.well-known/openid-configuration` (OIDC Discovery §4: an
@@ -162,12 +188,15 @@ impl std::fmt::Debug for OidcConfig {
             .field("username_claim", &self.username_claim)
             .field("algs", &self.algs)
             .field("leeway_secs", &self.leeway_secs)
+            .field("trust_email_verified", &self.trust_email_verified)
             .finish()
     }
 }
 
 /// Any Forgejo (or Gitea) instance at `issuer`: username suggestion from
-/// `preferred_username`.
+/// `preferred_username`. The `email_verified` claim is **not** trusted (an
+/// instance may not confirm addresses); opt in with
+/// [`OidcConfig::with_trusted_email_verified`] for an instance that does.
 #[must_use]
 pub fn forgejo(
     name: impl Into<String>,
@@ -179,18 +208,21 @@ pub fn forgejo(
         .with_username_claim("preferred_username")
 }
 
-/// Codeberg: [`forgejo`] at [`CODEBERG_ISSUER`].
+/// Codeberg: [`forgejo`] at [`CODEBERG_ISSUER`], with a trusted
+/// `email_verified` claim (Codeberg confirms addresses).
 #[must_use]
 pub fn codeberg(
     name: impl Into<String>,
     client_id: impl Into<String>,
     client_secret: impl Into<String>,
 ) -> OidcConfig {
-    forgejo(name, CODEBERG_ISSUER, client_id, client_secret)
+    forgejo(name, CODEBERG_ISSUER, client_id, client_secret).with_trusted_email_verified(true)
 }
 
 /// A GitLab instance at `issuer`: username suggestion from `nickname` (the
-/// GitLab username).
+/// GitLab username). The `email_verified` claim is **not** trusted (a
+/// self-managed instance may skip confirmation); opt in with
+/// [`OidcConfig::with_trusted_email_verified`].
 #[must_use]
 pub fn gitlab(
     name: impl Into<String>,
@@ -201,14 +233,15 @@ pub fn gitlab(
     OidcConfig::new(name, issuer, client_id, client_secret).with_username_claim("nickname")
 }
 
-/// GitLab.com: [`gitlab`] at [`GITLAB_COM_ISSUER`].
+/// GitLab.com: [`gitlab`] at [`GITLAB_COM_ISSUER`], with a trusted
+/// `email_verified` claim.
 #[must_use]
 pub fn gitlab_com(
     name: impl Into<String>,
     client_id: impl Into<String>,
     client_secret: impl Into<String>,
 ) -> OidcConfig {
-    gitlab(name, GITLAB_COM_ISSUER, client_id, client_secret)
+    gitlab(name, GITLAB_COM_ISSUER, client_id, client_secret).with_trusted_email_verified(true)
 }
 
 #[cfg(test)]
@@ -247,6 +280,12 @@ mod tests {
         let glw = gitlab("gitlab-work", "https://gitlab.example", "id", "sec");
         assert_eq!(glw.issuer, "https://gitlab.example");
         assert_eq!(glw.name, "gitlab-work");
+
+        // Only the vetted issuers trust `email_verified`.
+        assert!(cb.trust_email_verified && gl.trust_email_verified);
+        assert!(!fj.trust_email_verified && !glw.trust_email_verified);
+        assert!(!OidcConfig::new("x", "https://idp.example", "i", "s").trust_email_verified);
+        assert!(fj.with_trusted_email_verified(true).trust_email_verified);
     }
 
     #[test]
@@ -267,6 +306,18 @@ mod tests {
         assert_eq!(id.subject(), "99");
         assert_eq!(id.email(), "u@example.com");
         assert_eq!(id.suggested_username(), Some("gl-user"));
+        assert!(id.email_verified());
+        // An untrusted provider still yields the identity and its email, but
+        // the email is not trusted as verified (so it is never recorded).
+        let id = forgejo("fj", "https://git.example", "i", "s")
+            .identity_from_claims(&claims)
+            .unwrap();
+        assert_eq!(id.email(), "u@example.com");
+        assert!(!id.email_verified());
+        let id = gitlab("glw", "https://gitlab.example", "i", "s")
+            .identity_from_claims(&claims)
+            .unwrap();
+        assert!(!id.email_verified());
         // Non-string claim → no suggestion.
         let id = codeberg("cb", "i", "s")
             .identity_from_claims(&claims)

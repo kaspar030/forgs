@@ -15,9 +15,12 @@ use sha2::Digest as _;
 /// picks the freed name or address up (design §4).
 ///
 /// Only constructible through [`ExternalIdentity::verified`], which refuses an
-/// identity without a verified email, so a value of this type always carries
-/// one: `email_verified` is `true` on every constructed value and exists as a
-/// field so the store can record it without re-deriving it.
+/// identity whose provider did not assert a verified email, so a value of this
+/// type always carries one. `email_verified` says whether forgs **trusts**
+/// that assertion: `true` unless [`ExternalIdentity::distrust_email`] was
+/// applied (a provider whose `email_verified` claim is not vetted, such as an
+/// arbitrary self-hosted Forgejo). The store records only trusted addresses
+/// as the user's email addresses, so an untrusted provider cannot squat one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalIdentity {
     provider: String,
@@ -66,6 +69,16 @@ impl ExternalIdentity {
         })
     }
 
+    /// Mark the email as asserted by the provider but **not trusted**:
+    /// [`Self::email_verified`] becomes `false`, so the store keeps it on
+    /// the identity row only and never claims it in the globally unique
+    /// user-email table.
+    #[must_use]
+    pub fn distrust_email(mut self) -> Self {
+        self.email_verified = false;
+        self
+    }
+
     /// The configured provider instance name (`github`, `codeberg`,
     /// `gitlab-work`).
     #[must_use]
@@ -85,7 +98,8 @@ impl ExternalIdentity {
         &self.email
     }
 
-    /// Always `true`; see the type docs.
+    /// Whether the provider's verified-email assertion is trusted; see the
+    /// type docs.
     #[must_use]
     pub fn email_verified(&self) -> bool {
         self.email_verified

@@ -307,7 +307,16 @@ forgs_user_email { user_id, email UNIQUE (canonical), verified_at, is_primary }
   `read:user user:email`, reads `GET /user/emails` and takes the
   `primary && verified` address. Each provider maps to one `ExternalIdentity
   { provider, subject, email, email_verified, suggested_username }`. With no
-  verified email, login is refused and the error says so. The provider login
+  verified email, login is refused and the error says so. Whether the
+  `email_verified` claim is **trusted** is per provider
+  (`OidcConfig::trust_email_verified`): Forgejo/Gitea derive it from the
+  account's active flag, so a self-hosted instance with
+  `REGISTER_EMAIL_CONFIRM=false` asserts any typed address. Only vetted
+  issuers (Codeberg, GitLab.com; GitHub reads `verified` from its API)
+  trust it by default; a generic `forgejo()`/`gitlab()`/OIDC instance does
+  not unless configured to. An untrusted email is kept on the identity row
+  (`email_verified = false`) but never recorded in `forgs_user_email`, so it
+  cannot squat an address another user would later claim. The provider login
   is offered only as a **suggestion** for the username field, never as an
   identifier.
 - A provider instance is **configured**, not hardcoded: `provider` is the
