@@ -71,7 +71,7 @@ use forgs::{RoleLadder, Schema};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::SqlitePool;
 
-pub use credentials::{ConsumedApiKey, GrantRow};
+pub use credentials::{ConsumedApiKey, ConsumedSession, GrantRow};
 pub use error::StoreError;
 pub use migrate::{migrate, SCHEMA_VERSION};
 pub use ns::{Membership, NsNode};

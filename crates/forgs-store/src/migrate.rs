@@ -12,7 +12,10 @@ use crate::error::{Result, StoreError};
 
 /// Every forgs migration, in order. Versions are never renumbered or edited
 /// once released; a change is a new entry.
-const MIGRATIONS: &[(i64, &str)] = &[(1, include_str!("../migrations/0001_init.sql"))];
+const MIGRATIONS: &[(i64, &str)] = &[
+    (1, include_str!("../migrations/0001_init.sql")),
+    (2, include_str!("../migrations/0002_session_auth_time.sql")),
+];
 
 /// The newest schema version this build knows.
 pub const SCHEMA_VERSION: i64 = MIGRATIONS[MIGRATIONS.len() - 1].0;

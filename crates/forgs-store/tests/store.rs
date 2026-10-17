@@ -134,7 +134,8 @@ async fn migrate_is_idempotent_and_records_versions() {
         .fetch_all(s.pool())
         .await
         .unwrap();
-    assert_eq!(rows, vec![(forgs_store::SCHEMA_VERSION,)]);
+    let want: Vec<(i64,)> = (1..=forgs_store::SCHEMA_VERSION).map(|v| (v,)).collect();
+    assert_eq!(rows, want);
     // forgs never touches sqlx's migration table.
     let (n,): (i64,) =
         sqlx::query_as("SELECT COUNT(*) FROM sqlite_master WHERE name = '_sqlx_migrations'")
@@ -228,7 +229,7 @@ async fn foreign_keys_are_enforced() {
     let s = store(fleet()).await;
     let ghost = UserId::generate(NOW * 1000);
     assert!(matches!(
-        s.insert_session(&hash(1), ghost, NOW, NOW + 10).await,
+        s.insert_session(&hash(1), ghost, NOW, NOW, NOW + 10).await,
         Err(StoreError::Dangling)
     ));
     assert!(matches!(
@@ -1045,7 +1046,7 @@ async fn token_store_lookups_round_trip() {
     let ns = ns.unwrap();
 
     let session = f.mint(TokenKind::Session);
-    s.insert_session(&session.hash(), alice, NOW, NOW + 100)
+    s.insert_session(&session.hash(), alice, NOW, NOW, NOW + 100)
         .await
         .unwrap();
     let r = s.lookup_session(&session.hash()).await.unwrap().unwrap();
@@ -1127,7 +1128,7 @@ async fn token_store_lookups_round_trip() {
 
     // A negative stored expiry clamps to "expired", never unbounded.
     let neg = f.mint(TokenKind::Session);
-    s.insert_session(&neg.hash(), alice, NOW, NOW)
+    s.insert_session(&neg.hash(), alice, NOW, NOW, NOW)
         .await
         .unwrap();
     sqlx::query("UPDATE forgs_session SET expires = -5 WHERE token_hash = ?1")
@@ -1180,13 +1181,15 @@ async fn logout_all_is_per_user() {
     let s = store(fleet()).await;
     let (alice, _) = s.create_local_user("alice", None, NOW).await.unwrap();
     let (bob, _) = s.create_local_user("bob", None, NOW).await.unwrap();
-    s.insert_session(&hash(1), alice, NOW, NOW + 9)
+    s.insert_session(&hash(1), alice, NOW, NOW, NOW + 9)
         .await
         .unwrap();
-    s.insert_session(&hash(2), alice, NOW, NOW + 9)
+    s.insert_session(&hash(2), alice, NOW, NOW, NOW + 9)
         .await
         .unwrap();
-    s.insert_session(&hash(3), bob, NOW, NOW + 9).await.unwrap();
+    s.insert_session(&hash(3), bob, NOW, NOW, NOW + 9)
+        .await
+        .unwrap();
     s.insert_refresh_token(&hash(4), alice, NOW, NOW + 9)
         .await
         .unwrap();
@@ -1197,6 +1200,71 @@ async fn logout_all_is_per_user() {
     assert_eq!(s.delete_refresh_tokens_for_user(alice).await.unwrap(), 1);
     assert!(s.lookup_session(&hash(3)).await.unwrap().is_some());
     assert!(s.lookup_refresh_token(&hash(5)).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn consume_session_is_single_shot_and_bounded() {
+    let s = store(fleet()).await;
+    let (alice, _) = s.create_local_user("alice", None, NOW).await.unwrap();
+    // Live, chain started 50s before its issue.
+    s.insert_session(&hash(1), alice, NOW, NOW - 50, NOW + 100)
+        .await
+        .unwrap();
+    let got = s.consume_session(&hash(1), NOW, 0).await.unwrap().unwrap();
+    assert_eq!(got.user_id, alice);
+    assert_eq!(got.auth_time, NOW - 50);
+    // Gone: a second consume (a racing refresher) gets nothing.
+    assert!(s.consume_session(&hash(1), NOW, 0).await.unwrap().is_none());
+    assert!(s.lookup_session(&hash(1)).await.unwrap().is_none());
+
+    // Expired (expiry is exclusive): refused and left alone.
+    s.insert_session(&hash(2), alice, NOW, NOW, NOW + 10)
+        .await
+        .unwrap();
+    assert!(s
+        .consume_session(&hash(2), NOW + 10, 0)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(s.lookup_session(&hash(2)).await.unwrap().is_some());
+
+    // Chain too old (auth_time <= min_auth_time): refused and left alone.
+    s.insert_session(&hash(3), alice, NOW, NOW - 5, NOW + 10)
+        .await
+        .unwrap();
+    assert!(s
+        .consume_session(&hash(3), NOW, NOW - 5)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(s.lookup_session(&hash(3)).await.unwrap().is_some());
+    assert!(s
+        .consume_session(&hash(3), NOW, NOW - 6)
+        .await
+        .unwrap()
+        .is_some());
+
+    // Unknown.
+    assert!(s.consume_session(&hash(9), NOW, 0).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn concurrent_consume_session_yields_one_winner() {
+    let s = store(fleet()).await;
+    let (alice, _) = s.create_local_user("alice", None, NOW).await.unwrap();
+    s.insert_session(&hash(1), alice, NOW, NOW, NOW + 100)
+        .await
+        .unwrap();
+    let h1 = hash(1);
+    let (a, b) = tokio::join!(
+        s.consume_session(&h1, NOW, 0),
+        s.consume_session(&h1, NOW, 0)
+    );
+    let wins = [a.unwrap(), b.unwrap()]
+        .iter()
+        .filter(|r| r.is_some())
+        .count();
+    assert_eq!(wins, 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -1212,7 +1280,7 @@ async fn deleting_a_user_cascades_their_rows() {
         .unwrap();
     let (bob, b) = s.create_local_user("bob", None, NOW).await.unwrap();
     let b = b.unwrap();
-    s.insert_session(&hash(1), alice, NOW, NOW + 9)
+    s.insert_session(&hash(1), alice, NOW, NOW, NOW + 9)
         .await
         .unwrap();
     s.insert_refresh_token(&hash(2), alice, NOW, NOW + 9)
@@ -1626,8 +1694,12 @@ async fn sweep_removes_exactly_the_dead_rows() {
     let (alice, ns) = s.create_local_user("alice", None, NOW).await.unwrap();
     let scope = s.scoped(ns.unwrap());
     let t = NOW + 100;
-    s.insert_session(&hash(1), alice, NOW, t).await.unwrap(); // dead (== now)
-    s.insert_session(&hash(2), alice, NOW, t + 1).await.unwrap();
+    s.insert_session(&hash(1), alice, NOW, NOW, t)
+        .await
+        .unwrap(); // dead (== now)
+    s.insert_session(&hash(2), alice, NOW, NOW, t + 1)
+        .await
+        .unwrap();
     s.insert_refresh_token(&hash(3), alice, NOW, t - 1)
         .await
         .unwrap(); // dead

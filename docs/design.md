@@ -217,6 +217,12 @@ forgs_membership { ns_node_id, subject (SubjectKey), user_id NULL, role }
 - Lifetimes (`forgs_http::Ttls` defaults): sessions 12h; CLI refresh tokens
   30d, non-rotating; workload tokens 1h, capped at 12h; pending signups 15m;
   device approvals 10m; API keys minted over the API at most 30d.
+  Session refresh (`grant_type: refresh`) consumes the old session in one
+  atomic `DELETE … RETURNING` before minting, so concurrent refreshes of one
+  token yield exactly one success; the replacement inherits the chain's
+  original authentication time, and a chain is capped at 30d
+  (`session_max_life`) from it. Login and refresh-token redemption start a
+  new chain.
   `logout --all` revokes every session and refresh token of the user.
 - API keys are namespace-scoped. Minting requires membership, keys minted over
   the API must expire, they are revocable by the creator or an admin, and named

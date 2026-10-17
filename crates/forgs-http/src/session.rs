@@ -26,7 +26,8 @@ impl std::fmt::Debug for MintedSession {
     }
 }
 
-/// Mint a session for an existing user. `how` goes into the audit detail.
+/// Mint a session for an existing user, starting a new refresh chain (its
+/// absolute lifetime counts from now). `how` goes into the audit detail.
 ///
 /// # Errors
 ///
@@ -36,11 +37,26 @@ pub async fn mint_session(
     user: UserId,
     how: &str,
 ) -> Result<MintedSession, ApiError> {
+    mint_session_in_chain(ctx, user, how, ctx.now()).await
+}
+
+/// Mint a session belonging to the refresh chain authenticated at
+/// `auth_time`. Its expiry is capped at the chain's absolute end,
+/// `auth_time + session_max_life`.
+async fn mint_session_in_chain(
+    ctx: &AuthContext,
+    user: UserId,
+    how: &str,
+    auth_time: u64,
+) -> Result<MintedSession, ApiError> {
     let now = ctx.now();
-    let expires = now.saturating_add(ctx.ttl().session);
+    let ttl = ctx.ttl();
+    let expires = now
+        .saturating_add(ttl.session)
+        .min(auth_time.saturating_add(ttl.session_max_life));
     let token = ctx.format().mint(TokenKind::Session);
     ctx.store()
-        .insert_session(&token.hash(), user, now, expires)
+        .insert_session(&token.hash(), user, now, auth_time, expires)
         .await
         .map_err(store_err("insert_session"))?;
     ctx.audit()
@@ -103,13 +119,23 @@ pub(crate) async fn user_is_active(ctx: &AuthContext, user: UserId) -> Result<bo
 
 /// `grant_type: refresh` — exchange a live session token for a fresh one.
 ///
-/// **Replacing**: the old session stops working immediately, so a stolen one
-/// has a strictly bounded life even if the theft is not noticed.
+/// **Replacing, atomically**: the old session is consumed by one
+/// `DELETE … RETURNING` *before* the new one is minted, so concurrent
+/// refreshes of one token yield exactly one success — a stolen session
+/// cannot be forked. If the mint then fails the caller has lost its session:
+/// that fails closed.
+///
+/// **Bounded**: the replacement inherits the chain's original
+/// authentication time, and a chain older than
+/// [`Ttls::session_max_life`](crate::context::Ttls::session_max_life) cannot
+/// be refreshed (nor can any session in it expire past that age). A stolen
+/// session refreshed forever therefore still dies; getting a new chain
+/// needs a fresh login or a refresh-token redemption.
 ///
 /// # Errors
 ///
-/// `401 invalid_grant` for anything but a live session of an active user
-/// (uniformly), `500` on a storage failure.
+/// `401 invalid_grant` for anything but a live, in-lifetime session of an
+/// active user (uniformly), `500` on a storage failure.
 pub async fn refresh_session(
     ctx: &AuthContext,
     session_token: &str,
@@ -139,8 +165,24 @@ pub async fn refresh_session(
     if !user_is_active(ctx, user).await? {
         return Err(ApiError::InvalidGrant);
     }
-    let fresh = mint_session(ctx, user, "session refresh").await?;
-    let _ = ctx.store().delete_session(&auth.hash).await;
+    let min_auth_time = now.saturating_sub(ctx.ttl().session_max_life);
+    let consumed = ctx
+        .store()
+        .consume_session(&auth.hash, now, min_auth_time)
+        .await
+        .map_err(store_err("consume_session"))?;
+    let Some(consumed) = consumed.filter(|c| c.user_id == user) else {
+        ctx.audit()
+            .record(
+                AuditEvent::new(now, "session.refresh_refused")
+                    .subject(&auth.subject)
+                    .target(auth.hash.short())
+                    .detail("session already consumed or past absolute lifetime"),
+            )
+            .await;
+        return Err(ApiError::InvalidGrant);
+    };
+    let fresh = mint_session_in_chain(ctx, user, "session refresh", consumed.auth_time).await?;
     Ok(TokenResponse {
         token: fresh.token,
         expires: fresh.expires,

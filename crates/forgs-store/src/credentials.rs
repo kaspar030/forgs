@@ -85,6 +85,15 @@ pub struct ConsumedApiKey {
     pub created_by: Option<UserId>,
 }
 
+/// A session consumed by [`Store::consume_session`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConsumedSession {
+    /// The session's user.
+    pub user_id: UserId,
+    /// When the session's refresh chain was originally authenticated.
+    pub auth_time: u64,
+}
+
 type ApiKeyRecordRow = (
     String,
     String,
@@ -117,6 +126,10 @@ const API_KEY_COLS: &str =
 impl Store {
     /// Insert a user session (by token hash).
     ///
+    /// `auth_time` is when the session's refresh chain was originally
+    /// authenticated: `issued_at` for a fresh login, the predecessor's
+    /// `auth_time` for a session refresh.
+    ///
     /// The user must exist: the foreign key makes a session for a
     /// nonexistent user fail loudly here rather than become a valid token
     /// belonging to nobody.
@@ -129,20 +142,64 @@ impl Store {
         hash: &TokenHash,
         user: UserId,
         issued_at: u64,
+        auth_time: u64,
         expires: u64,
     ) -> Result<()> {
-        sqlx::query("INSERT INTO forgs_session (token_hash, user_id, issued_at, expires) VALUES (?1, ?2, ?3, ?4)")
-            .bind(hash.as_str())
-            .bind(user.to_string())
-            .bind(ts(issued_at)?)
-            .bind(ts(expires)?)
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "INSERT INTO forgs_session (token_hash, user_id, issued_at, auth_time, expires)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )
+        .bind(hash.as_str())
+        .bind(user.to_string())
+        .bind(ts(issued_at)?)
+        .bind(ts(auth_time)?)
+        .bind(ts(expires)?)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
-    /// Delete a session (logout, or refresh replacing it). Returns whether it
-    /// existed.
+    /// Atomically consume a live session for a refresh, in **one statement**.
+    ///
+    /// Deletes the session if it is unexpired (`expires > now`; expiry is
+    /// exclusive) and its chain is younger than the absolute limit
+    /// (`auth_time > min_auth_time`), returning its user and `auth_time`.
+    /// Concurrent refreshers race on the `DELETE`, so exactly one of them
+    /// gets the row: one stolen session cannot be forked into several.
+    ///
+    /// Returns `None` when the session is unknown, already consumed,
+    /// expired, or past its chain's absolute lifetime (an expired or
+    /// over-age row is left alone).
+    ///
+    /// # Errors
+    ///
+    /// [`crate::StoreError::CorruptRow`] or a database error.
+    pub async fn consume_session(
+        &self,
+        hash: &TokenHash,
+        now: u64,
+        min_auth_time: u64,
+    ) -> Result<Option<ConsumedSession>> {
+        let row: Option<(String, i64)> = sqlx::query_as(
+            "DELETE FROM forgs_session
+             WHERE token_hash = ?1 AND expires > ?2 AND auth_time > ?3
+             RETURNING user_id, auth_time",
+        )
+        .bind(hash.as_str())
+        .bind(ts(now)?)
+        .bind(ts(min_auth_time)?)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|(user, auth_time)| {
+            Ok(ConsumedSession {
+                user_id: parse_id!(UserId, user)?,
+                auth_time: from_ts(auth_time),
+            })
+        })
+        .transpose()
+    }
+
+    /// Delete a session (logout). Returns whether it existed.
     ///
     /// # Errors
     ///

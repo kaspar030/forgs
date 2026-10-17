@@ -78,6 +78,10 @@ pub struct Ttls {
     pub session: u64,
     /// A CLI refresh token. 30d, non-rotating.
     pub refresh: u64,
+    /// Absolute lifetime of a session refresh chain (`grant_type: refresh`),
+    /// counted from the original authentication. No refreshed session
+    /// outlives it. 30d.
+    pub session_max_life: u64,
     /// A workload token's default lifetime. 1h.
     pub workload: u64,
     /// The ceiling on any workload token. 12h.
@@ -99,6 +103,7 @@ impl Default for Ttls {
         Self {
             session: 12 * 3600,
             refresh: 30 * 24 * 3600,
+            session_max_life: 30 * 24 * 3600,
             workload: 3600,
             workload_cap: 12 * 3600,
             pending_signup: 15 * 60,

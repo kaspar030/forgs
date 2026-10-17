@@ -1136,6 +1136,92 @@ async fn wrong_kind_is_403_and_every_401_is_identical() {
 }
 
 #[tokio::test]
+async fn concurrent_session_refresh_yields_exactly_one_success() {
+    let h = harness().await;
+    let jar = h.signup("a", "1", "a@x.example", "alice").await;
+    let session = H::session(&jar);
+    let (a, b) = tokio::join!(
+        forgs_http::session::refresh_session(&h.ctx, &session),
+        forgs_http::session::refresh_session(&h.ctx, &session)
+    );
+    let (ok, err): (Vec<_>, Vec<_>) = [a, b].into_iter().partition(Result::is_ok);
+    assert_eq!(ok.len(), 1, "exactly one refresh wins");
+    assert!(matches!(err[0], Err(forgs_http::ApiError::InvalidGrant)));
+    h.whoami(&session).await.expect(StatusCode::UNAUTHORIZED);
+    let fresh = ok.into_iter().next().unwrap().unwrap().token;
+    h.whoami(&fresh).await.expect(StatusCode::OK);
+    assert!(h.audit.has("session.refresh_refused"));
+}
+
+#[tokio::test]
+async fn session_refresh_chain_has_an_absolute_lifetime() {
+    let h = harness().await;
+    let jar = h.signup("a", "1", "a@x.example", "alice").await;
+    let ttl = *h.ctx.ttl();
+    let start = h.ctx.now();
+    let end = start + ttl.session_max_life;
+    let refresh = |tok: String| {
+        let h = &h;
+        async move {
+            h.post_json(
+                "/auth/token",
+                None,
+                None,
+                &[],
+                &json!({"grant_type": "refresh", "session_token": tok}),
+            )
+            .await
+        }
+    };
+    let mut tok = H::session(&jar);
+    let mut refused = false;
+    for _ in 0..1000 {
+        h.clock.advance(ttl.session - 60);
+        let r = refresh(tok.clone()).await;
+        if r.status == StatusCode::UNAUTHORIZED {
+            assert_eq!(r.error(), "invalid_grant");
+            refused = true;
+            break;
+        }
+        r.expect(StatusCode::OK);
+        let expires = r.json()["expires"].as_u64().unwrap();
+        assert!(expires <= end, "refreshed session outlives the chain");
+        tok = r.json()["token"].as_str().unwrap().to_owned();
+    }
+    assert!(refused, "the chain was refreshable forever");
+    assert!(h.ctx.now() >= end);
+
+    // A refresh-token redemption starts a fresh, refreshable chain.
+    let alice = h
+        .ctx
+        .store()
+        .user_by_username("alice")
+        .await
+        .unwrap()
+        .unwrap();
+    let rt = forgs_http::session::mint_refresh(&h.ctx, alice.id)
+        .await
+        .unwrap();
+    let r = h
+        .post_json(
+            "/auth/token",
+            None,
+            None,
+            &[],
+            &json!({"grant_type": "refresh_token", "refresh_token": rt}),
+        )
+        .await;
+    r.expect(StatusCode::OK);
+    let new = r.json()["token"].as_str().unwrap().to_owned();
+    let r = refresh(new).await;
+    r.expect(StatusCode::OK);
+    assert_eq!(
+        r.json()["expires"].as_u64().unwrap(),
+        h.ctx.now() + ttl.session
+    );
+}
+
+#[tokio::test]
 async fn tombstoned_reserved_and_invalid_usernames() {
     let h = harness().await;
     let jar = h.signup("a", "1", "a@x.example", "alice").await;
