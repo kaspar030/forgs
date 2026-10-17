@@ -7,6 +7,7 @@ use std::time::Duration;
 use hyper::body::Bytes;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use zeroize::Zeroize;
 
 use forgs::api::{
     ApiKeyCreated, ApiKeyList, ApiKeyRequest, ApiKeyRevoked, DevicePollRequest, DevicePollResponse,
@@ -418,6 +419,22 @@ impl ForgsClient {
         self.post_json("/auth/token", None, request).await
     }
 
+    /// [`ForgsClient::exchange`], then wipe the credential copy held in
+    /// `request` (the wire structs in `forgs::api` are plain `String`s).
+    async fn exchange_scrubbed(
+        &self,
+        mut request: TokenRequest,
+    ) -> Result<TokenResponse, ClientError> {
+        let result = self.exchange(&request).await;
+        match &mut request {
+            TokenRequest::Refresh { session_token: s }
+            | TokenRequest::RefreshToken { refresh_token: s }
+            | TokenRequest::GithubOidc { oidc_token: s }
+            | TokenRequest::ApiKey { api_key: s } => s.zeroize(),
+        }
+        result
+    }
+
     /// Exchange a still-valid session token for a fresh one.
     ///
     /// **Replacing**: the server deletes the presented session on success, so
@@ -430,7 +447,7 @@ impl ForgsClient {
     ///
     /// As [`ForgsClient::exchange`].
     pub async fn refresh_session(&self, session_token: &str) -> Result<TokenResponse, ClientError> {
-        self.exchange(&TokenRequest::Refresh {
+        self.exchange_scrubbed(TokenRequest::Refresh {
             session_token: session_token.to_owned(),
         })
         .await
@@ -450,7 +467,7 @@ impl ForgsClient {
         &self,
         refresh_token: &str,
     ) -> Result<TokenResponse, ClientError> {
-        self.exchange(&TokenRequest::RefreshToken {
+        self.exchange_scrubbed(TokenRequest::RefreshToken {
             refresh_token: refresh_token.to_owned(),
         })
         .await
@@ -467,7 +484,7 @@ impl ForgsClient {
         &self,
         oidc_token: &str,
     ) -> Result<TokenResponse, ClientError> {
-        self.exchange(&TokenRequest::GithubOidc {
+        self.exchange_scrubbed(TokenRequest::GithubOidc {
             oidc_token: oidc_token.to_owned(),
         })
         .await
@@ -482,7 +499,7 @@ impl ForgsClient {
     /// `401 invalid_grant`, a key whose purpose does not redeem this way a
     /// `403 forbidden`.
     pub async fn exchange_api_key(&self, api_key: &str) -> Result<TokenResponse, ClientError> {
-        self.exchange(&TokenRequest::ApiKey {
+        self.exchange_scrubbed(TokenRequest::ApiKey {
             api_key: api_key.to_owned(),
         })
         .await
@@ -506,16 +523,16 @@ impl ForgsClient {
         refresh_token: Option<&str>,
         all: bool,
     ) -> Result<(), ClientError> {
-        self.post(
-            "/auth/logout",
-            Some(&Secret::from(session_token)),
-            &LogoutRequest {
-                refresh_token: refresh_token.map(ToOwned::to_owned),
-                all,
-            },
-        )
-        .await
-        .map(drop)
+        let mut request = LogoutRequest {
+            refresh_token: refresh_token.map(ToOwned::to_owned),
+            all,
+        };
+        let result = self
+            .post("/auth/logout", Some(&Secret::from(session_token)), &request)
+            .await
+            .map(drop);
+        request.refresh_token.zeroize();
+        result
     }
 
     /// Begin forgs' own device flow (`POST /auth/device/start`).
@@ -540,14 +557,12 @@ impl ForgsClient {
         &self,
         device_secret: &str,
     ) -> Result<DevicePollResponse, ClientError> {
-        self.post_json(
-            "/auth/device/poll",
-            None,
-            &DevicePollRequest {
-                device_secret: device_secret.to_owned(),
-            },
-        )
-        .await
+        let mut request = DevicePollRequest {
+            device_secret: device_secret.to_owned(),
+        };
+        let result = self.post_json("/auth/device/poll", None, &request).await;
+        request.device_secret.zeroize();
+        result
     }
 
     /// Mint a namespace-scoped API key (`POST /auth/keys`, `create`).

@@ -23,8 +23,12 @@ fn provider() -> Arc<CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
-/// Build the [`ClientConfig`] for connections to a forgs server (and the
-/// GitHub Actions token service, which only ever uses `pin = None`).
+/// Build the [`ClientConfig`] for connections to a forgs server.
+///
+/// [`crate::gha`] reaches the GitHub Actions token service through whatever
+/// config the passed [`crate::ForgsClient`] has: nothing forces `pin = None`
+/// there, so a pinned client fails the TLS check against GitHub and never
+/// sends the request token. Callers use a separate unpinned client for it.
 ///
 /// Presents no client certificate: callers authenticate with bearer tokens.
 ///

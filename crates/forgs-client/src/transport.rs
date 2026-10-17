@@ -61,7 +61,10 @@ pub(crate) async fn send(
         builder = builder.header(http::header::CONTENT_TYPE, "application/json");
     }
     if let Some(bearer) = bearer {
-        let mut value = http::HeaderValue::from_str(&format!("Bearer {}", bearer.expose()))
+        // The formatted header text is wiped when it goes out of scope;
+        // `HeaderValue` keeps its own copy, which this crate cannot wipe.
+        let text = zeroize::Zeroizing::new(format!("Bearer {}", bearer.expose()));
+        let mut value = http::HeaderValue::from_str(&text)
             // The error text would not name the value, but say why plainly.
             .map_err(|_| ClientError::Url("credential is not a valid header value".to_owned()))?;
         value.set_sensitive(true);

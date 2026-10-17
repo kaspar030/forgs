@@ -59,6 +59,9 @@ sha2 = "0.11"
 # OS randomness. `getrandom::fill` directly: rand_core 0.10 dropped `OsRng`.
 getrandom = "0.4"
 thiserror = "2"
+# Wiping client-side credentials on drop (forgs-client). Pure Rust, and already
+# in the graph through rustls / rustls-pki-types.
+zeroize = { version = "1", default-features = false, features = ["alloc"] }
 async-trait = "0.1"
 # `default-features = false` and no features: ulid's `std` feature (which its
 # `serde` feature needs) pulls rand 0.9, a second RNG stack. forgs builds ids

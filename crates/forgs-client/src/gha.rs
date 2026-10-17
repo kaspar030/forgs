@@ -5,6 +5,12 @@
 //! only in a job with `permissions: id-token: write`. Both are per-job; nothing
 //! is stored. The request goes through the client's own connector (and so its
 //! trust config), keeping one trust path.
+//!
+//! **A pinned client cannot reach GitHub.** The pin is the client's whole
+//! trust config, so the TLS handshake with the token service fails (a
+//! [`ClientError::Transport`]) and the request token is never sent: it fails
+//! closed. If the forgs server is pinned, build a second, unpinned client for
+//! this fetch — see [`fetch_id_token`].
 
 use serde::Deserialize;
 
@@ -42,6 +48,26 @@ pub enum GhaError {
 /// mistake), or an unparseable `request_url`; [`ClientError::Rejected`] for a
 /// non-2xx (usually a job without `id-token: write`);
 /// [`ClientError::Malformed`] for a body without a non-empty `value`.
+///
+/// # Pinned clients
+///
+/// `client`'s trust config applies here too, so a client built with a pin
+/// fails against GitHub with [`ClientError::Transport`] before the request
+/// token leaves the process. Use a separate `WebPKI` client for the fetch and
+/// the pinned one for the exchange:
+///
+/// ```no_run
+/// # async fn run(pin: [u8; 32], url: &str, token: &forgs_client::Secret)
+/// #     -> Result<(), forgs_client::ClientError> {
+/// use forgs_client::{gha, ForgsClient};
+/// // The base URL is not used for the fetch (the full `request_url` is), but
+/// // must be a valid base: `request_url` itself carries a query.
+/// let github = ForgsClient::new("https://token.actions.githubusercontent.com", None)?;
+/// let forgs = ForgsClient::new("https://forgs.internal:8443", Some(pin))?;
+/// let jwt = gha::fetch_id_token(&github, url, token, "https://forgs.internal:8443").await?;
+/// let session = forgs.exchange_github_oidc(jwt.expose()).await?;
+/// # drop(session); Ok(()) }
+/// ```
 pub async fn fetch_id_token(
     client: &ForgsClient,
     request_url: &str,
@@ -87,6 +113,10 @@ pub async fn fetch_id_token(
 ///
 /// [`GhaError::NotInJob`] if either variable is absent or empty, else as
 /// [`fetch_id_token`].
+///
+/// # Pinned clients
+///
+/// As [`fetch_id_token`]: pass an unpinned client, or the fetch fails closed.
 pub async fn fetch_id_token_from_env(
     client: &ForgsClient,
     audience: &str,
