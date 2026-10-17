@@ -43,6 +43,9 @@ pub enum StoreError {
     /// The email address belongs to another user.
     #[error("email address is already in use")]
     EmailTaken,
+    /// The user's only remaining login method cannot be unlinked.
+    #[error("cannot unlink the last identity")]
+    LastIdentity,
     /// The referenced row does not exist.
     #[error("not found")]
     NotFound,

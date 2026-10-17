@@ -323,6 +323,56 @@ async fn failed_signups_roll_back_completely() {
 }
 
 #[tokio::test]
+async fn identities_are_listed_and_unlinked_but_never_the_last() {
+    let s = store(fleet()).await;
+    let (alice, _) = s.signup(&signup("alice", "1", None), NOW).await.unwrap();
+    let (bob, _) = s.signup(&signup("bob", "2", None), NOW).await.unwrap();
+    let late = s
+        .link_identity(alice, &ident("gitlab", "9", None), NOW + 10)
+        .await
+        .unwrap();
+    s.link_identity(alice, &ident("forgejo", "8", None), NOW + 20)
+        .await
+        .unwrap();
+    let ids = s.identities_for_user(alice).await.unwrap();
+    assert_eq!(
+        ids.iter().map(|i| i.provider.as_str()).collect::<Vec<_>>(),
+        ["github", "gitlab", "forgejo"]
+    );
+    assert_eq!(ids[1].id, late);
+    assert_eq!(ids[1].linked_at, NOW + 10);
+
+    // Another user's id is NotFound, not an unlink.
+    let bobs = s.identities_for_user(bob).await.unwrap()[0].id;
+    assert!(matches!(
+        s.unlink_identity(alice, bobs).await,
+        Err(StoreError::NotFound)
+    ));
+    assert!(matches!(
+        s.unlink_identity(bob, bobs).await,
+        Err(StoreError::LastIdentity)
+    ));
+    s.unlink_identity(alice, late).await.unwrap();
+    assert!(matches!(
+        s.unlink_identity(alice, late).await,
+        Err(StoreError::NotFound)
+    ));
+
+    // Linked-after keeps everything up to the cut-off ...
+    assert_eq!(
+        s.unlink_identities_linked_after(alice, NOW + 15)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(s.identities_for_user(alice).await.unwrap().len(), 1);
+    // ... and never the oldest, even with a cut-off before it.
+    assert_eq!(s.unlink_identities_linked_after(alice, 0).await.unwrap(), 0);
+    assert_eq!(s.identities_for_user(alice).await.unwrap().len(), 1);
+    assert_eq!(s.identities_for_user(bob).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn local_users_get_a_personal_node_and_no_identity() {
     let s = store(fleet()).await;
     let (user, ns) = s

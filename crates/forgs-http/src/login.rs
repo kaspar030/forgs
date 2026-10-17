@@ -18,9 +18,30 @@
 //! if its verified email matches an existing user**: this path never looks
 //! email up at all. Auto-linking on email turns "attacker controls a
 //! provider that asserts your email" into account takeover. A second login
-//! method is linked only from an authenticated session ([`start_login`] with
-//! `link_user`), and the callback re-checks that the same user is still
-//! logged in.
+//! method is linked only from an authenticated browser session, and only
+//! after step-up (below).
+//!
+//! # Linking requires step-up
+//!
+//! A session token alone — stolen, redeemed from a refresh token, or a CLI
+//! token — must not be able to add a permanent login method to an account.
+//! So linking is two legs, each with its own sealed flow cookie:
+//!
+//! 1. [`FlowIntent::Reauth`]: the browser logs in again with a provider
+//!    **already linked** to the user. The callback checks that the asserted
+//!    identity belongs to the logged-in user (`reauth_required` otherwise)
+//!    and starts leg 2.
+//! 2. [`FlowIntent::Link`]: the browser logs in with the target provider and
+//!    the callback links that identity.
+//!
+//! A `Link` cookie is minted only by a successful reauth leg (the cookie is
+//! sealed). Both legs re-check that the same user is still logged in. A user
+//! with no linked identity (a local bootstrap user) cannot link at all.
+//!
+//! Re-authenticating and linking through the *same* provider (a second
+//! GitHub account) usually ends in `identity_taken`: the provider tends to
+//! hand back the account the browser is already logged in to. Log out of
+//! the provider between the legs.
 
 use forgs::UserId;
 use forgs_idp::{AuthRequest, IdpError};
@@ -56,24 +77,82 @@ pub struct StartedLogin {
     pub cookie: String,
 }
 
+/// What a login flow is for, sealed into its flow cookie.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FlowIntent {
+    /// An ordinary login (or first-login signup).
+    Login,
+    /// Step-up: prove, with an identity already linked to `user`, that the
+    /// person holding the session is the account's owner; then link
+    /// `link_provider`.
+    Reauth {
+        /// The logged-in user.
+        user: UserId,
+        /// The provider to link once re-authenticated.
+        link_provider: String,
+    },
+    /// Link the identity to `user`. Minted only by a successful
+    /// [`FlowIntent::Reauth`] leg.
+    Link {
+        /// The logged-in user.
+        user: UserId,
+    },
+}
+
+impl FlowIntent {
+    fn encode(&self) -> String {
+        match self {
+            FlowIntent::Login => String::new(),
+            FlowIntent::Reauth {
+                user,
+                link_provider,
+            } => format!("reauth:{user}:{link_provider}"),
+            FlowIntent::Link { user } => format!("link:{user}"),
+        }
+    }
+
+    fn decode(s: &str) -> Option<Self> {
+        if s.is_empty() {
+            return Some(FlowIntent::Login);
+        }
+        if let Some(u) = s.strip_prefix("link:") {
+            return UserId::parse(u).ok().map(|user| FlowIntent::Link { user });
+        }
+        let rest = s.strip_prefix("reauth:")?;
+        let (u, p) = rest.split_once(':')?;
+        if p.is_empty() {
+            return None;
+        }
+        Some(FlowIntent::Reauth {
+            user: UserId::parse(u).ok()?,
+            link_provider: p.to_owned(),
+        })
+    }
+}
+
 /// Begin an authorization-code login with `provider`.
 ///
 /// `return_to` (a same-origin path; anything else is dropped) is where the
-/// browser lands afterwards. `link_user` is set only by the authenticated
-/// "add login method" route: the callback then links the identity to that
-/// user instead of logging in.
+/// browser lands afterwards. `intent` is [`FlowIntent::Login`] except for
+/// the authenticated "add login method" route, which starts a
+/// [`FlowIntent::Reauth`] leg (see the module docs).
 ///
 /// # Errors
 ///
-/// [`ApiError::UNKNOWN_PROVIDER`], or [`ApiError::UPSTREAM`] if the provider
-/// cannot build its URL.
+/// [`ApiError::UNKNOWN_PROVIDER`] (for `provider`, or a reauth leg's
+/// `link_provider`), or [`ApiError::UPSTREAM`] if the provider cannot build
+/// its URL.
 pub fn start_login(
     ctx: &AuthContext,
     provider: &str,
     return_to: Option<&str>,
-    link_user: Option<UserId>,
+    intent: &FlowIntent,
 ) -> Result<StartedLogin, ApiError> {
     let p = ctx.provider(provider).ok_or(ApiError::UNKNOWN_PROVIDER)?;
+    if let FlowIntent::Reauth { link_provider, .. } = intent {
+        ctx.provider(link_provider)
+            .ok_or(ApiError::UNKNOWN_PROVIDER)?;
+    }
     let req = AuthRequest::generate();
     let authorize_url = p
         .authorization_url(&ctx.redirect_uri(provider), &req)
@@ -82,7 +161,7 @@ pub fn start_login(
             ApiError::UPSTREAM
         })?;
     let return_to = return_to.and_then(safe_return_to).unwrap_or("");
-    let link = link_user.map(|u| u.to_string()).unwrap_or_default();
+    let intent = intent.encode();
     let cookie = seal(
         ctx,
         &ctx.cookies().oauth,
@@ -93,7 +172,7 @@ pub fn start_login(
             &req.nonce,
             &req.pkce_verifier,
             return_to,
-            &link,
+            &intent,
         ],
     );
     Ok(StartedLogin {
@@ -128,6 +207,12 @@ pub enum LoginOutcome {
         /// Where to go next.
         return_to: Option<String>,
     },
+    /// The step-up leg succeeded: the browser goes on to the target
+    /// provider with this new flow cookie.
+    Reauthenticated {
+        /// The link leg.
+        started: StartedLogin,
+    },
 }
 
 /// Finish a login. `oauth_cookie` is the flow cookie's value (the caller
@@ -140,7 +225,8 @@ pub enum LoginOutcome {
 /// alike, and nothing minted), [`ApiError::NO_VERIFIED_EMAIL`],
 /// [`ApiError::UPSTREAM`] for other provider failures, `403` for a disabled
 /// user, [`ApiError::IDENTITY_TAKEN`] when linking an identity already
-/// linked, `500` on storage failure.
+/// linked, [`ApiError::REAUTH_REQUIRED`] when a step-up leg asserted an
+/// identity that is not the logged-in user's, `500` on storage failure.
 #[allow(clippy::too_many_lines)]
 pub async fn complete_login(
     ctx: &AuthContext,
@@ -168,7 +254,7 @@ pub async fn complete_login(
     let Some(fields) = oauth_cookie.and_then(|c| unseal(ctx, &ctx.cookies().oauth, c, 6)) else {
         return Err(bad_state("missing, forged or expired flow cookie").await);
     };
-    let [cookie_provider, cookie_state, nonce, verifier, return_to, link] = &fields[..] else {
+    let [cookie_provider, cookie_state, nonce, verifier, return_to, intent] = &fields[..] else {
         return Err(bad_state("malformed flow cookie").await);
     };
     if cookie_provider != provider
@@ -210,28 +296,81 @@ pub async fn complete_login(
         email_verified: identity.email_verified(),
     };
 
-    if !link.is_empty() {
-        let link_user = UserId::parse(link).map_err(|_| ApiError::BadRequest)?;
-        // The flow was started from an authenticated session; the same user
-        // must still be the one logged in when it comes back.
-        if current_user != Some(link_user) {
-            return Err(bad_state("link flow finished without the starting session").await);
+    let Some(intent) = FlowIntent::decode(intent) else {
+        return Err(bad_state("malformed flow intent").await);
+    };
+    match intent {
+        FlowIntent::Login => {}
+        FlowIntent::Reauth {
+            user,
+            link_provider,
+        } => {
+            // Started from an authenticated browser session; the same user
+            // must still be the one logged in when it comes back.
+            if current_user != Some(user) {
+                return Err(bad_state("reauth flow finished without the starting session").await);
+            }
+            let owner = ctx
+                .store()
+                .user_by_identity(identity.provider(), identity.subject())
+                .await
+                .map_err(store_err("user_by_identity"))?;
+            if owner.as_ref().map(|u| u.id) != Some(user) {
+                ctx.audit()
+                    .record(
+                        AuditEvent::new(now, "identity.link.reauth_failed")
+                            .subject(&forgs::SubjectKey::user(user))
+                            .target(link_provider)
+                            .detail(format!("reauth via {provider} asserted another identity")),
+                    )
+                    .await;
+                return Err(ApiError::REAUTH_REQUIRED);
+            }
+            ctx.store()
+                .touch_identity_login(
+                    identity.provider(),
+                    identity.subject(),
+                    Some(identity.email()),
+                    identity.email_verified(),
+                    now,
+                )
+                .await
+                .map_err(store_err("touch_identity_login"))?;
+            ctx.audit()
+                .record(
+                    AuditEvent::new(now, "identity.link.reauth")
+                        .subject(&forgs::SubjectKey::user(user))
+                        .target(link_provider.clone())
+                        .detail(format!("via {provider}")),
+                )
+                .await;
+            let started = start_login(
+                ctx,
+                &link_provider,
+                return_to.as_deref(),
+                &FlowIntent::Link { user },
+            )?;
+            return Ok(LoginOutcome::Reauthenticated { started });
         }
-        ctx.store()
-            .link_identity(link_user, &new_identity, now)
-            .await
-            .map_err(store_err("link_identity"))?;
-        ctx.audit()
-            .record(
-                AuditEvent::new(now, "identity.link")
-                    .subject(&forgs::SubjectKey::user(link_user))
-                    .target(provider),
-            )
-            .await;
-        return Ok(LoginOutcome::Linked {
-            user: link_user,
-            return_to,
-        });
+        FlowIntent::Link { user } => {
+            if current_user != Some(user) {
+                return Err(bad_state("link flow finished without the starting session").await);
+            }
+            let id = ctx
+                .store()
+                .link_identity(user, &new_identity, now)
+                .await
+                .map_err(store_err("link_identity"))?;
+            ctx.audit()
+                .record(
+                    AuditEvent::new(now, "identity.link")
+                        .subject(&forgs::SubjectKey::user(user))
+                        .target(provider)
+                        .detail(format!("identity {id}")),
+                )
+                .await;
+            return Ok(LoginOutcome::Linked { user, return_to });
+        }
     }
 
     let known = ctx

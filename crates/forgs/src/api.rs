@@ -58,6 +58,11 @@ pub mod error_code {
     pub const NO_VERIFIED_EMAIL: &str = "no_verified_email";
     /// The server is at capacity for this flow; retry later.
     pub const TEMPORARILY_UNAVAILABLE: &str = "temporarily_unavailable";
+    /// The identity is the user's only login method and cannot be unlinked.
+    pub const LAST_IDENTITY: &str = "last_identity";
+    /// Adding a login method needs a fresh login with one already linked to
+    /// the account (and the account has none usable).
+    pub const REAUTH_REQUIRED: &str = "reauth_required";
 }
 
 /// A token-exchange request to `POST /auth/token`.
@@ -151,6 +156,53 @@ pub struct LogoutRequest {
     /// the presented ones. This is the lost-machine answer.
     #[serde(default)]
     pub all: bool,
+    /// With [`LogoutRequest::all`] only (ignored otherwise): also unlink every
+    /// login method linked **after** this epoch (seconds) — for "someone may
+    /// have added a login method to my account". The account's oldest
+    /// identity is always kept.
+    ///
+    /// To remove one specific identity instead: list them
+    /// (`GET /auth/identities`), unlink it (`POST /auth/identities/unlink`),
+    /// then `logout --all`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identities_linked_after: Option<u64>,
+}
+
+/// One linked login method, in an [`IdentityList`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdentityInfo {
+    /// The identity id (what [`UnlinkIdentityRequest::id`] names).
+    pub id: String,
+    /// The configured provider instance name.
+    pub provider: String,
+    /// The provider's immutable subject id.
+    pub subject: String,
+    /// The email the provider last asserted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    /// Whether that email was asserted as verified.
+    #[serde(default)]
+    pub email_verified: bool,
+    /// When it was linked (epoch seconds).
+    pub linked_at: u64,
+    /// The last login through it (epoch seconds).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_login_at: Option<u64>,
+}
+
+/// `GET /auth/identities`: the caller's linked login methods, oldest first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdentityList {
+    /// The identities.
+    pub identities: Vec<IdentityInfo>,
+}
+
+/// A request to `POST /auth/identities/unlink`. The last identity cannot be
+/// unlinked (`409 last_identity`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnlinkIdentityRequest {
+    /// The identity id from [`IdentityInfo::id`].
+    pub id: String,
 }
 
 /// A request to begin forgs' own device flow (`POST /auth/device/start`).
@@ -499,6 +551,7 @@ impl std::fmt::Debug for LogoutRequest {
         f.debug_struct("LogoutRequest")
             .field("refresh_token", &redact_opt(self.refresh_token.as_ref()))
             .field("all", &self.all)
+            .field("identities_linked_after", &self.identities_linked_after)
             .finish()
     }
 }
@@ -627,8 +680,17 @@ mod tests {
             &LogoutRequest {
                 refresh_token: Some("r".into()),
                 all: true,
+                identities_linked_after: None,
             },
             &json!({"refresh_token": "r", "all": true}),
+        );
+        round_trip(
+            &LogoutRequest {
+                refresh_token: None,
+                all: true,
+                identities_linked_after: Some(7),
+            },
+            &json!({"all": true, "identities_linked_after": 7}),
         );
     }
 
@@ -920,7 +982,8 @@ mod tests {
                 "{:?}",
                 LogoutRequest {
                     refresh_token: Some(S.into()),
-                    all: true
+                    all: true,
+                    identities_linked_after: None,
                 }
             ),
             format!(

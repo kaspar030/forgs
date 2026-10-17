@@ -1434,7 +1434,8 @@ async fn email_match_does_not_auto_link() {
         .unwrap()
         .is_none());
 
-    // Link from bob's authenticated session (CSRF-checked).
+    // Link from bob's authenticated session (CSRF-checked), after step-up
+    // through the provider he already has (stub, code "b").
     let mut bob = bob;
     h.post_form("/auth/identities/link/stub2", &bob, &[])
         .await
@@ -1448,19 +1449,49 @@ async fn email_match_does_not_auto_link() {
         .await;
     start.expect(StatusCode::SEE_OTHER);
     bob.absorb(&start);
+    // The first leg goes to the *already linked* provider.
+    assert!(query_param(&start.location(), "redirect_uri").ends_with("/auth/stub/callback"));
     let state = query_param(&start.location(), "state");
-    // The link intent is bound to bob's session: without it, refused.
+    // The intent is bound to bob's session: without it, refused.
     let mut stranger = Jar::default();
     stranger
         .0
         .insert("__Host-frg_oauth".into(), bob.get("__Host-frg_oauth"));
     h.get(
-        &format!("/auth/stub2/callback?code=z&state={state}"),
+        &format!("/auth/stub/callback?code=b&state={state}"),
         Some(&stranger),
         &[],
     )
     .await
     .expect(StatusCode::BAD_REQUEST);
+    // A reauth-leg cookie cannot be used at the target provider directly.
+    h.get(
+        &format!("/auth/stub2/callback?code=z&state={state}"),
+        Some(&bob),
+        &[],
+    )
+    .await
+    .expect(StatusCode::BAD_REQUEST);
+    let reauth = h
+        .get(
+            &format!("/auth/stub/callback?code=b&state={state}"),
+            Some(&bob),
+            &[],
+        )
+        .await;
+    reauth.expect(StatusCode::FOUND);
+    assert!(h.audit.has("identity.link.reauth"));
+    assert!(query_param(&reauth.location(), "redirect_uri").ends_with("/auth/stub2/callback"));
+    assert_eq!(
+        reauth
+            .set_cookies()
+            .iter()
+            .filter(|c| c.starts_with("__Host-frg_oauth="))
+            .count(),
+        1
+    );
+    bob.absorb(&reauth);
+    let state = query_param(&reauth.location(), "state");
     let cb = h
         .get(
             &format!("/auth/stub2/callback?code=z&state={state}"),
@@ -1476,6 +1507,292 @@ async fn email_match_does_not_auto_link() {
     let cb = h.browser_login(&mut jar3, "stub2", "z").await;
     assert_eq!(cb.location(), "/");
     assert_eq!(h.whoami(&H::session(&jar3)).await.json()["username"], "bob");
+}
+
+impl H {
+    async fn user_id(&self, username: &str) -> forgs::UserId {
+        self.ctx
+            .store()
+            .user_by_username(username)
+            .await
+            .unwrap()
+            .unwrap()
+            .id
+    }
+
+    /// Start linking `target` from `jar`'s session; returns the 303.
+    async fn link_start(&self, jar: &mut Jar, target: &str) -> Resp {
+        let r = self
+            .post_form(
+                &format!("/auth/identities/link/{target}"),
+                jar,
+                &[("csrf", &jar.get("__Host-frg_csrf"))],
+            )
+            .await;
+        jar.absorb(&r);
+        r
+    }
+
+    /// The full two-leg link: reauth via `reauth`/`reauth_code`, then link
+    /// `target`/`code`. Returns the final callback.
+    async fn link(
+        &self,
+        jar: &mut Jar,
+        reauth: &str,
+        reauth_code: &str,
+        target: &str,
+        code: &str,
+    ) -> Resp {
+        let start = self.link_start(jar, target).await;
+        start.expect(StatusCode::SEE_OTHER);
+        let state = query_param(&start.location(), "state");
+        let r = self
+            .get(
+                &format!("/auth/{reauth}/callback?code={reauth_code}&state={state}"),
+                Some(jar),
+                &[],
+            )
+            .await;
+        r.expect(StatusCode::FOUND);
+        jar.absorb(&r);
+        let state = query_param(&r.location(), "state");
+        let cb = self
+            .get(
+                &format!("/auth/{target}/callback?code={code}&state={state}"),
+                Some(jar),
+                &[],
+            )
+            .await;
+        jar.absorb(&cb);
+        cb
+    }
+}
+
+#[tokio::test]
+async fn link_start_refuses_a_bearer_and_a_user_without_identities() {
+    let h = harness().await;
+    let bob = h.signup("b", "2", "bob@x.example", "bob").await;
+    let r = h
+        .post_form_with(
+            "/auth/identities/link/stub2",
+            &Jar::default(),
+            &[("authorization", &format!("Bearer {}", H::session(&bob)))],
+            &[],
+        )
+        .await;
+    r.expect(StatusCode::FORBIDDEN);
+    assert!(r
+        .set_cookies()
+        .iter()
+        .all(|c| !c.starts_with("__Host-frg_oauth=")));
+    assert!(h.audit.has("identity.link.refused"));
+
+    // A local user (no identity) cannot step up, so cannot link.
+    let (local, _) = h
+        .ctx
+        .store()
+        .create_local_user("root", None, NOW)
+        .await
+        .unwrap();
+    let s = forgs_http::session::mint_session(&h.ctx, local, "test")
+        .await
+        .unwrap();
+    let mut jar = Jar::default();
+    jar.0.insert("__Host-frg_session".into(), s.token.clone());
+    jar.0.insert(
+        "__Host-frg_csrf".into(),
+        forgs_http::cookies::csrf_token(
+            &h.ctx,
+            h.ctx.format().parse(&s.token).unwrap().hash().as_str(),
+        ),
+    );
+    let r = h.link_start(&mut jar, "stub2").await;
+    assert_eq!(r.error(), "reauth_required");
+}
+
+#[tokio::test]
+async fn reauth_with_someone_elses_identity_links_nothing() {
+    let h = harness().await;
+    let mut bob = h.signup("b", "2", "bob@x.example", "bob").await;
+    h.signup("a", "1", "a@x.example", "alice").await;
+    h.idp2.add("z", "900", "z@x.example", None);
+    let start = h.link_start(&mut bob, "stub2").await;
+    start.expect(StatusCode::SEE_OTHER);
+    let state = query_param(&start.location(), "state");
+    // The IdP hands back alice's identity (code "a"), not bob's.
+    let r = h
+        .get(
+            &format!("/auth/stub/callback?code=a&state={state}"),
+            Some(&bob),
+            &[],
+        )
+        .await;
+    r.expect(StatusCode::FORBIDDEN);
+    assert!(r.text().contains("confirm it"));
+    assert!(h.audit.has("identity.link.reauth_failed"));
+    // And an identity unknown to everyone is refused the same way.
+    h.idp.add("n", "777", "n@x.example", None);
+    let start = h.link_start(&mut bob, "stub2").await;
+    let state = query_param(&start.location(), "state");
+    h.get(
+        &format!("/auth/stub/callback?code=n&state={state}"),
+        Some(&bob),
+        &[],
+    )
+    .await
+    .expect(StatusCode::FORBIDDEN);
+    let bob_id = h.user_id("bob").await;
+    assert_eq!(
+        h.ctx
+            .store()
+            .identities_for_user(bob_id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn identities_are_listed_and_unlinked_but_never_the_last() {
+    let h = harness().await;
+    let mut bob = h.signup("b", "2", "bob@x.example", "bob").await;
+    let alice = h.signup("a", "1", "a@x.example", "alice").await;
+    h.idp2.add("z", "900", "z@x.example", None);
+    h.clock.advance(10);
+    h.link(&mut bob, "stub", "b", "stub2", "z")
+        .await
+        .expect(StatusCode::FOUND);
+
+    // Listed via cookie and via bearer.
+    let by_cookie = h.get("/auth/identities", Some(&bob), &[]).await;
+    by_cookie.expect(StatusCode::OK);
+    let list = h
+        .get(
+            "/auth/identities",
+            None,
+            &[("authorization", &format!("Bearer {}", H::session(&bob)))],
+        )
+        .await
+        .json();
+    assert_eq!(by_cookie.json(), list);
+    let ids = list["identities"].as_array().unwrap();
+    assert_eq!(ids.len(), 2);
+    assert_eq!(ids[0]["provider"], "stub");
+    assert_eq!(ids[1]["provider"], "stub2");
+    assert_eq!(ids[1]["subject"], "900");
+    let stub_id = ids[0]["id"].as_str().unwrap().to_owned();
+    let stub2_id = ids[1]["id"].as_str().unwrap().to_owned();
+
+    // A cookie unlink without CSRF is refused.
+    h.post_json(
+        "/auth/identities/unlink",
+        None,
+        Some(&bob),
+        &[],
+        &json!({"id": stub2_id}),
+    )
+    .await
+    .expect(StatusCode::FORBIDDEN);
+    // Someone else's id, or garbage: 404 alike.
+    let alice_ids = h
+        .get(
+            "/auth/identities",
+            None,
+            &[("authorization", &format!("Bearer {}", H::session(&alice)))],
+        )
+        .await
+        .json();
+    let alice_id = alice_ids["identities"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for id in [alice_id.as_str(), "nope"] {
+        let r = h
+            .post_json(
+                "/auth/identities/unlink",
+                Some(&H::session(&bob)),
+                None,
+                &[],
+                &json!({ "id": id }),
+            )
+            .await;
+        r.expect(StatusCode::NOT_FOUND);
+    }
+    let csrf = bob.get("__Host-frg_csrf");
+    h.post_json(
+        "/auth/identities/unlink",
+        None,
+        Some(&bob),
+        &[("x-frg-csrf", &csrf)],
+        &json!({ "id": stub2_id }),
+    )
+    .await
+    .expect(StatusCode::NO_CONTENT);
+    assert!(h.audit.has("identity.unlink"));
+    // The last one stays.
+    let r = h
+        .post_json(
+            "/auth/identities/unlink",
+            Some(&H::session(&bob)),
+            None,
+            &[],
+            &json!({ "id": stub_id }),
+        )
+        .await;
+    r.expect(StatusCode::CONFLICT);
+    assert_eq!(r.error(), "last_identity");
+    // stub2 no longer logs bob in.
+    let mut jar = Jar::default();
+    let cb = h.browser_login(&mut jar, "stub2", "z").await;
+    assert_eq!(cb.location(), "/auth/signup");
+}
+
+#[tokio::test]
+async fn logout_all_can_unlink_late_identities() {
+    let h = harness().await;
+    let mut bob = h.signup("b", "2", "bob@x.example", "bob").await;
+    h.idp2.add("z", "900", "z@x.example", None);
+    h.clock.advance(100);
+    h.link(&mut bob, "stub", "b", "stub2", "z")
+        .await
+        .expect(StatusCode::FOUND);
+    let token = H::session(&bob);
+    h.post_json(
+        "/auth/logout",
+        Some(&token),
+        None,
+        &[],
+        &json!({"all": true, "identities_linked_after": NOW + 50}),
+    )
+    .await
+    .expect(StatusCode::NO_CONTENT);
+    h.whoami(&token).await.expect(StatusCode::UNAUTHORIZED);
+    let bob_id = h.user_id("bob").await;
+    let left = h.ctx.store().identities_for_user(bob_id).await.unwrap();
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].provider, "stub");
+    // Even a cut-off before everything keeps the oldest.
+    let mut jar = Jar::default();
+    h.browser_login(&mut jar, "stub", "b").await;
+    h.post_json(
+        "/auth/logout",
+        Some(&H::session(&jar)),
+        None,
+        &[],
+        &json!({"all": true, "identities_linked_after": 0}),
+    )
+    .await
+    .expect(StatusCode::NO_CONTENT);
+    assert_eq!(
+        h.ctx
+            .store()
+            .identities_for_user(bob_id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 #[tokio::test]

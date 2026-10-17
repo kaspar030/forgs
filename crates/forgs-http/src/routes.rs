@@ -15,7 +15,9 @@
 //! | `POST /auth/device/start`, `/poll` | body | the CLI's device flow |
 //! | `GET`/`POST /auth/device` | cookie + CSRF | the browser verification page |
 //! | `POST /auth/keys` | **header** | API keys |
-//! | `POST /auth/identities/link/{provider}` | cookie + CSRF | add a login method |
+//! | `POST /auth/identities/link/{provider}` | cookie + CSRF only (no bearer) | add a login method, after step-up re-auth |
+//! | `GET /auth/identities` | header or cookie | the caller's login methods |
+//! | `POST /auth/identities/unlink` | header, or cookie + CSRF | remove one (never the last) |
 //! | `POST /auth/members`, `/auth/rename` | **header** | membership, renames |
 //!
 //! The JSON surface the CLI uses (`/auth/token`, `/auth/keys`,
@@ -33,7 +35,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use forgs::api::{
     ApiKeyRequest, DevicePollRequest, DeviceStartRequest, LogoutRequest, MembersRequest,
-    RenameRequest, SessionInfo, SignupRequest, TokenRequest,
+    RenameRequest, SessionInfo, SignupRequest, TokenRequest, UnlinkIdentityRequest,
 };
 use forgs::TokenKind;
 use serde::de::DeserializeOwned;
@@ -48,8 +50,8 @@ use crate::cookies::{
     session_cookies, set_cookie, with_cookies,
 };
 use crate::error::{reject, ApiError};
-use crate::login::{safe_return_to, LoginOutcome};
-use crate::{device, html, keys, login, members, session, signup, workload};
+use crate::login::{safe_return_to, FlowIntent, LoginOutcome};
+use crate::{device, html, identities, keys, login, members, session, signup, workload};
 
 /// The auth routes, to be merged or nested into the app's router. Tell the
 /// context where it is nested with [`crate::AuthContextBuilder::mount`].
@@ -70,6 +72,8 @@ where
         .route("/auth/device/poll", post(device_poll))
         .route("/auth/device", get(device_page).post(device_submit))
         .route("/auth/keys", post(api_keys))
+        .route("/auth/identities", get(identities_list))
+        .route("/auth/identities/unlink", post(identities_unlink))
         .route("/auth/identities/link/{provider}", post(link_start))
         .route("/auth/members", post(members_route))
         .route("/auth/rename", post(rename))
@@ -213,6 +217,10 @@ fn error_page(e: &ApiError) -> Response {
         e if *e == ApiError::IDENTITY_TAKEN => "That login is already linked to an account.",
         e if *e == ApiError::UNKNOWN_PROVIDER => "Unknown login provider.",
         e if *e == ApiError::UPSTREAM => "The login provider could not complete the login.",
+        e if *e == ApiError::REAUTH_REQUIRED => {
+            "To add a login method, confirm it's you by logging in with a method already linked \
+             to this account."
+        }
         _ => "Something went wrong. Please try again.",
     };
     html::message(e.status(), "Login failed", text)
@@ -264,7 +272,7 @@ async fn login_start(
         &ctx,
         &provider,
         q.get("return_to").map(String::as_str),
-        None,
+        &FlowIntent::Login,
     ) {
         Ok(started) => redirect(
             &started.authorize_url,
@@ -298,7 +306,12 @@ async fn login_callback(
         q.get("code").map_or("", String::as_str),
         q.get("state").map_or("", String::as_str),
         cookie_value(&headers, &ctx.cookies().oauth),
-        previous.as_ref().and_then(Caller::user_id),
+        // Only the browser's own session cookie counts as "logged in here": a
+        // bearer header never continues a reauth or link leg.
+        previous
+            .as_ref()
+            .filter(|c| c.arrival == Arrival::Cookie)
+            .and_then(Caller::user_id),
     )
     .await;
     match outcome {
@@ -331,12 +344,28 @@ async fn login_callback(
         Ok(LoginOutcome::Linked { return_to, .. }) => {
             redirect(&landing(&ctx, return_to.as_deref()), &[spent], false)
         }
+        // Step-up done: on to the provider being linked. The new flow cookie
+        // replaces the spent one (one Set-Cookie per name, never both).
+        Ok(LoginOutcome::Reauthenticated { started }) => redirect(
+            &started.authorize_url,
+            &[set_cookie(
+                &ctx.cookies().oauth,
+                &started.cookie,
+                ctx.ttl().login_flow,
+                true,
+            )],
+            false,
+        ),
         Err(e) => with_cookies(error_page(&e), &[spent]),
     }
 }
 
-/// `POST /auth/identities/link/{provider}` — "add a login method", only
-/// from an authenticated session (CSRF-checked).
+/// `POST /auth/identities/link/{provider}` — "add a login method": only from
+/// an authenticated **browser** session (cookie + CSRF; a bearer token is
+/// refused), and only after step-up re-authentication with an identity
+/// already linked to the user (see [`crate::login`]). The form field `via`
+/// may name which linked provider to re-authenticate with; by default it is
+/// the one used most recently.
 async fn link_start(
     State(ctx): State<AuthContext>,
     Path(provider): Path<String>,
@@ -348,14 +377,47 @@ async fn link_start(
         Ok(c) => c,
         Err(r) => return r,
     };
+    if caller.arrival != Arrival::Cookie {
+        ctx.audit()
+            .record(
+                crate::audit::AuditEvent::new(ctx.now(), "identity.link.refused")
+                    .subject(&caller.auth.subject)
+                    .target(provider.clone())
+                    .detail("bearer"),
+            )
+            .await;
+        return ApiError::Forbidden.into_response();
+    }
     let Some(user) = caller.user_id() else {
         return ApiError::Forbidden.into_response();
     };
+    if ctx.provider(&provider).is_none() {
+        return ApiError::UNKNOWN_PROVIDER.into_response();
+    }
+    let linked = match ctx.store().identities_for_user(user).await {
+        Ok(l) => l,
+        Err(e) => return crate::error::store_err("identities_for_user")(e).into_response(),
+    };
+    let usable = |p: &str| linked.iter().any(|i| i.provider == p) && ctx.provider(p).is_some();
+    let via = match form.get("via").map(String::as_str) {
+        Some(v) if usable(v) => Some(v.to_owned()),
+        _ => linked
+            .iter()
+            .filter(|i| ctx.provider(&i.provider).is_some())
+            .max_by_key(|i| (i.last_login_at.unwrap_or(i.linked_at), i.linked_at))
+            .map(|i| i.provider.clone()),
+    };
+    let Some(via) = via else {
+        return ApiError::REAUTH_REQUIRED.into_response();
+    };
     match login::start_login(
         &ctx,
-        &provider,
+        &via,
         form.get("return_to").map(String::as_str),
-        Some(user),
+        &FlowIntent::Reauth {
+            user,
+            link_provider: provider,
+        },
     ) {
         Ok(started) => redirect(
             &started.authorize_url,
@@ -367,6 +429,29 @@ async fn link_start(
             )],
             true,
         ),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// `GET /auth/identities` — the caller's linked login methods.
+async fn identities_list(
+    State(ctx): State<AuthContext>,
+    auth: Authenticated<SessionOnly, CookieOk>,
+) -> Response {
+    match identities::list(&ctx, &auth).await {
+        Ok(l) => Json(l).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// `POST /auth/identities/unlink` — remove one (CSRF-checked for a cookie).
+async fn identities_unlink(
+    State(ctx): State<AuthContext>,
+    auth: Authenticated<SessionOnly, CookieOk>,
+    JsonBody(req): JsonBody<UnlinkIdentityRequest>,
+) -> Response {
+    match identities::unlink(&ctx, &auth, &req).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => e.into_response(),
     }
 }

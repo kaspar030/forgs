@@ -25,6 +25,48 @@ pub struct NewIdentity {
     pub email_verified: bool,
 }
 
+/// A linked external identity, as stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Identity {
+    /// Immutable id (what unlinking names).
+    pub id: IdentityId,
+    /// The configured provider instance name.
+    pub provider: String,
+    /// The provider's immutable subject id.
+    pub subject: String,
+    /// The email the provider last asserted, if any.
+    pub email: Option<String>,
+    /// Whether that email was asserted as verified.
+    pub email_verified: bool,
+    /// When it was linked, epoch seconds.
+    pub linked_at: u64,
+    /// The last login through it, epoch seconds.
+    pub last_login_at: Option<u64>,
+}
+
+type IdentityRow = (
+    String,
+    String,
+    String,
+    Option<String>,
+    bool,
+    i64,
+    Option<i64>,
+);
+
+fn identity_from_row(r: IdentityRow) -> Result<Identity> {
+    let (id, provider, subject, email, email_verified, linked_at, last_login_at) = r;
+    Ok(Identity {
+        id: parse_id!(IdentityId, id)?,
+        provider,
+        subject,
+        email,
+        email_verified,
+        linked_at: from_ts(linked_at),
+        last_login_at: last_login_at.map(from_ts),
+    })
+}
+
 /// A signup: the chosen username and the identity it links.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewSignup {
@@ -454,6 +496,85 @@ impl Store {
         let id = insert_identity(&mut tx, &user.to_string(), identity, now).await?;
         tx.commit().await?;
         Ok(id)
+    }
+
+    /// The identities linked to `user`, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// A database error, or [`StoreError::CorruptRow`].
+    pub async fn identities_for_user(&self, user: UserId) -> Result<Vec<Identity>> {
+        let rows: Vec<IdentityRow> = sqlx::query_as(
+            "SELECT id, provider, provider_subject, email, email_verified, linked_at, last_login_at
+               FROM forgs_identity WHERE user_id = ?1 ORDER BY linked_at, id",
+        )
+        .bind(user.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(identity_from_row).collect()
+    }
+
+    /// Unlink one of `user`'s identities, in one (immediate) transaction.
+    ///
+    /// Never removes the user's **last** identity: that would leave an
+    /// account nobody can log in to. The user's recorded email addresses
+    /// (`forgs_user_email`) are left as they are.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `id` is not an identity of `user` (another
+    /// user's id is indistinguishable from an unknown one),
+    /// [`StoreError::LastIdentity`], or a database error.
+    pub async fn unlink_identity(&self, user: UserId, id: IdentityId) -> Result<()> {
+        let user_s = user.to_string();
+        let mut tx = self.begin().await?;
+        let (mine, total): (bool, i64) = sqlx::query_as(
+            "SELECT EXISTS (SELECT 1 FROM forgs_identity WHERE id = ?2 AND user_id = ?1),
+                    (SELECT COUNT(*) FROM forgs_identity WHERE user_id = ?1)",
+        )
+        .bind(&user_s)
+        .bind(id.to_string())
+        .fetch_one(&mut *tx)
+        .await?;
+        if !mine {
+            return Err(StoreError::NotFound);
+        }
+        if total <= 1 {
+            return Err(StoreError::LastIdentity);
+        }
+        sqlx::query("DELETE FROM forgs_identity WHERE id = ?2 AND user_id = ?1")
+            .bind(&user_s)
+            .bind(id.to_string())
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Unlink every identity of `user` linked strictly after `after` (epoch
+    /// seconds) — the `logout --all` answer to "someone linked a login method
+    /// to my account". The user's oldest identity is always kept, so this
+    /// never leaves the account without a login method. Returns how many
+    /// were removed.
+    ///
+    /// # Errors
+    ///
+    /// A database error, or [`StoreError::TimeOverflow`].
+    pub async fn unlink_identities_linked_after(&self, user: UserId, after: u64) -> Result<u64> {
+        let mut tx = self.begin().await?;
+        let n = sqlx::query(
+            "DELETE FROM forgs_identity
+              WHERE user_id = ?1 AND linked_at > ?2
+                AND id <> (SELECT id FROM forgs_identity WHERE user_id = ?1
+                            ORDER BY linked_at, id LIMIT 1)",
+        )
+        .bind(user.to_string())
+        .bind(ts(after)?)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+        Ok(n)
     }
 
     /// A user by id.

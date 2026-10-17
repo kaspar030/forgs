@@ -78,7 +78,7 @@ pub use ns::{Membership, NsNode};
 pub use pending::{ApprovedDevice, PendingDevice, PendingSignup};
 pub use scoped::{ApiKeyRow, AuditEntry, AuditRow, MemberRow, NewApiKey, NewGrant, NsScope};
 pub use sweep::SweepCounts;
-pub use users::{NewIdentity, NewSignup, User, UserState};
+pub use users::{Identity, NewIdentity, NewSignup, User, UserState};
 
 /// Connect options for a forgs database at `url` (`sqlite://path`,
 /// `sqlite::memory:`): foreign keys **on**, and the file created if missing.

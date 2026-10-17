@@ -26,7 +26,8 @@
 //!   That allowlist is the blast radius of the cookie design.
 //! * [`Carrier::Cookie`] — header or cookie, for forgs' own explicitly marked
 //!   browser routes (the device-verification form, session logout, link
-//!   start, whoami).
+//!   start, identity list/unlink, whoami). Link start additionally refuses
+//!   a header arrival: adding a login method is a browser-only act.
 //!
 //! The header wins when both are present: an explicit credential is a
 //! deliberate act, a cookie is attached by the browser, so a page that opts

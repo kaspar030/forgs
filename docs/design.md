@@ -299,11 +299,21 @@ IdP callback  →  identity known?
 ```
 
 - **Account linking**: a second provider, or a second GitHub account, is linked
-  only from an *authenticated* session (`POST /auth/identities/link/{provider}`,
-  "add login method"). If a new identity arrives whose verified email matches
+  only from an *authenticated browser* session (`POST
+  /auth/identities/link/{provider}`, "add login method"; cookie + CSRF, a
+  bearer token is refused), and only after **step-up**: the browser first
+  logs in again with a provider already linked to the account, and only an
+  identity that belongs to the logged-in user lets the flow continue to the
+  target provider. A stolen session, refresh or CLI token is therefore not
+  enough to plant a permanent login method. A user with no linked identity
+  cannot link. If a new identity arrives whose verified email matches
   an existing user, forgs does **not** auto-link. It tells the user to log in
   with their existing method and link from there. Auto-linking on email turns
   "attacker controls a provider that asserts your email" into account takeover.
+  Linked identities are listed with `GET /auth/identities` and removed with
+  `POST /auth/identities/unlink` (never the last one: `409 last_identity`).
+  `POST /auth/logout {all, identities_linked_after}` also unlinks every
+  identity linked after that time, always keeping the oldest.
 
 ### CLI login is forgs' own device flow
 
@@ -337,7 +347,8 @@ forgs-idp        IdentityProvider and WorkloadIssuer traits, ExternalIdentity.
                  `client`, OidcProvider, JwksCache and GithubActionsIssuer.
 forgs-http       axum: /auth/* routes (providers, login, {provider}/start +
                  callback, signup, token, logout, session + session/logout,
-                 device start/poll + page, keys, identities/link, members,
+                 device start/poll + page, keys, identities (list, unlink,
+                 link with step-up), members,
                  rename), Authenticated extractor with per-route allowed
                  kinds, AuthContext, cookies + CSRF, app hooks, audit.
 forgs-client     HTTP client for device login/refresh/logout/keys/workload

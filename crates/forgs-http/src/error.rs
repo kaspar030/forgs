@@ -121,6 +121,11 @@ impl ApiError {
     /// `403 no_verified_email`.
     pub const NO_VERIFIED_EMAIL: ApiError =
         ApiError::Code(StatusCode::FORBIDDEN, code::NO_VERIFIED_EMAIL);
+    /// `409 last_identity`.
+    pub const LAST_IDENTITY: ApiError = ApiError::Code(StatusCode::CONFLICT, code::LAST_IDENTITY);
+    /// `403 reauth_required`.
+    pub const REAUTH_REQUIRED: ApiError =
+        ApiError::Code(StatusCode::FORBIDDEN, code::REAUTH_REQUIRED);
     /// `503 temporarily_unavailable`.
     pub const UNAVAILABLE: ApiError = ApiError::Code(
         StatusCode::SERVICE_UNAVAILABLE,
@@ -148,6 +153,7 @@ impl From<StoreError> for ApiError {
             StoreError::BadRole | StoreError::BadPrefix => ApiError::BadRequest,
             StoreError::PersonalNode | StoreError::HasChildren => ApiError::CONFLICT,
             StoreError::OwnedLimit => ApiError::NAMESPACE_LIMIT,
+            StoreError::LastIdentity => ApiError::LAST_IDENTITY,
             other => {
                 tracing::warn!(error = %other, "store operation failed");
                 ApiError::Internal
@@ -204,6 +210,13 @@ mod tests {
             ApiError::from(StoreError::OwnedLimit),
             ApiError::NAMESPACE_LIMIT
         );
+        assert_eq!(
+            ApiError::from(StoreError::LastIdentity),
+            ApiError::LAST_IDENTITY
+        );
+        assert_eq!(ApiError::LAST_IDENTITY.status(), StatusCode::CONFLICT);
+        assert_eq!(ApiError::REAUTH_REQUIRED.status(), StatusCode::FORBIDDEN);
+        assert_eq!(ApiError::REAUTH_REQUIRED.code(), "reauth_required");
         assert_eq!(ApiError::NAMESPACE_LIMIT.status(), StatusCode::FORBIDDEN);
         assert_eq!(ApiError::NOT_EMPTY.status(), StatusCode::CONFLICT);
         assert_eq!(ApiError::Internal.code(), "server_error");

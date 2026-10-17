@@ -7,7 +7,8 @@
 //! identity providers, workload issuers, an [`AuditSink`] and its hooks) and
 //! merges [`router`] into its own axum `Router`. Every route is a thin
 //! adapter over a framework-agnostic service function ([`session`],
-//! [`login`], [`signup`], [`device`], [`keys`], [`workload`], [`members`]),
+//! [`login`], [`signup`], [`device`], [`keys`], [`workload`], [`members`],
+//! [`identities`]),
 //! so an app can drive the same logic from elsewhere.
 //!
 //! # Threat model, in brief
@@ -25,7 +26,9 @@
 //! * **`redirect_uri` from `public_url` only**, never `Host`.
 //! * **No auto-linking on email.** An unknown identity always goes through
 //!   signup; a second login method is linked only from an authenticated
-//!   session.
+//!   browser session (cookie + CSRF, never a bearer token), and only after
+//!   step-up: a fresh login with a method already linked to the account.
+//!   Identities can be listed and unlinked (never the last one).
 //! * **Server-rendered pages** carry a strict CSP and escape every value
 //!   ([`html`]).
 
@@ -39,6 +42,7 @@ pub mod device;
 pub mod error;
 pub mod hooks;
 pub mod html;
+pub mod identities;
 pub mod keys;
 pub mod login;
 pub mod members;

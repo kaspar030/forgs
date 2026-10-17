@@ -526,6 +526,7 @@ impl ForgsClient {
         let mut request = LogoutRequest {
             refresh_token: refresh_token.map(ToOwned::to_owned),
             all,
+            identities_linked_after: None,
         };
         let result = self
             .post("/auth/logout", Some(&Secret::from(session_token)), &request)
