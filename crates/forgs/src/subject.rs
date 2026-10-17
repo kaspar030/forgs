@@ -9,8 +9,9 @@
 //! A [`SubjectKey`] renders as `[<ns>/]<kind>:<id>`:
 //!
 //! * `user:01J…` — a user, by immutable [`UserId`];
-//! * `gha/workload:owner/repo` — a GitHub Actions workload. The `gha`
-//!   namespace slot is reserved, not a namespace node;
+//! * `gha/workload:id:<owner_id>/<repo_id>` — a GitHub Actions workload,
+//!   keyed on GitHub's immutable numeric ids. The `gha` namespace slot is a
+//!   per-issuer label, not a namespace node;
 //! * `01J…/workload:agent:builder` — a named API-key identity, scoped by the
 //!   id of the namespace node that minted it.
 //!
@@ -257,47 +258,59 @@ impl fmt::Display for Subject {
     }
 }
 
-/// The reserved namespace a GitHub Actions workload subject lives in.
+/// The default issuer label (namespace slot) of a GitHub Actions workload
+/// subject: the one github.com tokens are keyed under.
 ///
-/// A workload token proves "a job in repo `owner/name`", and that fact is
+/// A workload token proves "a job in repo `<repository_id>`", and that fact is
 /// **namespace-independent**: the same repo may be granted access by several
 /// namespaces, and belongs to none of them. So the subject key is
-/// `gha/workload:<owner>/<repo>` — `gha` occupies the namespace slot, and there
-/// is no namespace node named `gha` that anything is scoped to.
+/// `<issuer label>/workload:id:<owner_id>/<repo_id>` — the label occupies the
+/// namespace slot, and there is no namespace node it is scoped to.
 ///
-/// Two properties make this safe rather than a collision waiting to happen:
+/// # Why an issuer label
 ///
-/// * namespace-scoped subject keys carry a node **id** (a ULID), which can
-///   never equal `gha`;
+/// Each configured workload issuer (github.com, a GHES instance, an enterprise
+/// custom issuer) has its **own** label ([`valid_workload_ns`]). The same ids
+/// minted by two different issuers are two different identities: GHES ids are
+/// a separate counter, so `id:1/2` on GHES is unrelated to `id:1/2` on
+/// github.com. Keying both under one label would let one issuer's repo inherit
+/// the other's grants.
+///
+/// # Why ids, not names
+///
+/// GitHub owner and repo names are reassignable: after a rename, transfer or
+/// deletion, anyone can register the freed name and mint tokens for it. A
+/// subject keyed on the name would silently hand the old repo's grants to the
+/// newcomer — the same reason user identities are keyed on immutable ids
+/// (docs/design.md §4). `repository_id` and `repository_owner_id` never get
+/// reused, so a recreated repo is a new subject and matches no grant, while a
+/// renamed one keeps its grants. The name is recorded for display and audit
+/// only.
+///
+/// Two properties keep the label slot from colliding with anything:
+///
+/// * namespace-scoped subject keys carry a node **id** (an uppercase ULID),
+///   which can never equal a label (lowercase only, see
+///   [`valid_workload_ns`]);
 /// * a grant is matched on the **whole rendered key**, so even a hypothetical
 ///   `gha/user:x` could not be reached by a workload token, which always
-///   renders `gha/workload:…`.
-///
-/// `repository_owner` is deliberately *not* part of the trust decision: a fork
-/// or a newly created repo under a granted owner produces a different id here
-/// and therefore matches no grant.
+///   renders `<label>/workload:id:…`.
 pub const WORKLOAD_NS_GHA: &str = "gha";
 
 /// Validate and normalise a GitHub `owner/name` repository string.
 ///
+/// The name is **display and audit only** — it is never part of a workload
+/// subject (see [`WORKLOAD_NS_GHA`] for why). It is still validated so a
+/// claim cannot write arbitrary text into audit rows, and lowercased so the
+/// same repo always reads the same.
+///
 /// Returns the **lowercased** repo, or `None` if it is not exactly one
 /// `owner/name` pair over a conservative charset (`[A-Za-z0-9._-]`).
 ///
-/// # Why lowercase, and why in one function
-///
 /// GitHub repository names are case-*preserving* but case-*insensitive*, so
-/// `Ariel-OS/ariel-os` and `ariel-os/ariel-os` are the same repo. A grant
-/// stores this id and a workload token's claim is matched against it by exact
-/// string equality, so a case difference between the two spellings would
-/// become a silent denial that looks like a server bug. Both sides call
-/// **this** function — grant creation on the way in and the OIDC claim on the
-/// way in — so they cannot disagree.
-///
-/// The charset is enforced because the result becomes a subject id that is
-/// rendered into `<ns>/<kind>:<id>`: a `/` or `:` in the wrong place would let
-/// a repo name impersonate another subject shape. One slash is allowed (the
-/// separator itself), and [`SubjectKey::parse`] splits at the *first* `/` and
-/// the *first* `:`, so the result round-trips.
+/// `Ariel-OS/ariel-os` and `ariel-os/ariel-os` are the same repo; lowercasing
+/// keeps one spelling in logs. The charset (`[A-Za-z0-9._-]`, one `/`) bounds
+/// what a token claim can write into an audit detail.
 #[must_use]
 pub fn normalise_repo(repo: &str) -> Option<String> {
     let repo = repo.trim();
@@ -325,18 +338,71 @@ pub fn normalise_repo(repo: &str) -> Option<String> {
     ))
 }
 
-/// The [`SubjectKey`] a GitHub Actions job in `repo` authenticates as.
+/// Longest accepted issuer label (see [`valid_workload_ns`]).
+pub const MAX_WORKLOAD_NS_LEN: usize = 32;
+
+/// Whether `label` is a valid workload issuer label (the namespace slot of a
+/// workload subject, e.g. [`WORKLOAD_NS_GHA`]).
 ///
-/// `repo` must already have passed [`normalise_repo`]. The single constructor,
-/// so the grant-creation path and the token-exchange path cannot produce two
-/// different spellings of the same identity.
+/// 1–[`MAX_WORKLOAD_NS_LEN`] characters over `[a-z0-9-]`, starting with
+/// `[a-z]`. Lowercase-only means a label can never equal a namespace-node id,
+/// which renders as an uppercase ULID, and excluding `/` and `:` keeps the
+/// rendered key round-tripping through [`SubjectKey::parse`].
 #[must_use]
-pub fn workload_subject_key(repo: &str) -> SubjectKey {
-    SubjectKey {
-        ns: Some(WORKLOAD_NS_GHA.to_owned()),
-        kind: SubjectKind::Workload,
-        id: repo.to_owned(),
+pub fn valid_workload_ns(label: &str) -> bool {
+    !label.is_empty()
+        && label.len() <= MAX_WORKLOAD_NS_LEN
+        && label.starts_with(|c: char| c.is_ascii_lowercase())
+        && label
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// Validate and canonicalise a GitHub numeric id (`repository_id`,
+/// `repository_owner_id`).
+///
+/// Returns the id unchanged, or `None` unless it is 1–20 ASCII digits with no
+/// leading zero that fits a `u64`. Strict on purpose: `"01"` and `"1"` must
+/// never be two spellings of one identity, and nothing is repaired (no
+/// trimming, no sign).
+#[must_use]
+pub fn normalise_github_id(s: &str) -> Option<String> {
+    if s.is_empty() || s.len() > 20 || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
     }
+    if s.len() > 1 && s.starts_with('0') {
+        return None;
+    }
+    if s == "0" {
+        return None;
+    }
+    s.parse::<u64>().ok().map(|n| n.to_string())
+}
+
+/// The [`SubjectKey`] a GitHub Actions job authenticates as:
+/// `<ns>/workload:id:<owner_id>/<repo_id>`.
+///
+/// `ns` is the issuer's label ([`valid_workload_ns`]; [`WORKLOAD_NS_GHA`] for
+/// github.com), and the ids are the token's `repository_owner_id` and
+/// `repository_id`. Returns `None` if the label or either id is invalid
+/// ([`normalise_github_id`]).
+///
+/// The **only** place the `id:` prefix is spelled, so the grant-creation path
+/// and the token-exchange path cannot produce two different spellings of the
+/// same identity. Repo **names** are deliberately not accepted: see
+/// [`WORKLOAD_NS_GHA`].
+#[must_use]
+pub fn workload_subject_key(ns: &str, owner_id: &str, repo_id: &str) -> Option<SubjectKey> {
+    if !valid_workload_ns(ns) {
+        return None;
+    }
+    let owner_id = normalise_github_id(owner_id)?;
+    let repo_id = normalise_github_id(repo_id)?;
+    Some(SubjectKey {
+        ns: Some(ns.to_owned()),
+        kind: SubjectKind::Workload,
+        id: format!("id:{owner_id}/{repo_id}"),
+    })
 }
 
 /// Length cap on a service (API-key identity) name.
@@ -365,7 +431,8 @@ pub const MAX_SERVICE_NAME_LEN: usize = 64;
 /// * **The charset.** The name is rendered into `<ns>/workload:agent:<name>`.
 ///   Excluding `:` makes it structurally impossible to spell another id form
 ///   (`key:<hash8>`) or introduce a second separator. Excluding `/` makes it
-///   impossible to be mistaken for a `gha/workload:owner/repo` repo subject.
+///   impossible to be mistaken for a `gha/workload:id:<owner>/<repo>` repo
+///   subject.
 /// * **The first character.** A leading `-` reads as a flag in every message,
 ///   shell recipe and CLI example that quotes the name, and a leading `.`
 ///   invites `.` or `..`, which look like paths.
@@ -398,8 +465,8 @@ pub fn normalise_service_name(name: &str) -> Option<String> {
 /// [`workload_subject_key`]'s doc gives: two spellings of one identity is the
 /// failure mode.
 ///
-/// Namespace-scoped, so it can never collide with a `gha/workload:owner/repo`
-/// repo subject, and — because the charset excludes `:` — never with another
+/// Namespace-scoped, so it can never collide with a
+/// `gha/workload:id:<owner>/<repo>` repo subject, and — because the charset excludes `:` — never with another
 /// id spelling either.
 #[must_use]
 pub fn agent_subject_key(ns: &NsNodeId, name: &str) -> SubjectKey {
@@ -492,18 +559,76 @@ mod tests {
     }
 
     /// The workload subject shape, and the property that makes it work: an id
-    /// containing a slash round-trips through `SubjectKey::parse`.
+    /// containing `:` and `/` round-trips through `SubjectKey::parse`.
     #[test]
     fn a_workload_subject_key_round_trips_through_parse() {
-        let key = workload_subject_key(&normalise_repo("ariel-os/ariel-os").unwrap());
-        assert_eq!(key.to_string(), "gha/workload:ariel-os/ariel-os");
+        let key = workload_subject_key(WORKLOAD_NS_GHA, "12345", "67890").unwrap();
+        assert_eq!(key.to_string(), "gha/workload:id:12345/67890");
         assert_eq!(SubjectKey::parse(&key.to_string()), Some(key.clone()));
         assert_eq!(key.ns(), Some(WORKLOAD_NS_GHA));
         assert_eq!(key.kind(), SubjectKind::Workload);
+        assert_eq!(key.id(), "id:12345/67890");
     }
 
-    /// Case-insensitivity is normalised on **both** sides (grant creation and
-    /// claim ingestion) by this one function.
+    /// Two issuers' labels give two subjects for the same ids.
+    #[test]
+    fn issuer_labels_namespace_workload_subjects() {
+        let a = workload_subject_key("gha", "1", "2").unwrap();
+        let b = workload_subject_key("ghes-corp", "1", "2").unwrap();
+        assert_ne!(a, b);
+        assert_eq!(b.to_string(), "ghes-corp/workload:id:1/2");
+        assert_eq!(SubjectKey::parse(&b.to_string()), Some(b));
+    }
+
+    #[test]
+    fn github_ids_are_validated_strictly() {
+        assert_eq!(normalise_github_id("1").as_deref(), Some("1"));
+        assert_eq!(
+            normalise_github_id("18446744073709551615").as_deref(),
+            Some("18446744073709551615")
+        );
+        for bad in [
+            "",
+            "0",
+            "01",
+            "-1",
+            "+1",
+            "1a",
+            " 1",
+            "1 ",
+            "18446744073709551616",
+            "123456789012345678901",
+            "1/2",
+        ] {
+            assert_eq!(normalise_github_id(bad), None, "{bad:?}");
+        }
+        assert!(workload_subject_key("gha", "01", "2").is_none());
+        assert!(workload_subject_key("gha", "1", "").is_none());
+    }
+
+    #[test]
+    fn workload_ns_labels_are_validated() {
+        for good in ["gha", "ghes-corp", "a", "g2"] {
+            assert!(valid_workload_ns(good), "{good:?}");
+        }
+        assert!(valid_workload_ns(&"a".repeat(MAX_WORKLOAD_NS_LEN)));
+        for bad in [
+            "",
+            "GHA",
+            "a/b",
+            "a:b",
+            "a b",
+            "-gha",
+            "1gha",
+            "01J0000000000000000000000A",
+        ] {
+            assert!(!valid_workload_ns(bad), "{bad:?}");
+            assert!(workload_subject_key(bad, "1", "2").is_none());
+        }
+        assert!(!valid_workload_ns(&"a".repeat(MAX_WORKLOAD_NS_LEN + 1)));
+    }
+
+    /// The display name is lowercased and validated.
     #[test]
     fn repo_normalisation_lowercases_and_validates() {
         assert_eq!(

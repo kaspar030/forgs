@@ -60,7 +60,9 @@ Properties that follow from the model:
 1. `IdentityProvider` (forgs-idp): auth-code + PKCE,
    `fetch_identity -> ExternalIdentity`. §4.
 2. `WorkloadIssuer` (forgs-idp): OIDC policy + claims → a workload subject.
-   `GithubActionsIssuer` implements it.
+   `GithubActionsIssuer` implements it. Each issuer has a configurable
+   `name()` and a `subject_ns()` label, both unique across the configured
+   issuers (`AuthContextBuilder::build` refuses duplicates).
 3. **Token kinds** (`TokenFormat`): forgs owns Session, Refresh, ApiKey,
    Workload and DeviceSecret. Apps register extra kinds with
    `TokenFormatBuilder::app_kind` (fleet: node, node-device), each with a tag
@@ -194,7 +196,22 @@ forgs_membership { ns_node_id, subject (SubjectKey), user_id NULL, role }
   to a namespace: the request names its target namespace, and authz checks
   membership there. `acting_in` is a claim to be checked, never a grant.
   `SubjectKey` renders as `<kind>:<id>`, and workload keys carry their
-  namespace prefix (`gha/workload:<owner>/<repo>`).
+  namespace prefix (`gha/workload:id:<owner_id>/<repo_id>`).
+- Workload identity (GitHub Actions OIDC) is keyed on the immutable
+  `repository_owner_id` and `repository_id` claims, never on the
+  `owner/repo` name, for the same reason as user identities (§4): names are
+  reassignable, and whoever registers a freed name must not inherit the old
+  repo's grants. A rename keeps the subject; a repo recreated under the same
+  name is a new subject. The name is recorded for display and audit only.
+  The namespace slot is a per-issuer label (`gha` for github.com, a distinct
+  one such as `ghes-corp` for a GHES or enterprise issuer), so two issuers
+  never share a subject. To grant a repo, resolve the typed `owner/repo` to
+  its ids with `forgs_idp::github::resolve_repo_ids` and build the subject
+  with `forgs::subject::workload_subject_key(ns, owner_id, repo_id)`.
+  **Breaking (2026-10):** the earlier name-keyed subjects
+  (`gha/workload:<owner>/<repo>`) no longer match any token. Existing grants
+  on them are inert and are not migrated; recreate them against the id-keyed
+  subject.
 - Tokens: prefix-typed opaque secrets, stored only as SHA-256 hashes, and
   redeem-only kinds are rejected by prefix before any DB access.
 - Lifetimes (`forgs_http::Ttls` defaults): sessions 12h; CLI refresh tokens

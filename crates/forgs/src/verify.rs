@@ -302,7 +302,7 @@ mod tests {
     use crate::ids::{ApiKeyId, NsNodeId, PendingId, UserId};
     use crate::store::fake::{BrokenStore, FakeStore, PanicStore};
     use crate::store::{AppRecord, SessionRecord, WorkloadRecord};
-    use crate::subject::{normalise_repo, workload_subject_key, SubjectKind};
+    use crate::subject::{workload_subject_key, SubjectKind};
     use crate::token::AppKind;
 
     fn fleet() -> (TokenFormat, AppKind, AppKind) {
@@ -350,7 +350,7 @@ mod tests {
     async fn workload_token_resolves_and_expires() {
         let f = TokenFormat::default();
         let token = f.mint(TokenKind::Workload);
-        let subject = workload_subject_key(&normalise_repo("ariel-os/ariel-os").unwrap());
+        let subject = workload_subject_key("gha", "1", "2").unwrap();
         let store = FakeStore::default().with_workload(
             &token.hash(),
             WorkloadRecord {

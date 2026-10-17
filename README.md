@@ -19,7 +19,7 @@ client that tie these together.
 |---|---|
 | `forgs` | ids, opaque tokens + verification, user codes, rotation policy, namespace schema, username policy, role ladders, `Subject`, authz evaluation, `/auth/*` wire types. **Pure: no IO, no clock.** |
 | `forgs-store` | sqlx/SQLite: `forgs_`-prefixed tables, forgs' own migrator (`forgs_schema_version`, never `_sqlx_migrations`), `Store`, and namespace-scoped `NsScope` handles. |
-| `forgs-idp` | `IdentityProvider` trait; GitHub (OAuth2), generic OIDC with Codeberg/Forgejo and GitLab presets, GitHub Actions workload issuer + runner-side token fetch. Features `client` (HTTPS egress) and `oidc` (JWT verification). |
+| `forgs-idp` | `IdentityProvider` trait; GitHub (OAuth2), generic OIDC with Codeberg/Forgejo and GitLab presets, GitHub Actions workload issuer (subjects keyed on immutable repo ids) + repo-id resolver + runner-side token fetch. Features `client` (HTTPS egress) and `oidc` (JWT verification). |
 | `forgs-http` | axum `/auth/*` routes (login/callback, signup, token, session/logout, device start/poll and approval page, keys, identity linking, members, rename, providers), the `Authenticated` extractor, `AuthContext`, cookies + CSRF, server-rendered pages, and app hooks (`AppTokenLookup`, `ApiKeyPurposes`, `PendingApprovalHook`). |
 | `forgs-client` | hyper + rustls/`ring` client for device login, refresh, logout, API keys and workload exchange; GitHub Actions token fetch; CLI helpers; TLS pinning. No server dependencies (enforced by `tests/no_http_server_dep.rs`). |
 

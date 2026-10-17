@@ -209,6 +209,16 @@ pub enum ConfigError {
     /// A provider name is unusable in a URL path, reserved, or duplicated.
     #[error("invalid or duplicate provider name {0:?}")]
     ProviderName(String),
+    /// A workload issuer name is invalid (same rule as provider names) or
+    /// duplicated.
+    #[error("invalid or duplicate workload issuer name {0:?}")]
+    WorkloadIssuerName(String),
+    /// A workload issuer's subject label fails
+    /// [`forgs::subject::valid_workload_ns`] or is shared with another issuer
+    /// — two issuers on one label would map their repos onto the same
+    /// subjects.
+    #[error("invalid or duplicate workload subject label {0:?}")]
+    WorkloadSubjectNs(String),
     /// The mount prefix must be empty or start with `/` and not end with one.
     #[error("invalid mount prefix {0:?}")]
     Mount(String),
@@ -547,7 +557,10 @@ impl AuthContextBuilder {
         self
     }
 
-    /// Add a workload issuer (e.g. GitHub Actions).
+    /// Add a workload issuer (e.g. GitHub Actions). Each issuer's
+    /// [`WorkloadIssuer::name`] and [`WorkloadIssuer::subject_ns`] must be
+    /// unique among the configured issuers; [`Self::build`] refuses
+    /// duplicates.
     #[must_use]
     pub fn workload_issuer(mut self, issuer: Arc<dyn WorkloadIssuer>) -> Self {
         self.workload_issuers.push(issuer);
@@ -603,7 +616,8 @@ impl AuthContextBuilder {
     /// # Errors
     ///
     /// [`ConfigError`] for an unusable public URL, a short secret, a bad
-    /// provider name, mount or path.
+    /// provider name, mount or path, or an invalid or duplicate workload
+    /// issuer name or subject label.
     pub fn build(self) -> Result<AuthContext, ConfigError> {
         let public_url = self.public_url.trim().trim_end_matches('/').to_owned();
         let public_origin = origin_of(&public_url)
@@ -629,17 +643,27 @@ impl AuthContextBuilder {
         let mut seen = Vec::new();
         for p in &self.providers {
             let name = p.name();
-            let ok = !name.is_empty()
-                && name.len() <= 64
-                && name.bytes().all(|b| {
-                    b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_'
-                })
+            let ok = valid_name(name)
                 && !RESERVED_PROVIDER_NAMES.contains(&name)
                 && !seen.contains(&name);
             if !ok {
                 return Err(ConfigError::ProviderName(name.to_owned()));
             }
             seen.push(name);
+        }
+        let mut names = Vec::new();
+        let mut labels = Vec::new();
+        for issuer in &self.workload_issuers {
+            let name = issuer.name();
+            if !valid_name(name) || names.contains(&name) {
+                return Err(ConfigError::WorkloadIssuerName(name.to_owned()));
+            }
+            names.push(name);
+            let ns = issuer.subject_ns();
+            if !forgs::subject::valid_workload_ns(ns) || labels.contains(&ns) {
+                return Err(ConfigError::WorkloadSubjectNs(ns.to_owned()));
+            }
+            labels.push(ns);
         }
         let brand = self
             .cookie_brand
@@ -746,6 +770,15 @@ fn origin_of(url: &str) -> Option<String> {
         return None;
     }
     Some(format!("{scheme}://{}", authority.to_ascii_lowercase()))
+}
+
+/// A provider or workload issuer name: 1–64 chars over `[a-z0-9_-]`.
+fn valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
 }
 
 #[cfg(test)]

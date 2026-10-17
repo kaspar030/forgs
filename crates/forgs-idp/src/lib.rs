@@ -7,7 +7,8 @@
 //! login is only a *suggestion* for the forgs username, and an identity
 //! without a verified email is refused.
 //!
-//! * [`github`] — GitHub (`OAuth2` only: `GET /user` + `GET /user/emails`).
+//! * [`github`] — GitHub (`OAuth2` only: `GET /user` + `GET /user/emails`),
+//!   plus the `owner/repo` → immutable-id resolver workload grants need.
 //! * [`oidc`] — generic `OpenID` Connect with Codeberg/Forgejo and GitLab
 //!   presets, plus the JWT/JWKS machinery.
 //! * [`workload`] — GitHub Actions workload identity (`WorkloadIssuer`).
@@ -51,7 +52,10 @@ pub use identity::{
 };
 
 #[cfg(feature = "client")]
+pub use github::resolve_repo_ids;
+#[cfg(feature = "client")]
 pub use github::GithubProvider;
+pub use github::GithubRepoIds;
 #[cfg(all(feature = "client", feature = "oidc"))]
 pub use oidc::OidcProvider;
 #[cfg(all(feature = "client", feature = "oidc"))]

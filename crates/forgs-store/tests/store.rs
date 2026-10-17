@@ -1094,7 +1094,7 @@ async fn token_store_lookups_round_trip() {
     );
 
     let wl = f.mint(TokenKind::Workload);
-    let subject = forgs::subject::workload_subject_key("probe-rs/probe-rs");
+    let subject = forgs::subject::workload_subject_key("gha", "1", "2").unwrap();
     s.insert_workload_token(
         &wl.hash(),
         &subject,
@@ -1634,7 +1634,7 @@ async fn sweep_removes_exactly_the_dead_rows() {
     s.insert_refresh_token(&hash(4), alice, NOW, t + 1)
         .await
         .unwrap();
-    let w = forgs::subject::workload_subject_key("a/b");
+    let w = forgs::subject::workload_subject_key("gha", "3", "4").unwrap();
     s.insert_workload_token(&hash(5), &w, "github_oidc", None, NOW, t)
         .await
         .unwrap(); // dead

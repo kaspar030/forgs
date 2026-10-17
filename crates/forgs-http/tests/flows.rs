@@ -17,8 +17,8 @@ use forgs::store::AppRecord;
 use forgs::{AppKind, RoleLadder, SubjectKey, TokenFormat, TokenHash, TokenKind, TokenUse};
 use forgs_http::{
     AllowedKinds, AnyConnection, ApiCookie, ApiError, ApiKeyPurposes, AppTokenLookup, AuditEvent,
-    AuditSink, AuthContext, Authenticated, FixedClock, HeaderOnly, KeyMint, PurposeKind,
-    SessionOnly, StaticPurposes,
+    AuditSink, AuthContext, Authenticated, ConfigError, FixedClock, HeaderOnly, KeyMint,
+    PurposeKind, SessionOnly, StaticPurposes,
 };
 use forgs_idp::oidc::OidcError;
 use forgs_idp::workload::{WorkloadClaims, WorkloadIdentity};
@@ -111,22 +111,47 @@ impl IdentityProvider for StubIdp {
     }
 }
 
-/// Accepts `good:<owner>/<repo>`.
-struct StubIssuer;
+/// Accepts `<prefix>:<owner_id>/<repo_id>/<owner>/<repo>` (prefix `good` for
+/// the default issuer), keyed under `ns`.
+struct StubIssuer {
+    name: &'static str,
+    ns: &'static str,
+    prefix: &'static str,
+}
+
+const STUB_ISSUER: StubIssuer = StubIssuer {
+    name: "github-actions",
+    ns: "gha",
+    prefix: "good",
+};
 
 #[async_trait]
 impl WorkloadIssuer for StubIssuer {
-    fn name(&self) -> &'static str {
-        "github-actions"
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn subject_ns(&self) -> &str {
+        self.ns
     }
     async fn verify(&self, jwt: &str, _now: u64) -> Result<WorkloadIdentity, OidcError> {
-        let repo = jwt.strip_prefix("good:").ok_or(OidcError::BadSignature)?;
-        let owner = repo.split('/').next().unwrap().to_owned();
+        let rest = jwt
+            .strip_prefix(self.prefix)
+            .and_then(|r| r.strip_prefix(':'))
+            .ok_or(OidcError::BadSignature)?;
+        let mut parts = rest.splitn(4, '/');
+        let (Some(oid), Some(rid), Some(owner), Some(name)) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return Err(OidcError::Malformed);
+        };
         Ok(WorkloadIdentity {
-            subject: forgs::subject::workload_subject_key(repo),
+            subject: forgs::subject::workload_subject_key(self.ns, oid, rid)
+                .ok_or(OidcError::Malformed)?,
             claims: WorkloadClaims {
-                repository: repo.to_owned(),
-                repository_owner: owner,
+                repository_id: rid.to_owned(),
+                repository_owner_id: oid.to_owned(),
+                repository: format!("{owner}/{name}"),
+                repository_owner: owner.to_owned(),
                 git_ref: None,
                 workflow: None,
                 job_workflow_ref: None,
@@ -361,7 +386,13 @@ async fn harness_at(issuer: bool, public_url: &str) -> H {
                 .with("node", PurposeKind::App),
         )));
     if issuer {
-        b = b.workload_issuer(Arc::new(StubIssuer));
+        b = b
+            .workload_issuer(Arc::new(STUB_ISSUER))
+            .workload_issuer(Arc::new(StubIssuer {
+                name: "ghes",
+                ns: "ghes-corp",
+                prefix: "ghes",
+            }));
     }
     let ctx = b.build().unwrap();
     let app = forgs_http::router::<AuthContext>()
@@ -1549,7 +1580,7 @@ async fn workload_exchange() {
         .is_some());
 
     // OIDC: no grant → flat 401; with a grant → a workload token.
-    let jwt = "good:octo/widgets";
+    let jwt = "good:1/2/octo/widgets";
     let r = token(json!({"grant_type": "github_oidc", "oidc_token": jwt})).await;
     r.expect(StatusCode::UNAUTHORIZED);
     assert_eq!(r.error(), "invalid_grant");
@@ -1569,7 +1600,7 @@ async fn workload_exchange() {
         .scoped(ns)
         .insert_grant(
             &NewGrant {
-                subject: forgs::subject::workload_subject_key("octo/widgets"),
+                subject: forgs::subject::workload_subject_key("gha", "1", "2").unwrap(),
                 selector: "*".into(),
                 ops: "read".into(),
                 expires: None,
@@ -1585,10 +1616,72 @@ async fn workload_exchange() {
     let me = h.whoami(r.json()["token"].as_str().unwrap()).await.json();
     assert_eq!(
         me["subject"],
-        SubjectKey::parse("gha/workload:octo/widgets")
+        SubjectKey::parse("gha/workload:id:1/2")
             .unwrap()
             .to_string()
     );
+    let mint = h
+        .audit
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|e| e.action == "workload.token.mint")
+        .cloned()
+        .unwrap();
+    let detail = mint.detail.unwrap();
+    assert!(detail.contains("repository_id=2"), "{detail}");
+    assert!(detail.contains("owner_id=1"), "{detail}");
+
+    // The same ids from another issuer are another subject: the grant to
+    // `gha/…` does not reach it.
+    let ghes = "ghes:1/2/octo/widgets";
+    token(json!({"grant_type": "github_oidc", "oidc_token": ghes}))
+        .await
+        .expect(StatusCode::UNAUTHORIZED);
+    // A repo recreated under the same name (new ids) is not the granted one.
+    token(json!({"grant_type": "github_oidc", "oidc_token": "good:1/3/octo/widgets"}))
+        .await
+        .expect(StatusCode::UNAUTHORIZED);
+    // A legacy name-keyed grant authorizes nothing.
+    h.ctx
+        .store()
+        .scoped(ns)
+        .insert_grant(
+            &NewGrant {
+                subject: SubjectKey::parse("gha/workload:octo/widgets").unwrap(),
+                selector: "*".into(),
+                ops: "read".into(),
+                expires: None,
+                created_by: None,
+            },
+            NOW,
+        )
+        .await
+        .unwrap();
+    token(json!({"grant_type": "github_oidc", "oidc_token": "good:1/3/octo/widgets"}))
+        .await
+        .expect(StatusCode::UNAUTHORIZED);
+    h.ctx
+        .store()
+        .scoped(ns)
+        .insert_grant(
+            &NewGrant {
+                subject: forgs::subject::workload_subject_key("ghes-corp", "1", "2").unwrap(),
+                selector: "*".into(),
+                ops: "read".into(),
+                expires: None,
+                created_by: None,
+            },
+            NOW,
+        )
+        .await
+        .unwrap();
+    let r = token(json!({"grant_type": "github_oidc", "oidc_token": ghes})).await;
+    r.expect(StatusCode::OK);
+    let me = h.whoami(r.json()["token"].as_str().unwrap()).await.json();
+    assert_eq!(me["subject"], "ghes-corp/workload:id:1/2");
 
     // Unconfigured server: 503.
     let h2 = harness_with(false).await;
@@ -1780,6 +1873,41 @@ async fn config_is_validated() {
         .provider(StubIdp::new("a"))
         .build()
         .is_err());
+    let issuer = |name: &'static str, ns: &'static str| -> Arc<dyn WorkloadIssuer> {
+        Arc::new(StubIssuer {
+            name,
+            ns,
+            prefix: "good",
+        })
+    };
+    for (a, b2) in [
+        // Duplicate name.
+        (("gh", "gha"), ("gh", "ghes")),
+        // Duplicate subject label.
+        (("gh", "gha"), ("ghes", "gha")),
+        // Invalid label / name.
+        (("gh", "gha"), ("ghes", "GHES")),
+        (("gh", "gha"), ("ghes", "a/b")),
+        (("gh", "gha"), ("Bad Name", "ghes")),
+    ] {
+        let err = b(PUBLIC, &[1; 32])
+            .workload_issuer(issuer(a.0, a.1))
+            .workload_issuer(issuer(b2.0, b2.1))
+            .build()
+            .err();
+        assert!(
+            matches!(
+                err,
+                Some(ConfigError::WorkloadIssuerName(_) | ConfigError::WorkloadSubjectNs(_))
+            ),
+            "{a:?} {b2:?}: {err:?}"
+        );
+    }
+    assert!(b(PUBLIC, &[1; 32])
+        .workload_issuer(issuer("gh", "gha"))
+        .workload_issuer(issuer("ghes", "ghes-corp"))
+        .build()
+        .is_ok());
     let ctx = b(PUBLIC, &[1; 32]).mount("/sso").build().unwrap();
     assert_eq!(
         ctx.redirect_uri("github"),

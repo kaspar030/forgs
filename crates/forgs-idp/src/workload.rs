@@ -10,20 +10,27 @@
 //!
 //! Verified: signature (JWKS key by mandatory `kid`), algorithm (exactly
 //! `[RS256]`), issuer and audience (exact), `exp`/`nbf` against an injected
-//! `now`, and that `repository` is exactly one `owner/name` pair over a
-//! conservative charset (via [`forgs::subject::normalise_repo`], the same
-//! function grant creation uses, so the two sides cannot disagree on case).
+//! `now`, and that `repository_id` and `repository_owner_id` are present,
+//! canonical numeric ids ([`forgs::subject::normalise_github_id`]).
 //!
-//! Recorded but **never authorizing**: `repository_owner`, `ref`, `workflow`,
-//! `job_workflow_ref`, `run_id`. In particular `repository_owner` is not
-//! sufficient — a fork, or a new repo under a granted owner, must not inherit
-//! access. Only the full `owner/repo` becomes the subject
+//! **Authorizing**: only the immutable ids. The subject is
+//! `<issuer label>/workload:id:<repository_owner_id>/<repository_id>`
 //! ([`forgs::subject::workload_subject_key`]), matched against an explicit
-//! grant by the caller.
+//! grant by the caller. Names are reassignable — after a rename, transfer or
+//! deletion anyone can register the freed `owner/repo` — so a name-keyed
+//! subject would hand the old repo's grants to whoever took the name. The
+//! issuer label ([`OidcPolicy::subject_ns`]) keeps two configured issuers
+//! (github.com and a GHES) from ever sharing a subject.
+//!
+//! Recorded but **never authorizing**: `repository` (still required and
+//! validated via [`forgs::subject::normalise_repo`], for display and audit),
+//! `repository_owner`, `ref`, `workflow`, `job_workflow_ref`, `run_id`. A fork,
+//! or a new repo under a granted owner, has a different `repository_id` and
+//! so matches no grant.
 
-use forgs::subject::{normalise_repo, workload_subject_key};
+use forgs::subject::{normalise_github_id, normalise_repo, workload_subject_key, WORKLOAD_NS_GHA};
 use forgs::SubjectKey;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 use crate::oidc::{decode_verified, AlgPolicy, JwkSet, OidcError, VerifyParams};
 
@@ -47,6 +54,12 @@ pub struct OidcPolicy {
     pub audience: String,
     /// Clock-skew margin, in seconds, applied to `exp` and `nbf`.
     pub leeway_secs: u64,
+    /// The issuer label every subject verified under this policy carries
+    /// (the namespace slot of `<label>/workload:id:…`). Must pass
+    /// [`forgs::subject::valid_workload_ns`] and be **unique per configured
+    /// issuer**: [`WORKLOAD_NS_GHA`] for github.com, something distinct
+    /// (`ghes-corp`) for a GHES or enterprise custom issuer.
+    pub subject_ns: String,
 }
 
 impl OidcPolicy {
@@ -57,6 +70,24 @@ impl OidcPolicy {
             issuer: GHA_ISSUER.to_owned(),
             audience: audience.into(),
             leeway_secs: 60,
+            subject_ns: WORKLOAD_NS_GHA.to_owned(),
+        }
+    }
+
+    /// A policy for another GitHub Actions-compatible issuer (GHES, an
+    /// enterprise custom issuer), 60 s leeway. `subject_ns` must differ from
+    /// every other configured issuer's label.
+    #[must_use]
+    pub fn custom(
+        issuer: impl Into<String>,
+        audience: impl Into<String>,
+        subject_ns: impl Into<String>,
+    ) -> Self {
+        Self {
+            issuer: issuer.into(),
+            audience: audience.into(),
+            leeway_secs: 60,
+            subject_ns: subject_ns.into(),
         }
     }
 }
@@ -64,8 +95,15 @@ impl OidcPolicy {
 /// The claims forgs cares about from a GitHub Actions OIDC token.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkloadClaims {
-    /// `owner/name`, validated and **lowercased**. The only claim that takes
-    /// part in an authorization decision.
+    /// The repository's immutable numeric id. Together with
+    /// [`Self::repository_owner_id`], the only claim that takes part in an
+    /// authorization decision.
+    pub repository_id: String,
+    /// The owner's immutable numeric id. Authorizing, with
+    /// [`Self::repository_id`].
+    pub repository_owner_id: String,
+    /// `owner/name`, validated and **lowercased**. Display and audit only;
+    /// **never** authorizing (names are reassignable).
     pub repository: String,
     /// The repository's owner, lowercased. Audit only; **never** authorizing.
     pub repository_owner: String,
@@ -86,7 +124,7 @@ pub struct WorkloadClaims {
 /// A verified workload: the subject it authenticates as, plus its claims.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkloadIdentity {
-    /// `gha/workload:<owner>/<repo>`.
+    /// `<issuer label>/workload:id:<owner_id>/<repo_id>`.
     pub subject: SubjectKey,
     /// The verified claims.
     pub claims: WorkloadClaims,
@@ -98,6 +136,10 @@ struct RawClaims {
     repository: Option<String>,
     #[serde(default)]
     repository_owner: Option<String>,
+    #[serde(default, deserialize_with = "lenient_id")]
+    repository_id: Option<String>,
+    #[serde(default, deserialize_with = "lenient_id")]
+    repository_owner_id: Option<String>,
     #[serde(default, rename = "ref")]
     git_ref: Option<String>,
     #[serde(default)]
@@ -108,6 +150,16 @@ struct RawClaims {
     run_id: Option<String>,
     sub: Option<String>,
     exp: Option<u64>,
+}
+
+/// A numeric-id claim: GitHub sends a string, but an unsigned integer is
+/// accepted too. Any other JSON type reads as missing (and is then refused).
+fn lenient_id<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    Ok(match serde_json::Value::deserialize(d)? {
+        serde_json::Value::String(s) => Some(s),
+        serde_json::Value::Number(n) => n.as_u64().map(|n| n.to_string()),
+        _ => None,
+    })
 }
 
 /// Verify a GitHub Actions OIDC JWT against `jwks` and `policy` at `now`.
@@ -150,9 +202,30 @@ pub fn verify_github_actions(
         .filter(|s| !s.trim().is_empty())
         .ok_or(OidcError::MissingClaim("repository_owner"))?
         .to_ascii_lowercase();
+    let repository_id = claims
+        .repository_id
+        .as_deref()
+        .and_then(normalise_github_id)
+        .ok_or(OidcError::MissingClaim("repository_id"))?;
+    let repository_owner_id = claims
+        .repository_owner_id
+        .as_deref()
+        .and_then(normalise_github_id)
+        .ok_or(OidcError::MissingClaim("repository_owner_id"))?;
+    // Ids are valid here, so `None` means a misconfigured label — which
+    // `AuthContextBuilder::build` already refuses. Fail closed, never panic.
+    let subject = workload_subject_key(&policy.subject_ns, &repository_owner_id, &repository_id)
+        .ok_or_else(|| {
+            OidcError::Jwks(format!(
+                "invalid workload subject label {:?}",
+                policy.subject_ns
+            ))
+        })?;
     Ok(WorkloadIdentity {
-        subject: workload_subject_key(&repository),
+        subject,
         claims: WorkloadClaims {
+            repository_id,
+            repository_owner_id,
             repository,
             repository_owner,
             git_ref: claims.git_ref,
@@ -168,8 +241,15 @@ pub fn verify_github_actions(
 /// An issuer of workload tokens forgs can exchange for a session.
 #[async_trait::async_trait]
 pub trait WorkloadIssuer: Send + Sync {
-    /// A stable name for logs (`github-actions`).
+    /// A stable name for logs and audit (`github-actions`). Must be
+    /// **unique** among the configured issuers.
     fn name(&self) -> &str;
+
+    /// The issuer label every subject this issuer verifies carries (the
+    /// namespace slot of `<label>/workload:id:…`). Must pass
+    /// [`forgs::subject::valid_workload_ns`] and be **unique** among the
+    /// configured issuers, so two issuers never share a subject.
+    fn subject_ns(&self) -> &str;
 
     /// Verify `jwt` at `now` (epoch seconds, the caller's clock).
     async fn verify(&self, jwt: &str, now: u64) -> Result<WorkloadIdentity, OidcError>;
@@ -189,6 +269,7 @@ mod issuer {
     /// [`JwksCache`], with one forced refresh on an unknown `kid`.
     #[derive(Debug)]
     pub struct GithubActionsIssuer {
+        name: String,
         policy: OidcPolicy,
         jwks: JwksCache,
     }
@@ -207,10 +288,25 @@ mod issuer {
             )
         }
 
-        /// Explicit policy and cache (GHES, tests).
+        /// Explicit policy and cache (GHES, tests). The name defaults to
+        /// `github-actions`; give a second issuer a distinct one with
+        /// [`Self::with_name`].
         #[must_use]
         pub fn with_parts(policy: OidcPolicy, jwks: JwksCache) -> Self {
-            Self { policy, jwks }
+            Self {
+                name: "github-actions".to_owned(),
+                policy,
+                jwks,
+            }
+        }
+
+        /// The same issuer under another [`WorkloadIssuer::name`].
+        #[must_use]
+        pub fn with_name(self, name: impl Into<String>) -> Self {
+            Self {
+                name: name.into(),
+                ..self
+            }
         }
 
         /// The policy.
@@ -222,8 +318,12 @@ mod issuer {
 
     #[async_trait::async_trait]
     impl WorkloadIssuer for GithubActionsIssuer {
-        fn name(&self) -> &'static str {
-            "github-actions"
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn subject_ns(&self) -> &str {
+            &self.policy.subject_ns
         }
 
         async fn verify(&self, jwt: &str, now: u64) -> Result<WorkloadIdentity, OidcError> {
@@ -261,6 +361,8 @@ mod tests {
             "iat": 900u64,
             "repository": "ariel-os/ariel-os",
             "repository_owner": "ariel-os",
+            "repository_id": "67890",
+            "repository_owner_id": "12345",
             "ref": "refs/heads/main",
             "workflow": "hil",
             "job_workflow_ref": "ariel-os/ariel-os/.github/workflows/hil.yml@refs/heads/main",
@@ -283,8 +385,13 @@ mod tests {
             1_000,
         )
         .unwrap();
-        assert_eq!(out.subject.to_string(), "gha/workload:ariel-os/ariel-os");
-        assert_eq!(out.subject, workload_subject_key("ariel-os/ariel-os"));
+        assert_eq!(out.subject.to_string(), "gha/workload:id:12345/67890");
+        assert_eq!(
+            Some(out.subject),
+            workload_subject_key("gha", "12345", "67890")
+        );
+        assert_eq!(out.claims.repository_id, "67890");
+        assert_eq!(out.claims.repository_owner_id, "12345");
         assert_eq!(out.claims.repository, "ariel-os/ariel-os");
         assert_eq!(out.claims.repository_owner, "ariel-os");
         assert_eq!(out.claims.git_ref.as_deref(), Some("refs/heads/main"));
@@ -373,6 +480,11 @@ mod tests {
                 "repository_owner",
                 OidcError::MissingClaim("repository_owner"),
             ),
+            ("repository_id", OidcError::MissingClaim("repository_id")),
+            (
+                "repository_owner_id",
+                OidcError::MissingClaim("repository_owner_id"),
+            ),
             ("exp", OidcError::MissingClaim("exp")),
             ("sub", OidcError::MissingClaim("sub")),
         ] {
@@ -393,6 +505,82 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn malformed_ids_are_refused_and_integers_accepted() {
+        let keys = jwks(&[("k1", KEY_A_N)]);
+        for (claim, bad) in [
+            ("repository_id", json!("abc")),
+            ("repository_id", json!("01")),
+            ("repository_id", json!(-1)),
+            ("repository_id", json!(true)),
+            ("repository_id", json!("")),
+            ("repository_owner_id", json!("1 ")),
+            ("repository_owner_id", json!(1.5)),
+            ("repository_owner_id", json!(null)),
+        ] {
+            let mut c = claims();
+            c[claim] = bad.clone();
+            assert_eq!(
+                verify(&sign("k1", KEY_A_DER_B64, &c), &keys, 1_000).unwrap_err(),
+                OidcError::MissingClaim(claim),
+                "{claim}={bad}"
+            );
+        }
+        let mut c = claims();
+        c["repository_id"] = json!(67_890);
+        c["repository_owner_id"] = json!(12_345);
+        let out = verify(&sign("k1", KEY_A_DER_B64, &c), &keys, 1_000).unwrap();
+        assert_eq!(out.subject.to_string(), "gha/workload:id:12345/67890");
+    }
+
+    /// The subject follows the ids, not the name: a rename keeps it, and a
+    /// repo recreated under a freed name gets a new one.
+    #[test]
+    fn the_subject_follows_ids_not_names() {
+        let keys = jwks(&[("k1", KEY_A_N)]);
+        let base = verify(&sign("k1", KEY_A_DER_B64, &claims()), &keys, 1_000)
+            .unwrap()
+            .subject;
+        let mut renamed = claims();
+        renamed["repository"] = json!("new-owner/new-name");
+        renamed["repository_owner"] = json!("new-owner");
+        let out = verify(&sign("k1", KEY_A_DER_B64, &renamed), &keys, 1_000).unwrap();
+        assert_eq!(out.subject, base);
+        assert_eq!(out.claims.repository, "new-owner/new-name");
+        let mut squatted = claims();
+        squatted["repository_id"] = json!("99999");
+        squatted["repository_owner_id"] = json!("55555");
+        let out = verify(&sign("k1", KEY_A_DER_B64, &squatted), &keys, 1_000).unwrap();
+        assert_ne!(out.subject, base);
+        assert_eq!(out.claims.repository, "ariel-os/ariel-os");
+    }
+
+    /// The same token under two issuers' labels is two subjects.
+    #[test]
+    fn issuer_labels_give_distinct_subjects() {
+        let keys = jwks(&[("k1", KEY_A_N)]);
+        let jwt = sign("k1", KEY_A_DER_B64, &claims());
+        let gha = verify(&jwt, &keys, 1_000).unwrap().subject;
+        let ghes_policy = OidcPolicy {
+            subject_ns: "ghes-corp".to_owned(),
+            ..policy()
+        };
+        let ghes = verify_github_actions(&jwt, &keys, &ghes_policy, 1_000)
+            .unwrap()
+            .subject;
+        assert_ne!(gha, ghes);
+        assert_eq!(ghes.to_string(), "ghes-corp/workload:id:12345/67890");
+        // A misconfigured label fails closed rather than panicking.
+        let bad = OidcPolicy {
+            subject_ns: "Bad/ns".to_owned(),
+            ..policy()
+        };
+        assert!(verify_github_actions(&jwt, &keys, &bad, 1_000).is_err());
+        let custom = OidcPolicy::custom("https://ghes.example/_services/token", AUDIENCE, "ghes");
+        assert_eq!(custom.subject_ns, "ghes");
+        assert_eq!(custom.leeway_secs, 60);
     }
 
     #[test]
@@ -461,6 +649,7 @@ mod tests {
             JwksCache::new(stub.url("/jwks"), Duration::from_hours(1), Duration::ZERO),
         );
         assert_eq!(issuer.name(), "github-actions");
+        assert_eq!(issuer.subject_ns(), "gha");
         issuer
             .verify(&sign("k1", KEY_A_DER_B64, &claims()), 1_000)
             .await
@@ -473,8 +662,11 @@ mod tests {
             .verify(&sign("k2", KEY_B_DER_B64, &claims()), 1_000)
             .await
             .unwrap();
-        assert_eq!(out.subject.to_string(), "gha/workload:ariel-os/ariel-os");
+        assert_eq!(out.subject.to_string(), "gha/workload:id:12345/67890");
         assert_eq!(stub.count("/jwks"), 2);
+        let renamed = GithubActionsIssuer::new(AUDIENCE).with_name("github-com");
+        assert_eq!(renamed.name(), "github-com");
+        assert_eq!(renamed.subject_ns(), "gha");
         assert_eq!(
             GithubActionsIssuer::new(AUDIENCE).policy().issuer,
             GHA_ISSUER

@@ -301,8 +301,84 @@ pub fn github_identity(
     )
 }
 
+/// A repository's immutable ids, as a workload grant needs them
+/// (`forgs::subject::workload_subject_key(ns, &repository_owner_id,
+/// &repository_id)`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GithubRepoIds {
+    /// The repository's numeric id.
+    pub repository_id: String,
+    /// The owner's numeric id.
+    pub repository_owner_id: String,
+    /// `owner/name` as GitHub currently spells it. Display only.
+    pub full_name: String,
+}
+
+#[derive(Deserialize)]
+struct RepoBody {
+    id: u64,
+    owner: RepoOwner,
+    full_name: String,
+}
+
+#[derive(Deserialize)]
+struct RepoOwner {
+    id: u64,
+}
+
+/// Parse `GET /repos/{owner}/{repo}`.
+///
+/// # Errors
+///
+/// [`IdpError::Malformed`] unless the body has a numeric `id`, a numeric
+/// `owner.id` and a string `full_name`. Ids of `0` are refused too: no real
+/// repo or account has one.
+pub fn parse_repo_response(body: &[u8]) -> Result<GithubRepoIds, IdpError> {
+    let parsed: RepoBody =
+        serde_json::from_slice(body).map_err(|e| IdpError::Malformed(e.to_string()))?;
+    if parsed.id == 0 || parsed.owner.id == 0 {
+        return Err(IdpError::Malformed(
+            "zero repository or owner id".to_owned(),
+        ));
+    }
+    Ok(GithubRepoIds {
+        repository_id: parsed.id.to_string(),
+        repository_owner_id: parsed.owner.id.to_string(),
+        full_name: parsed.full_name,
+    })
+}
+
 #[cfg(feature = "client")]
 pub use provider::GithubProvider;
+
+/// Resolve a user-typed `owner/repo` to its immutable ids, for creating a
+/// workload grant. Workload subjects are keyed on ids, never names
+/// (`forgs::subject::WORKLOAD_NS_GHA`), so this is the grant-time step that
+/// turns what an operator types into what a token will prove.
+///
+/// `GET {api_base}/repos/{owner}/{repo}`, optionally authenticated with
+/// `token` (needed for private repos).
+///
+/// # Errors
+///
+/// [`IdpError::Config`] for a repo that is not a valid `owner/name`, the
+/// HTTP error for a non-2xx answer (a `404` for a missing or invisible repo),
+/// [`IdpError::Malformed`] for an unexpected body.
+#[cfg(feature = "client")]
+pub async fn resolve_repo_ids(
+    endpoints: &GithubEndpoints,
+    repo: &str,
+    token: Option<&str>,
+) -> Result<GithubRepoIds, IdpError> {
+    let repo = forgs::subject::normalise_repo(repo)
+        .ok_or_else(|| IdpError::Config(format!("not an owner/name repository: {repo:?}")))?;
+    let url = format!("{}/repos/{repo}", endpoints.api_base.trim_end_matches('/'));
+    let resp = crate::https::get(&url, token, "application/vnd.github+json").await?;
+    if !resp.is_success() {
+        return Err(resp.http_error());
+    }
+    parse_repo_response(&resp.body)
+}
 
 #[cfg(feature = "client")]
 mod provider {
@@ -605,6 +681,39 @@ mod tests {
         }
     }
 
+    #[test]
+    fn repo_response_parses_numeric_ids() {
+        let ids = parse_repo_response(
+            br#"{"id": 67890, "name": "widgets", "full_name": "Octo/widgets",
+                "owner": {"login": "Octo", "id": 12345, "type": "Organization"},
+                "private": false}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            ids,
+            GithubRepoIds {
+                repository_id: "67890".into(),
+                repository_owner_id: "12345".into(),
+                full_name: "Octo/widgets".into(),
+            }
+        );
+        for bad in [
+            &b""[..],
+            b"[]",
+            br#"{"id": "67890", "full_name": "a/b", "owner": {"id": 1}}"#,
+            br#"{"id": 1, "full_name": "a/b", "owner": {"id": -1}}"#,
+            br#"{"id": 1, "full_name": "a/b"}"#,
+            br#"{"id": 0, "full_name": "a/b", "owner": {"id": 1}}"#,
+            br#"{"message": "Not Found"}"#,
+        ] {
+            assert!(
+                matches!(parse_repo_response(bad), Err(IdpError::Malformed(_))),
+                "{}",
+                String::from_utf8_lossy(bad)
+            );
+        }
+    }
+
     #[cfg(feature = "client")]
     mod flow {
         use super::super::*;
@@ -723,5 +832,46 @@ mod tests {
         }
 
         use crate::identity::ProviderTokens;
+
+        #[tokio::test]
+        async fn repo_ids_resolve_against_a_stub() {
+            let stub = StubServer::start(vec![(
+                "/api/v3/repos/octo/widgets".into(),
+                Reply::json(&json!({
+                    "id": 67_890, "full_name": "Octo/Widgets",
+                    "owner": {"id": 12_345, "login": "Octo"}
+                })),
+            )])
+            .await;
+            let endpoints = GithubEndpoints::enterprise(&stub.base());
+            let ids = resolve_repo_ids(&endpoints, "Octo/Widgets", Some(TOKEN))
+                .await
+                .unwrap();
+            assert_eq!(ids.repository_id, "67890");
+            assert_eq!(ids.repository_owner_id, "12345");
+            let reqs = stub.requests();
+            assert_eq!(reqs[0].path(), "/api/v3/repos/octo/widgets");
+            assert_eq!(
+                reqs[0].header("authorization"),
+                Some(format!("Bearer {TOKEN}").as_str())
+            );
+            assert_eq!(
+                reqs[0].header("accept"),
+                Some("application/vnd.github+json")
+            );
+
+            assert!(matches!(
+                resolve_repo_ids(&endpoints, "not-a-repo", None).await,
+                Err(IdpError::Config(_))
+            ));
+            stub.set(
+                "/api/v3/repos/octo/widgets",
+                Reply::status(404, "application/json", r#"{"message":"Not Found"}"#),
+            );
+            assert!(matches!(
+                resolve_repo_ids(&endpoints, "octo/widgets", None).await,
+                Err(IdpError::Http { status: 404, .. })
+            ));
+        }
     }
 }

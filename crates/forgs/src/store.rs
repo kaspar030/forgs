@@ -59,9 +59,9 @@ pub struct ApiKeyRecord {
 /// A CI workload token row.
 ///
 /// Deliberately **not** namespace-scoped: a workload belongs to no tenant. Its
-/// subject is `gha/workload:<owner>/<repo>` for the OIDC path, or a
-/// namespace-scoped `<ns>/workload:agent:<name>` for a named API key. It
-/// reaches resources only through grants.
+/// subject is `<issuer label>/workload:id:<owner_id>/<repo_id>` for the OIDC
+/// path, or a namespace-scoped `<ns>/workload:agent:<name>` for a named API
+/// key. It reaches resources only through grants.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkloadRecord {
     /// The subject the token speaks as. A store must drop a row whose stored

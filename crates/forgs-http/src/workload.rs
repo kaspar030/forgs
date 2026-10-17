@@ -1,10 +1,12 @@
 //! Workload token exchange at `POST /auth/token` (framework-agnostic).
 //!
 //! * `github_oidc` — a CI job's OIDC JWT, verified by a configured
-//!   [`forgs_idp::WorkloadIssuer`]. The subject is `gha/workload:<owner>/<repo>`
-//!   and it must hold at least one live grant: a workload belongs to no
-//!   tenant and reaches anything only through grants, so a token for a
-//!   grantless repo would be useless and is not minted.
+//!   [`forgs_idp::WorkloadIssuer`]. The subject is
+//!   `<issuer label>/workload:id:<owner_id>/<repo_id>` — immutable ids, never
+//!   the reassignable `owner/repo` name, and namespaced by the issuer that
+//!   verified it — and it must hold at least one live grant: a workload
+//!   belongs to no tenant and reaches anything only through grants, so a
+//!   token for a grantless repo would be useless and is not minted.
 //! * `api_key` — the weak path for a runner with no workload identity: a
 //!   long-lived bearer secret in somebody's CI config. Bounded by being
 //!   namespace-scoped, expiring and revocable; the workload token it mints
@@ -29,6 +31,7 @@ async fn mint_workload(
     issuer: &str,
     claims: Option<&str>,
     not_after: Option<u64>,
+    detail: Option<&str>,
 ) -> Result<TokenResponse, ApiError> {
     let now = ctx.now();
     let ttl = ctx.ttl().workload.min(ctx.ttl().workload_cap);
@@ -46,7 +49,7 @@ async fn mint_workload(
             AuditEvent::new(now, "workload.token.mint")
                 .subject(subject)
                 .target(token.hash().short())
-                .detail(format!("issuer={issuer}")),
+                .detail(detail.map_or_else(|| format!("issuer={issuer}"), str::to_owned)),
         )
         .await;
     Ok(TokenResponse {
@@ -75,34 +78,52 @@ pub async fn exchange_oidc(ctx: &AuthContext, jwt: &str) -> Result<TokenResponse
     for issuer in ctx.workload_issuers() {
         match issuer.verify(jwt, now).await {
             Ok(id) => {
-                identity = Some((issuer.name().to_owned(), id));
+                identity = Some((issuer.name().to_owned(), issuer.subject_ns().to_owned(), id));
                 break;
             }
             Err(e) => last = Some(e),
         }
     }
-    let Some((issuer, identity)) = identity else {
+    let Some((issuer, subject_ns, identity)) = identity else {
         let label = last.as_ref().map_or("oidc.reject", |e| e.label());
         ctx.audit()
             .record(AuditEvent::new(now, label).detail("workload OIDC exchange"))
             .await;
         return Err(ApiError::InvalidGrant);
     };
+    // Defence in depth: an issuer may only speak for subjects under its own
+    // label, so a buggy or hostile issuer cannot claim another's repos.
+    if identity.subject.ns() != Some(subject_ns.as_str())
+        || identity.subject.kind() != SubjectKind::Workload
+    {
+        ctx.audit()
+            .record(
+                AuditEvent::new(now, "workload.reject.ns_mismatch")
+                    .subject(&identity.subject)
+                    .detail(format!("issuer={issuer} expected_ns={subject_ns}")),
+            )
+            .await;
+        return Err(ApiError::InvalidGrant);
+    }
     let grants = ctx
         .store()
         .grants_for_subject(&identity.subject, now)
         .await
         .map_err(store_err("grants_for_subject"))?;
     if grants.is_empty() {
-        // Named in the audit with the repo: the operator's next action is
-        // to grant exactly that repo. The owner is not sufficient.
+        // Named in the audit with the repo and its ids: the operator's next
+        // action is to grant exactly that subject. The owner is not
+        // sufficient.
         ctx.audit()
             .record(
                 AuditEvent::new(now, "workload.reject.no_grant")
                     .subject(&identity.subject)
                     .detail(format!(
-                        "repository={} owner={}",
-                        identity.claims.repository, identity.claims.repository_owner
+                        "issuer={issuer} repository={} owner={} repository_id={} owner_id={}",
+                        identity.claims.repository,
+                        identity.claims.repository_owner,
+                        identity.claims.repository_id,
+                        identity.claims.repository_owner_id
                     )),
             )
             .await;
@@ -111,6 +132,8 @@ pub async fn exchange_oidc(ctx: &AuthContext, jwt: &str) -> Result<TokenResponse
     let c = &identity.claims;
     let claims = serde_json::json!({
         "repository": c.repository,
+        "repository_id": c.repository_id,
+        "repository_owner_id": c.repository_owner_id,
         "repository_owner": c.repository_owner,
         "ref": c.git_ref,
         "workflow": c.workflow,
@@ -120,7 +143,19 @@ pub async fn exchange_oidc(ctx: &AuthContext, jwt: &str) -> Result<TokenResponse
     })
     .to_string();
     // Not capped by the JWT's `exp` (minutes): the job outlives its id token.
-    mint_workload(ctx, &identity.subject, &issuer, Some(&claims), None).await
+    let detail = format!(
+        "issuer={issuer} repository={} repository_id={} owner_id={}",
+        c.repository, c.repository_id, c.repository_owner_id
+    );
+    mint_workload(
+        ctx,
+        &identity.subject,
+        &issuer,
+        Some(&claims),
+        None,
+        Some(&detail),
+    )
+    .await
 }
 
 /// Redeem a workload-purpose API key.
@@ -194,5 +229,5 @@ pub async fn exchange_api_key(ctx: &AuthContext, key: &str) -> Result<TokenRespo
                 .target(hash.short()),
         )
         .await;
-    mint_workload(ctx, &subject, "api_key", None, consumed.expires).await
+    mint_workload(ctx, &subject, "api_key", None, consumed.expires, None).await
 }
