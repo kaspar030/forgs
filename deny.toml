@@ -1,0 +1,12 @@
+# cargo-deny configuration. CI (.github/workflows/audit.yml) only runs
+# `cargo deny check advisories`; licenses/bans/sources are not gated.
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = [
+  { id = "RUSTSEC-2023-0071", reason = "rsa (Marvin timing attack) comes in via jsonwebtoken rust_crypto; forgs uses it only for RS256 signature VERIFICATION with public keys, never private-key decrypt/sign, so it is not exploitable. No fixed rsa release yet." },
+]

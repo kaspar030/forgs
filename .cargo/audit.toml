@@ -1,0 +1,3 @@
+[advisories]
+# rsa Marvin: RS256 verify-only via jsonwebtoken, not exploitable (see deny.toml)
+ignore = ["RUSTSEC-2023-0071"]
