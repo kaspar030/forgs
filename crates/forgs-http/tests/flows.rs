@@ -3024,3 +3024,84 @@ async fn create_and_delete_namespace() {
         .await
         .unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// Unauthenticated audit noise is not persisted (audit HTTP-05)
+
+#[tokio::test]
+async fn store_audit_sink_drops_unauthenticated_noise() {
+    let store = Store::connect_in_memory(schema(), RoleLadder::default())
+        .await
+        .unwrap();
+    // Default sink: StoreAuditSink over the store.
+    let ctx = AuthContext::builder(store.clone(), PUBLIC, &[42; 32])
+        .clock(Arc::new(FixedClock::new(NOW)))
+        .build()
+        .unwrap();
+    let app = forgs_http::router::<AuthContext>()
+        .route("/api/any", get(app_any))
+        .with_state(ctx.clone());
+    let count = || async {
+        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM forgs_audit")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        n
+    };
+    let send = |auth: Option<String>| {
+        let app = app.clone();
+        async move {
+            let mut b = Request::builder().uri("/api/any");
+            if let Some(a) = auth {
+                b = b.header(header::AUTHORIZATION, a);
+            }
+            app.oneshot(b.body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+    for auth in [
+        None,
+        Some("Bearer garbage".to_owned()),
+        Some("Bearer ".to_owned()),
+    ] {
+        assert_eq!(send(auth).await, StatusCode::UNAUTHORIZED);
+    }
+    assert_eq!(count().await, 0, "missing/malformed must not write rows");
+
+    // A well-formed but unknown credential is still recorded.
+    let unknown = ctx.format().mint(TokenKind::Session).to_secret_string();
+    assert_eq!(
+        send(Some(format!("Bearer {unknown}"))).await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(count().await, 1);
+}
+
+#[tokio::test]
+async fn store_audit_sink_can_opt_into_noise() {
+    let store = Store::connect_in_memory(schema(), RoleLadder::default())
+        .await
+        .unwrap();
+    let noise = AuditEvent::new(NOW, "auth.reject.missing");
+    assert!(noise.is_unauthenticated_noise());
+    assert!(!AuditEvent::new(NOW, "auth.reject.unknown").is_unauthenticated_noise());
+    assert!(!noise
+        .clone()
+        .subject(&SubjectKey::user(forgs::UserId::generate(NOW * 1000)))
+        .is_unauthenticated_noise());
+
+    forgs_http::StoreAuditSink::new(store.clone())
+        .record(noise.clone())
+        .await;
+    forgs_http::StoreAuditSink::new(store.clone())
+        .persist_unauthenticated_noise(true)
+        .record(noise)
+        .await;
+    let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM forgs_audit")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(n, 1);
+}

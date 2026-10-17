@@ -45,7 +45,8 @@
 //!   Reached by one-shot ticket id, user code or device hash.
 //! * **Audit rows outside any namespace** ([`Store::append_audit`]) — logins
 //!   and signups, which happen before any namespace is chosen.
-//! * **[`Store::sweep`]** — system-initiated hygiene with no caller.
+//! * **[`Store::sweep`]** — system-initiated hygiene with no caller: expired
+//!   credentials, and audit rows past [`Store::with_audit_retention`].
 //!
 //! [`Store::pool`] is public because apps share the database and need the pool
 //! for their own tables; writing to `forgs_` tables through it bypasses these
@@ -105,7 +106,12 @@ pub struct Store {
     schema: Arc<Schema>,
     roles: Arc<RoleLadder>,
     app_subject_kinds: Vec<&'static str>,
+    audit_retention: Option<u64>,
 }
+
+/// How long [`Store::sweep`] keeps audit rows by default: 90 days, in
+/// seconds. Change it with [`Store::with_audit_retention`].
+pub const DEFAULT_AUDIT_RETENTION_SECS: u64 = 90 * 24 * 60 * 60;
 
 impl Store {
     /// Wrap an existing pool, running [`migrate`] first.
@@ -124,6 +130,7 @@ impl Store {
             schema: Arc::new(schema),
             roles: Arc::new(roles),
             app_subject_kinds: Vec::new(),
+            audit_retention: Some(DEFAULT_AUDIT_RETENTION_SECS),
         })
     }
 
@@ -175,6 +182,23 @@ impl Store {
     pub fn with_app_subject_kinds(mut self, kinds: &[&'static str]) -> Self {
         self.app_subject_kinds = kinds.to_vec();
         self
+    }
+
+    /// Keep audit rows for `retention_secs` seconds: [`Store::sweep`] deletes
+    /// rows whose `ts` is older than `now - retention_secs`. `None` keeps
+    /// audit rows forever (the app then owns pruning `forgs_audit`).
+    /// Default: [`DEFAULT_AUDIT_RETENTION_SECS`] (90 days).
+    #[must_use]
+    pub fn with_audit_retention(mut self, retention_secs: Option<u64>) -> Self {
+        self.audit_retention = retention_secs;
+        self
+    }
+
+    /// The audit retention [`Store::sweep`] applies, in seconds (`None`:
+    /// forever).
+    #[must_use]
+    pub fn audit_retention(&self) -> Option<u64> {
+        self.audit_retention
     }
 
     /// The underlying pool, for the app's own tables. See the crate docs on

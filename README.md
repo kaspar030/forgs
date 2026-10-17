@@ -23,6 +23,22 @@ client that tie these together.
 | `forgs-http` | axum `/auth/*` routes (login/callback, signup, token, session/logout, device start/poll and approval page, keys, identity linking, members, rename, providers), the `Authenticated` extractor, `AuthContext`, cookies + CSRF, server-rendered pages, and app hooks (`AppTokenLookup`, `ApiKeyPurposes`, `PendingApprovalHook`). |
 | `forgs-client` | hyper + rustls/`ring` client for device login, refresh, logout, API keys and workload exchange; GitHub Actions token fetch; CLI helpers; TLS pinning; credential-file helper (Unix). No server dependencies (enforced by `tests/no_http_server_dep.rs`). |
 
+## Operating notes
+
+- **Rate-limit `/auth/*`.** forgs does not rate-limit. Put a limiter in front
+  of `/auth/*` (and of the app's authenticated routes): every token, refresh
+  and login failure is audited, and the token endpoints do database work per
+  request.
+- **Audit volume.** The default `StoreAuditSink` does not persist rejections
+  of requests with no credential or an unparseable one
+  (`auth.reject.missing`, `auth.reject.malformed`, `oidc.reject.malformed`);
+  they are traced at `debug`. Opt in with
+  `StoreAuditSink::persist_unauthenticated_noise(true)`.
+- **Audit retention.** `Store::sweep` deletes `forgs_audit` rows older than
+  the store's audit retention, 90 days by default
+  (`Store::with_audit_retention`, `None` keeps them forever). The app drives
+  `sweep` on its own timer.
+
 ## Dependency discipline
 
 fleet's agent cross-compiles to armv7-musl and consumes `forgs-client`, so:

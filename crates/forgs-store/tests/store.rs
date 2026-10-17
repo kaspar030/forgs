@@ -1041,6 +1041,70 @@ async fn audit_is_scoped() {
     assert_eq!(s.scoped(a.unwrap()).recent_audit(1).await.unwrap().len(), 1);
 }
 
+async fn audit_actions(s: &Store) -> Vec<String> {
+    let rows: Vec<(String,)> = sqlx::query_as("SELECT action FROM forgs_audit ORDER BY id")
+        .fetch_all(s.pool())
+        .await
+        .unwrap();
+    rows.into_iter().map(|(a,)| a).collect()
+}
+
+#[tokio::test]
+async fn the_sweep_prunes_audit_rows_past_retention() {
+    let s = store(fleet()).await.with_audit_retention(Some(100));
+    let (_, a) = s.create_local_user("alice", None, NOW).await.unwrap();
+    let e = |ts, action| AuditEntry {
+        ts,
+        subject: None,
+        action,
+        target: None,
+        detail: None,
+    };
+    s.append_audit(&e(NOW, "old")).await.unwrap();
+    s.scoped(a.unwrap())
+        .append_audit(&e(NOW, "old.scoped"))
+        .await
+        .unwrap();
+    s.append_audit(&e(NOW + 1, "boundary")).await.unwrap();
+    s.append_audit(&e(NOW + 50, "new")).await.unwrap();
+
+    // Cutoff is now - retention = NOW + 1; rows strictly older go.
+    let got = s.sweep(NOW + 101).await.unwrap();
+    assert_eq!(got.audit, 2);
+    assert_eq!(audit_actions(&s).await, ["boundary", "new"]);
+    assert_eq!(s.sweep(NOW + 101).await.unwrap().audit, 0);
+
+    // `None` keeps everything.
+    let s = s.with_audit_retention(None);
+    assert_eq!(s.sweep(u64::MAX >> 2).await.unwrap().audit, 0);
+    assert_eq!(audit_actions(&s).await.len(), 2);
+}
+
+#[tokio::test]
+async fn audit_retention_defaults_to_ninety_days_and_saturates() {
+    let s = store(fleet()).await;
+    assert_eq!(
+        s.audit_retention(),
+        Some(forgs_store::DEFAULT_AUDIT_RETENTION_SECS)
+    );
+    assert_eq!(forgs_store::DEFAULT_AUDIT_RETENTION_SECS, 90 * 86_400);
+    let e = AuditEntry {
+        ts: 0,
+        subject: None,
+        action: "ancient",
+        target: None,
+        detail: None,
+    };
+    s.append_audit(&e).await.unwrap();
+    // now < retention: the cutoff saturates at 0 and nothing goes.
+    assert_eq!(s.sweep(10).await.unwrap().audit, 0);
+    let got = s
+        .sweep(forgs_store::DEFAULT_AUDIT_RETENTION_SECS + 1)
+        .await
+        .unwrap();
+    assert_eq!(got.audit, 1);
+}
+
 // ---------------------------------------------------------------------------
 // API key consumption
 // ---------------------------------------------------------------------------
@@ -2040,6 +2104,7 @@ async fn sweep_removes_exactly_the_dead_rows() {
             api_keys: 2,
             pending_signups: 1,
             pending_devices: 2,
+            audit: 0,
         }
     );
     assert_eq!(s.sweep(t).await.unwrap(), SweepCounts::default());

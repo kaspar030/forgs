@@ -19,6 +19,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
         3,
         include_str!("../migrations/0003_workload_token_source_key.sql"),
     ),
+    (4, include_str!("../migrations/0004_audit_ts_index.sql")),
 ];
 
 /// The newest schema version this build knows.

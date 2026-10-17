@@ -76,7 +76,11 @@ Properties that follow from the model:
    both call into the app, which mints its own credential.
 6. `AuthContext` (forgs-http): injected clock, `Ttls`, `public_url`, cookie
    names (derived from the brand), a CSRF secret (injected, with domain
-   separation), and an `AuditSink`.
+   separation), and an `AuditSink`. The default `StoreAuditSink` does not
+   persist unauthenticated noise (missing / malformed credentials, which cost
+   nothing to send); `Store::sweep` prunes audit rows past a retention window
+   (default 90 days). forgs does not rate-limit: apps must put a rate limiter
+   in front of `/auth/*`.
 7. **Grant payload** (`forgs::authz`): forgs stores and evaluates liveness, the
    subject and the namespace fence. The selector and ops are app-defined via
    the `Selector`/`Resource`/`Op` traits and stored as canonical text.
@@ -340,7 +344,7 @@ forgs            core: ids, namespace schema, roles, Subject, tokens + verify,
                  user codes, rotation, username policy, authz evaluation,
                  /auth/* wire types (`forgs::api`). Pure: no IO, no clock.
 forgs-store      sqlx/SQLite: schema + migrator, Store, NsScope handles,
-                 expiry sweep.
+                 expiry + audit-retention sweep.
 forgs-idp        IdentityProvider and WorkloadIssuer traits, ExternalIdentity.
                  `client` feature: HTTPS egress (GitHub provider, GHA runner
                  token fetch). `oidc` feature: JWT/JWKS verification; with

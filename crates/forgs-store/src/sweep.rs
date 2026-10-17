@@ -4,6 +4,10 @@
 //! at verification and by the conditional consume statements regardless. The
 //! sweep only keeps tables from growing. There is no background task here;
 //! the app drives [`Store::sweep`] on its own timer.
+//!
+//! The sweep also enforces audit retention ([`Store::with_audit_retention`],
+//! default [`crate::DEFAULT_AUDIT_RETENTION_SECS`]): `forgs_audit` is
+//! otherwise append-only and would grow without bound.
 
 use crate::error::{ts, Result};
 use crate::Store;
@@ -23,13 +27,16 @@ pub struct SweepCounts {
     pub pending_signups: u64,
     /// Expired or consumed (redeemed or denied) device approvals.
     pub pending_devices: u64,
+    /// Audit rows older than the retention window.
+    pub audit: u64,
 }
 
 impl Store {
     /// Delete every credential row that expired at or before `now`
     /// (`expires <= now`, matching verification's exclusive expiry), consumed
     /// single-use API keys no live workload token still references, and
-    /// decided device approvals.
+    /// decided device approvals; and audit rows with `ts < now - retention`
+    /// unless retention is `None` ([`Store::with_audit_retention`]).
     ///
     /// Workload tokens are swept before API keys, so a consumed key whose
     /// tokens all just expired goes in the same pass. A consumed key is kept
@@ -40,6 +47,10 @@ impl Store {
     ///
     /// A database error; statements already run stay applied.
     pub async fn sweep(&self, now: u64) -> Result<SweepCounts> {
+        let audit_cutoff = self
+            .audit_retention
+            .map(|keep| ts(now.saturating_sub(keep)))
+            .transpose()?;
         let now = ts(now)?;
         let run = |sql: &'static str| {
             let pool = &self.pool;
@@ -67,6 +78,14 @@ impl Store {
                 "DELETE FROM forgs_pending_device WHERE expires <= ?1 OR consumed_at IS NOT NULL",
             )
             .await?,
+            audit: match audit_cutoff {
+                Some(cutoff) => sqlx::query("DELETE FROM forgs_audit WHERE ts < ?1")
+                    .bind(cutoff)
+                    .execute(&self.pool)
+                    .await?
+                    .rows_affected(),
+                None => 0,
+            },
         })
     }
 }
