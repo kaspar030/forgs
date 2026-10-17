@@ -157,18 +157,40 @@ impl JwksCache {
     /// [`OidcError::Jwks`] only when there is *no* usable cached set; a
     /// stale-but-present set survives a failed refresh.
     pub async fn get(&self) -> Result<Arc<JwkSet>, OidcError> {
-        {
+        let limited = {
             let state = self.lock_state();
             if let Some(keys) = self.fresh(&state) {
                 return Ok(keys);
             }
-            if self.rate_limited(&state) {
-                if state.keys.is_some() {
+            let limited = self.rate_limited(&state);
+            if limited {
+                if let Some(keys) = state.keys.clone() {
                     tracing::debug!("serving a stale JWKS: refetch is rate-limited");
+                    return Ok(keys);
                 }
-                return Self::cached_or(&state, "no cached key set; refetch is rate-limited");
             }
+            limited
+        };
+        if !limited {
+            return self.get_unlimited().await;
         }
+        // Rate-limited and cold. If that is because a fetch is in flight
+        // right now, wait for it and take its result; otherwise the issuer
+        // is failing and the floor holds.
+        self.await_in_flight("no cached key set; refetch is rate-limited")
+            .await
+    }
+
+    /// Wait for an in-flight fetch, if any, then return the cached set.
+    async fn await_in_flight(&self, why: &str) -> Result<Arc<JwkSet>, OidcError> {
+        if self.fetch_gate.try_lock().is_err() {
+            let _gate = self.fetch_gate.lock().await;
+        }
+        Self::cached_or(&self.lock_state(), why)
+    }
+
+    /// [`Self::get`] past the rate-limit check.
+    async fn get_unlimited(&self) -> Result<Arc<JwkSet>, OidcError> {
         let Ok(gate) = self.fetch_gate.try_lock() else {
             // A fetch is in flight. Readers with a cached set never wait on it.
             if let Some(keys) = self.lock_state().keys.clone() {
@@ -196,17 +218,17 @@ impl JwksCache {
     ///
     /// As [`JwksCache::get`].
     pub async fn refresh_for_unknown_kid(&self) -> Result<Arc<JwkSet>, OidcError> {
-        {
-            let state = self.lock_state();
-            if self.rate_limited(&state) {
-                tracing::debug!("JWKS refetch suppressed by the rate limit");
-                return Self::cached_or(&state, "no cached key set");
-            }
+        let limited = self.rate_limited(&self.lock_state());
+        if !limited {
+            let gate = self.fetch_gate.lock().await;
+            let out = self.refresh(true).await;
+            drop(gate);
+            return out;
         }
-        let gate = self.fetch_gate.lock().await;
-        let out = self.refresh(true).await;
-        drop(gate);
-        out
+        tracing::debug!("JWKS refetch suppressed by the rate limit");
+        // A token racing a key rotation whose fetch is in flight gets the
+        // new set rather than a spurious unknown `kid`.
+        self.await_in_flight("no cached key set").await
     }
 
     /// Re-check under the state lock (another fetch may just have finished),
@@ -434,6 +456,40 @@ mod tests {
         let started = Instant::now();
         assert!(matches!(cache.get().await, Err(OidcError::Jwks(_))));
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn concurrent_cold_gets_wait_for_the_in_flight_fetch_under_the_floor() {
+        let stub = StubServer::start(vec![(
+            "/jwks".into(),
+            Reply::json(&jwks_json(&[("a", KEY_A_N)])).delayed(Duration::from_millis(200)),
+        )])
+        .await;
+        let cache = Arc::new(
+            JwksCache::new(
+                stub.url("/jwks"),
+                Duration::from_hours(1),
+                JwksCache::DEFAULT_MIN_REFETCH,
+            )
+            .unwrap(),
+        );
+        let handles: Vec<_> = (0..5)
+            .map(|i| {
+                let cache = Arc::clone(&cache);
+                tokio::spawn(async move {
+                    if i % 2 == 0 {
+                        cache.get().await
+                    } else {
+                        tokio::task::yield_now().await;
+                        cache.refresh_for_unknown_kid().await
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            assert!(has(&h.await.unwrap().unwrap(), "a"));
+        }
+        assert_eq!(stub.count("/jwks"), 1);
     }
 
     #[tokio::test]
