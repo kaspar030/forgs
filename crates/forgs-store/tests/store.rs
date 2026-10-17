@@ -13,8 +13,8 @@ use forgs::{
     TokenKind, TokenStore, UserId,
 };
 use forgs_store::{
-    AuditEntry, AuditRow, GrantRow, NewApiKey, NewGrant, NewIdentity, NewSignup, NsNode, Store,
-    StoreError, SweepCounts, UserState,
+    AuditEntry, AuditRow, GrantRow, NewApiKey, NewGrant, NewIdentity, NewSignup, NsNode,
+    ReleaseCause, ReleaseLimit, Store, StoreError, SweepCounts, UserState, DEFAULT_RELEASE_LIMIT,
 };
 use sqlx::sqlite::SqlitePoolOptions;
 
@@ -184,7 +184,7 @@ async fn an_app_migration_can_reference_forgs_tables() {
         .await
         .unwrap();
     assert!(matches!(
-        s.delete_node(proj, NOW).await,
+        s.delete_node(proj, None, NOW).await,
         Err(StoreError::Dangling)
     ));
     // Migrating again after the app's tables exist is still a no-op.
@@ -484,7 +484,7 @@ async fn the_root_pre_check_sees_non_personal_nodes_without_backstops() {
     ));
     let (bob, _) = s.create_local_user("bob", None, NOW).await.unwrap();
     assert!(matches!(
-        s.rename_user(bob, "acme", NOW).await,
+        s.rename_user(bob, "acme", Some(bob), NOW).await,
         Err(StoreError::NameTaken)
     ));
     let other = s
@@ -492,7 +492,8 @@ async fn the_root_pre_check_sees_non_personal_nodes_without_backstops() {
         .await
         .unwrap();
     assert!(matches!(
-        s.rename_node(other, "acme", NameOrigin::App, NOW).await,
+        s.rename_node(other, "acme", NameOrigin::App, None, NOW)
+            .await,
         Err(StoreError::NameTaken)
     ));
     assert_eq!(count(&s, "forgs_user").await, 1);
@@ -506,7 +507,7 @@ async fn delete_user_refuses_while_they_own_other_nodes() {
     s.create_node(None, "org", "team", NameOrigin::User, Some(alice), NOW)
         .await
         .unwrap();
-    let r = s.delete_user(alice, NOW).await;
+    let r = s.delete_user(alice, None, NOW).await;
     assert!(matches!(r, Err(StoreError::Dangling)), "{r:?}");
     assert!(s.user_by_id(alice).await.unwrap().is_some());
     assert_eq!(count(&s, "forgs_ns_tombstone").await, 0);
@@ -628,7 +629,9 @@ async fn a_renamed_username_is_blocked_forever() {
     let s = store(fleet()).await;
     let (alice, ns) = s.create_local_user("alice", None, NOW).await.unwrap();
     let ns = ns.unwrap();
-    s.rename_user(alice, "alicia", NOW).await.unwrap();
+    s.rename_user(alice, "alicia", Some(alice), NOW)
+        .await
+        .unwrap();
     assert_eq!(
         s.user_by_id(alice).await.unwrap().unwrap().username,
         "alicia"
@@ -648,22 +651,22 @@ async fn a_renamed_username_is_blocked_forever() {
         Err(StoreError::NameTombstoned)
     ));
     assert!(matches!(
-        s.rename_user(alice, "alice", NOW).await,
+        s.rename_user(alice, "alice", Some(alice), NOW).await,
         Err(StoreError::NameTombstoned)
     ));
     // Renaming into another user's name is refused.
     s.create_local_user("bob", None, NOW).await.unwrap();
     assert!(matches!(
-        s.rename_user(alice, "bob", NOW).await,
+        s.rename_user(alice, "bob", Some(alice), NOW).await,
         Err(StoreError::NameTaken)
     ));
     // Personal nodes are renamed only through the user.
     assert!(matches!(
-        s.rename_node(ns, "x", NameOrigin::User, NOW).await,
+        s.rename_node(ns, "x", NameOrigin::User, None, NOW).await,
         Err(StoreError::PersonalNode)
     ));
     assert!(matches!(
-        s.delete_node(ns, NOW).await,
+        s.delete_node(ns, None, NOW).await,
         Err(StoreError::PersonalNode)
     ));
 }
@@ -683,13 +686,13 @@ async fn renamed_and_deleted_node_names_are_blocked_under_their_parent_only() {
         .create_node(Some(a), "project", "old", NameOrigin::User, None, NOW)
         .await
         .unwrap();
-    s.rename_node(p, "New", NameOrigin::User, NOW)
+    s.rename_node(p, "New", NameOrigin::User, None, NOW)
         .await
         .unwrap();
     let n = s.node(p).await.unwrap().unwrap();
     assert_eq!((n.name.as_str(), n.name_canonical.as_str()), ("New", "new"));
     // Display-only change releases nothing.
-    s.rename_node(p, "NEW", NameOrigin::User, NOW)
+    s.rename_node(p, "NEW", NameOrigin::User, None, NOW)
         .await
         .unwrap();
     assert!(matches!(
@@ -700,19 +703,19 @@ async fn renamed_and_deleted_node_names_are_blocked_under_their_parent_only() {
     s.create_node(Some(b), "project", "old", NameOrigin::User, None, NOW)
         .await
         .unwrap();
-    s.delete_node(p, NOW).await.unwrap();
+    s.delete_node(p, None, NOW).await.unwrap();
     assert!(matches!(
         s.create_node(Some(a), "project", "new", NameOrigin::User, None, NOW)
             .await,
         Err(StoreError::NameTombstoned)
     ));
     // A deleted root org's name is blocked for usernames too.
-    s.delete_node(b, NOW).await.unwrap_err(); // has a child
+    s.delete_node(b, None, NOW).await.unwrap_err(); // has a child
     let c = s
         .create_node(None, "org", "c-org", NameOrigin::User, None, NOW)
         .await
         .unwrap();
-    s.delete_node(c, NOW).await.unwrap();
+    s.delete_node(c, None, NOW).await.unwrap();
     assert!(matches!(
         s.create_local_user("c-org", None, NOW).await,
         Err(StoreError::NameTombstoned)
@@ -721,10 +724,179 @@ async fn renamed_and_deleted_node_names_are_blocked_under_their_parent_only() {
 }
 
 #[tokio::test]
+async fn root_name_releases_are_rate_limited_per_actor_and_per_holder() {
+    const DAY: u64 = 24 * 60 * 60;
+    let s = store(forge()).await.with_release_limit(Some(ReleaseLimit {
+        max: 2,
+        window_secs: 10 * DAY,
+    }));
+    let (alice, _) = s.create_local_user("alice", None, NOW).await.unwrap();
+    s.rename_user(alice, "a1", Some(alice), NOW).await.unwrap();
+    s.rename_user(alice, "a2", Some(alice), NOW + 1)
+        .await
+        .unwrap();
+    // The third rename inside the window would burn a third name.
+    assert!(matches!(
+        s.rename_user(alice, "google", Some(alice), NOW + 2).await,
+        Err(StoreError::ReleaseLimited)
+    ));
+    // Nothing changed: the name is still free for anyone else.
+    assert_eq!(s.user_by_id(alice).await.unwrap().unwrap().username, "a2");
+    s.create_local_user("google", None, NOW + 3).await.unwrap();
+    // Deleting a root node the user created counts too (create-then-delete
+    // burns names as well).
+    let org = s
+        .create_node(None, "org", "rust-lang", NameOrigin::User, Some(alice), NOW)
+        .await
+        .unwrap();
+    assert!(matches!(
+        s.delete_node(org, Some(alice), NOW + 4).await,
+        Err(StoreError::ReleaseLimited)
+    ));
+    assert!(matches!(
+        s.rename_node(org, "other", NameOrigin::User, Some(alice), NOW + 4)
+            .await,
+        Err(StoreError::ReleaseLimited)
+    ));
+    // Names below the root are not limited.
+    let p = s
+        .create_node(Some(org), "project", "p1", NameOrigin::User, None, NOW)
+        .await
+        .unwrap();
+    for (i, n) in ["p2", "p3", "p4"].into_iter().enumerate() {
+        s.rename_node(p, n, NameOrigin::User, Some(alice), NOW + 5 + i as u64)
+            .await
+            .unwrap();
+    }
+    // The app / an operator is never limited.
+    s.rename_user(alice, "a3", None, NOW + 9).await.unwrap();
+    // After the window the user may release again.
+    s.rename_user(alice, "a4", Some(alice), NOW + 10 * DAY + 2)
+        .await
+        .unwrap();
+
+    // Per holder: one root node renamed by different admins.
+    let (bob, _) = s.create_local_user("bob", None, NOW).await.unwrap();
+    let (carol, _) = s.create_local_user("carol", None, NOW).await.unwrap();
+    let (dave, _) = s.create_local_user("dave", None, NOW).await.unwrap();
+    let team = s
+        .create_node(None, "org", "team", NameOrigin::User, None, NOW)
+        .await
+        .unwrap();
+    s.rename_node(team, "team1", NameOrigin::User, Some(bob), NOW)
+        .await
+        .unwrap();
+    s.rename_node(team, "team2", NameOrigin::User, Some(carol), NOW)
+        .await
+        .unwrap();
+    assert!(matches!(
+        s.rename_node(team, "team3", NameOrigin::User, Some(dave), NOW)
+            .await,
+        Err(StoreError::ReleaseLimited)
+    ));
+    // A display-only change releases nothing and is never limited.
+    s.rename_node(team, "TEAM2", NameOrigin::User, Some(dave), NOW)
+        .await
+        .unwrap();
+
+    // Unlimited store.
+    let s = store(forge()).await.with_release_limit(None);
+    let (eve, _) = s.create_local_user("eve", None, NOW).await.unwrap();
+    for i in 0..10 {
+        s.rename_user(eve, &format!("eve{i}"), Some(eve), NOW)
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn tombstones_record_their_actor_and_can_be_released_by_an_operator() {
+    let s = store(forge()).await;
+    assert_eq!(s.release_limit(), Some(DEFAULT_RELEASE_LIMIT));
+    let (mallory, _) = s.create_local_user("mallory", None, NOW).await.unwrap();
+    let (alice, _) = s.create_local_user("alice", None, NOW).await.unwrap();
+    s.rename_user(mallory, "google", Some(mallory), NOW)
+        .await
+        .unwrap();
+    s.rename_user(mallory, "rust-lang", Some(mallory), NOW + 10)
+        .await
+        .unwrap();
+    s.rename_user(alice, "alicia", Some(alice), NOW)
+        .await
+        .unwrap();
+    let org = s
+        .create_node(None, "org", "acme", NameOrigin::User, Some(alice), NOW)
+        .await
+        .unwrap();
+    s.delete_node(org, None, NOW + 20).await.unwrap();
+
+    let burned = s.tombstones_released_by(mallory).await.unwrap();
+    assert_eq!(
+        burned.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+        ["mallory", "google"]
+    );
+    assert_eq!(burned[0].released_by, Some(mallory));
+    assert_eq!(burned[0].user, Some(mallory));
+    assert_eq!(burned[0].cause, Some(ReleaseCause::Rename));
+    assert_eq!(burned[0].released_at, NOW);
+    assert_eq!(burned[0].parent, None);
+    let acme = s.tombstone(None, "ACME").await.unwrap().unwrap();
+    assert_eq!(acme.released_by, None);
+    assert_eq!(acme.node, Some(org));
+    assert_eq!(acme.cause, Some(ReleaseCause::Delete));
+
+    // Release only what came after a point in time...
+    assert_eq!(
+        s.release_tombstones_by(mallory, Some(NOW + 5))
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(s.tombstone(None, "google").await.unwrap().is_none());
+    // ... and the freed name is claimable again.
+    s.create_local_user("google", None, NOW + 30).await.unwrap();
+    assert_eq!(s.release_tombstones_by(mallory, None).await.unwrap(), 1);
+    // Every name mallory burned is free again (mallory now holds "rust-lang").
+    s.create_local_user("mallory", None, NOW + 30)
+        .await
+        .unwrap();
+    // One name at a time.
+    assert!(s.release_tombstone(None, "Alice").await.unwrap());
+    assert!(!s.release_tombstone(None, "alice").await.unwrap());
+    s.create_local_user("alice", None, NOW + 30).await.unwrap();
+    assert!(s.tombstones_released_by(alice).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_tombstone_cooldown_releases_old_names_on_sweep() {
+    const DAY: u64 = 24 * 60 * 60;
+    let s = store(forge()).await;
+    let (alice, _) = s.create_local_user("alice", None, NOW).await.unwrap();
+    s.rename_user(alice, "alicia", Some(alice), NOW)
+        .await
+        .unwrap();
+    // Forever by default.
+    assert_eq!(s.tombstone_cooldown(), None);
+    assert_eq!(s.sweep(NOW + 1000 * DAY).await.unwrap().tombstones, 0);
+    let s = s.with_tombstone_cooldown(Some(30 * DAY));
+    assert_eq!(s.sweep(NOW + 30 * DAY).await.unwrap().tombstones, 0);
+    assert!(matches!(
+        s.create_local_user("alice", None, NOW + 30 * DAY).await,
+        Err(StoreError::NameTombstoned)
+    ));
+    assert_eq!(s.sweep(NOW + 30 * DAY + 1).await.unwrap().tombstones, 1);
+    s.create_local_user("alice", None, NOW + 31 * DAY)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn triggers_block_raw_sql_writes_of_tombstoned_names() {
     let s = store(forge()).await;
     let (alice, _) = s.create_local_user("alice", None, NOW).await.unwrap();
-    s.rename_user(alice, "alicia", NOW).await.unwrap();
+    s.rename_user(alice, "alicia", Some(alice), NOW)
+        .await
+        .unwrap();
     let res = sqlx::query(
         "INSERT INTO forgs_ns_node (id, parent_id, kind, name, name_canonical, created_at)
          VALUES (?1, NULL, 'org', 'alice', 'alice', 0)",
@@ -1275,7 +1447,7 @@ async fn deleting_a_user_deletes_their_keys_and_tokens() {
         .await
         .unwrap();
     mint_from(&s, &hash(1), &hash(0x51)).await;
-    s.delete_user(bob, NOW).await.unwrap();
+    s.delete_user(bob, None, NOW).await.unwrap();
     assert!(s.lookup_workload(&hash(0x51)).await.unwrap().is_none());
     assert!(s.api_key_by_hash(&hash(1)).await.unwrap().is_none());
     // Not an orphaned live key: only the shell-minted one remains.
@@ -1300,7 +1472,7 @@ async fn deleting_a_user_ends_tokens_from_keys_in_their_personal_node() {
         .unwrap();
     mint_from(&s, &hash(1), &hash(0x51)).await;
     mint_from(&s, &hash(2), &hash(0x52)).await;
-    s.delete_user(bob, NOW).await.unwrap();
+    s.delete_user(bob, None, NOW).await.unwrap();
     assert!(s.lookup_workload(&hash(0x51)).await.unwrap().is_none());
     assert!(s.lookup_workload(&hash(0x52)).await.unwrap().is_none());
     assert_eq!(count(&s, "forgs_workload_token").await, 0);
@@ -1314,7 +1486,7 @@ async fn deleting_a_node_ends_tokens_from_its_keys() {
         .await
         .unwrap();
     mint_from(&s, &hash(1), &hash(0x51)).await;
-    s.delete_node(project, NOW).await.unwrap();
+    s.delete_node(project, None, NOW).await.unwrap();
     assert!(s.lookup_workload(&hash(0x51)).await.unwrap().is_none());
 }
 
@@ -1655,7 +1827,7 @@ async fn deleting_a_user_cascades_their_rows() {
         .await
         .unwrap();
 
-    s.delete_user(alice, NOW).await.unwrap();
+    s.delete_user(alice, None, NOW).await.unwrap();
     for t in [
         "forgs_identity",
         "forgs_user_email",
@@ -1712,7 +1884,7 @@ async fn deleting_a_node_cascades_and_needs_a_leaf() {
         .unwrap();
     // The personal node has a child: deleting the user is refused.
     assert!(matches!(
-        s.delete_user(alice, NOW).await,
+        s.delete_user(alice, None, NOW).await,
         Err(StoreError::HasChildren)
     ));
     let o = s
@@ -1723,14 +1895,14 @@ async fn deleting_a_node_cascades_and_needs_a_leaf() {
         .await
         .unwrap();
     assert!(matches!(
-        s.delete_node(o, NOW).await,
+        s.delete_node(o, None, NOW).await,
         Err(StoreError::HasChildren)
     ));
-    s.delete_node(p, NOW).await.unwrap();
+    s.delete_node(p, None, NOW).await.unwrap();
     assert_eq!(count(&s, "forgs_api_key").await, 0);
     assert_eq!(count(&s, "forgs_grant").await, 0);
     assert_eq!(count(&s, "forgs_membership").await, 1); // alice on her own node
-    s.delete_user(alice, NOW).await.unwrap();
+    s.delete_user(alice, None, NOW).await.unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -2202,6 +2374,7 @@ async fn sweep_removes_exactly_the_dead_rows() {
             pending_signups: 1,
             pending_devices: 2,
             audit: 0,
+            tombstones: 0,
         }
     );
     assert_eq!(s.sweep(t).await.unwrap(), SweepCounts::default());
@@ -2317,6 +2490,6 @@ async fn create_node_with_admin_is_atomic_and_capped() {
     .unwrap();
 
     // A parent with children cannot be deleted.
-    let r = s.delete_node(team, NOW).await;
+    let r = s.delete_node(team, None, NOW).await;
     assert!(matches!(r, Err(StoreError::HasChildren)), "{r:?}");
 }

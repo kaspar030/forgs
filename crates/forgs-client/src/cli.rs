@@ -176,6 +176,9 @@ pub fn describe(err: &ClientError, doing: &str) -> String {
                 "{doing} failed: the prefix matches more than one key; list the keys and use a \
                  longer prefix"
             ),
+            error_code::RATE_LIMITED => {
+                format!("{doing} failed: too many attempts recently; try again later")
+            }
             error_code::INVALID_REQUEST => {
                 format!("{doing} failed: the server refused the request as invalid")
             }
@@ -228,6 +231,7 @@ mod tests {
         };
         assert!(describe(&rej("invalid_grant"), "x").contains("login again"));
         assert!(describe(&rej("unauthorized"), "x").contains("login again"));
+        assert!(describe(&rej("rate_limited"), "x").contains("try again later"));
         assert!(describe(&rej("ambiguous_prefix"), "revoking").contains("longer prefix"));
         assert!(describe(&rej("forbidden"), "x").contains("not allowed"));
         assert!(describe(&rej("not_found"), "x").contains("no such"));

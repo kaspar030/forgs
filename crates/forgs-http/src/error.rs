@@ -157,6 +157,7 @@ impl From<StoreError> for ApiError {
             StoreError::PersonalNode | StoreError::HasChildren => ApiError::CONFLICT,
             StoreError::OwnedLimit => ApiError::NAMESPACE_LIMIT,
             StoreError::LastIdentity => ApiError::LAST_IDENTITY,
+            StoreError::ReleaseLimited => ApiError::RATE_LIMITED,
             other => {
                 tracing::warn!(error = %other, "store operation failed");
                 ApiError::Internal
@@ -216,6 +217,10 @@ mod tests {
         assert_eq!(
             ApiError::from(StoreError::LastIdentity),
             ApiError::LAST_IDENTITY
+        );
+        assert_eq!(
+            ApiError::from(StoreError::ReleaseLimited),
+            ApiError::RATE_LIMITED
         );
         assert_eq!(ApiError::LAST_IDENTITY.status(), StatusCode::CONFLICT);
         assert_eq!(ApiError::REAUTH_REQUIRED.status(), StatusCode::FORBIDDEN);

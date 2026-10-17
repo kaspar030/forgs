@@ -457,7 +457,9 @@ pub struct MemberList {
 
 /// A request to `POST /auth/rename`.
 ///
-/// The old name is tombstoned forever (docs/design.md §6, decision 5).
+/// The old name is tombstoned forever (docs/design.md §6, decision 5), so
+/// releasing root names is rate-limited: past the server's limit the request
+/// is refused with `429 rate_limited`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum RenameRequest {

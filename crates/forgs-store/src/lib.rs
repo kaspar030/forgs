@@ -46,7 +46,11 @@
 //! * **Audit rows outside any namespace** ([`Store::append_audit`]) — logins
 //!   and signups, which happen before any namespace is chosen.
 //! * **[`Store::sweep`]** — system-initiated hygiene with no caller: expired
-//!   credentials, and audit rows past [`Store::with_audit_retention`].
+//!   credentials, audit rows past [`Store::with_audit_retention`], and
+//!   tombstones past [`Store::with_tombstone_cooldown`] when one is set.
+//! * **Tombstone administration** ([`Store::tombstones_released_by`],
+//!   [`Store::release_tombstones_by`], [`Store::release_tombstone`]) —
+//!   operator tools with no end-user caller; names share one global space.
 //!
 //! [`Store::pool`] is public because apps share the database and need the pool
 //! for their own tables; writing to `forgs_` tables through it bypasses these
@@ -62,6 +66,7 @@ mod pending;
 mod scoped;
 mod sweep;
 mod tokens;
+mod tombstones;
 mod users;
 
 use std::str::FromStr as _;
@@ -79,6 +84,7 @@ pub use ns::{Membership, NsNode};
 pub use pending::{ApprovedDevice, LiveCounts, PendingDevice, PendingSignup};
 pub use scoped::{ApiKeyRow, AuditEntry, AuditRow, MemberRow, NewApiKey, NewGrant, NsScope};
 pub use sweep::SweepCounts;
+pub use tombstones::{ReleaseCause, ReleaseLimit, Tombstone, DEFAULT_RELEASE_LIMIT};
 pub use users::{Identity, NewIdentity, NewSignup, User, UserState};
 
 /// Connect options for a forgs database at `url` (`sqlite://path`,
@@ -107,6 +113,8 @@ pub struct Store {
     roles: Arc<RoleLadder>,
     app_subject_kinds: Vec<&'static str>,
     audit_retention: Option<u64>,
+    release_limit: Option<ReleaseLimit>,
+    tombstone_cooldown: Option<u64>,
 }
 
 /// How long [`Store::sweep`] keeps audit rows by default: 90 days, in
@@ -131,6 +139,8 @@ impl Store {
             roles: Arc::new(roles),
             app_subject_kinds: Vec::new(),
             audit_retention: Some(DEFAULT_AUDIT_RETENTION_SECS),
+            release_limit: Some(DEFAULT_RELEASE_LIMIT),
+            tombstone_cooldown: None,
         })
     }
 

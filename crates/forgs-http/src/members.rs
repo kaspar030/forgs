@@ -4,7 +4,8 @@
 //! the ladder's highest role (inherited roles count). A change that would
 //! leave a namespace with no direct admin is refused (`409 last_admin`) —
 //! otherwise one click orphans a tenant. Renames tombstone the old name
-//! forever.
+//! forever, so releasing root names is rate-limited per user and per renamed
+//! user / node (`429 rate_limited`; `forgs_store::Store::with_release_limit`).
 //!
 //! [`create_namespace`] creates a node and makes its creator the admin in one
 //! store transaction, optionally capped by how many such nodes the creator
@@ -207,7 +208,9 @@ pub async fn remove(
 /// # Errors
 ///
 /// `400 username_invalid`, `409 username_taken` (incl. tombstoned),
-/// `500` on storage failure.
+/// `429 rate_limited` past the store's release limit (the old name would be
+/// tombstoned; see `forgs_store::Store::with_release_limit`), `500` on
+/// storage failure.
 pub async fn rename_user(
     ctx: &AuthContext,
     user: UserId,
@@ -217,10 +220,21 @@ pub async fn rename_user(
     let old = crate::session::username_of(ctx, user)
         .await
         .unwrap_or_default();
-    ctx.store()
-        .rename_user(user, new_username, now)
-        .await
-        .map_err(store_err("rename_user"))?;
+    let r = ctx
+        .store()
+        .rename_user(user, new_username, Some(user), now)
+        .await;
+    if matches!(r, Err(StoreError::ReleaseLimited)) {
+        ctx.audit()
+            .record(
+                AuditEvent::new(now, "user.rename.limited")
+                    .subject(&SubjectKey::user(user))
+                    .target(new_username.trim().to_ascii_lowercase())
+                    .detail(format!("from {old}")),
+            )
+            .await;
+    }
+    r.map_err(store_err("rename_user"))?;
     ctx.audit()
         .record(
             AuditEvent::new(now, "user.rename")
@@ -307,7 +321,8 @@ fn delete_err(e: StoreError) -> ApiError {
 ///
 /// `403` for an unknown namespace or a non-admin, `409 conflict` for a
 /// personal node (delete the user instead), `409 not_empty` while the node
-/// has children or app data still references it.
+/// has children or app data still references it, `429 rate_limited` for a
+/// root node past the caller's release limit.
 pub async fn delete_namespace(
     ctx: &AuthContext,
     user: UserId,
@@ -321,7 +336,10 @@ pub async fn delete_namespace(
         .map_err(store_err("node"))?
         .map_or_else(|| namespace.to_owned(), |n| n.name);
     let now = ctx.now();
-    ctx.store().delete_node(ns, now).await.map_err(delete_err)?;
+    ctx.store()
+        .delete_node(ns, Some(user), now)
+        .await
+        .map_err(delete_err)?;
     ctx.audit()
         .record(
             AuditEvent::new(now, "namespace.delete")
@@ -338,7 +356,8 @@ pub async fn delete_namespace(
 /// # Errors
 ///
 /// `403` for a non-admin, `409 conflict` for a personal node (rename the
-/// user instead), the name errors of [`rename_user`].
+/// user instead), the name errors of [`rename_user`] (including
+/// `429 rate_limited` for a root node).
 pub async fn rename_namespace(
     ctx: &AuthContext,
     user: UserId,
@@ -347,10 +366,21 @@ pub async fn rename_namespace(
 ) -> Result<(), ApiError> {
     let ns = require_admin(ctx, user, namespace, "namespace.rename").await?;
     let now = ctx.now();
-    ctx.store()
-        .rename_node(ns, new_name, NameOrigin::User, now)
-        .await
-        .map_err(store_err("rename_node"))?;
+    let r = ctx
+        .store()
+        .rename_node(ns, new_name, NameOrigin::User, Some(user), now)
+        .await;
+    if matches!(r, Err(StoreError::ReleaseLimited)) {
+        ctx.audit()
+            .record(
+                AuditEvent::new(now, "namespace.rename.limited")
+                    .ns(ns)
+                    .subject(&SubjectKey::user(user))
+                    .target(new_name.trim().to_owned()),
+            )
+            .await;
+    }
+    r.map_err(store_err("rename_node"))?;
     ctx.audit()
         .record(
             AuditEvent::new(now, "namespace.rename")

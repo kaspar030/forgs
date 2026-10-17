@@ -1430,6 +1430,44 @@ async fn tombstoned_reserved_and_invalid_usernames() {
 }
 
 #[tokio::test]
+async fn rename_loops_are_rate_limited() {
+    let h = harness().await;
+    let jar = h.signup("a", "1", "a@x.example", "alice").await;
+    let rename = |name: String| {
+        let h = &h;
+        let jar = &jar;
+        async move {
+            h.post_json(
+                "/auth/rename",
+                Some(&H::session(jar)),
+                None,
+                &[],
+                &json!({"action": "user", "new_username": name}),
+            )
+            .await
+        }
+    };
+    let max = forgs_store::DEFAULT_RELEASE_LIMIT.max;
+    for i in 0..max {
+        rename(format!("alice{i}"))
+            .await
+            .expect(StatusCode::NO_CONTENT);
+    }
+    let r = rename("google".into()).await;
+    r.expect(StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(r.error(), "rate_limited");
+    assert!(h.audit.has("user.rename.limited"));
+    // The refused name was not burned.
+    assert!(h
+        .ctx
+        .store()
+        .tombstone(None, "google")
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
 async fn email_match_does_not_auto_link() {
     let h = harness().await;
     let bob = h.signup("b", "2", "bob@x.example", "bob").await;

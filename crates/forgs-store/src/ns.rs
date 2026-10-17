@@ -6,7 +6,8 @@ use forgs::{NsNodeId, Role, SubjectKey, UserId, Visibility};
 use sqlx::SqliteConnection;
 
 use crate::error::{from_ts, parse_id, ts, Result, StoreError};
-use crate::users::{check_name_free, insert_tombstone};
+use crate::tombstones::{insert_tombstone, NewTomb, ReleaseCause};
+use crate::users::check_name_free;
 use crate::{now_ms, Store};
 
 /// A namespace node.
@@ -280,17 +281,25 @@ impl Store {
     /// A personal node is refused ([`StoreError::PersonalNode`]): it is
     /// renamed with its user by [`Store::rename_user`].
     ///
+    /// `actor` is the user acting, recorded on the tombstone; renaming a
+    /// root node is subject to the release limit
+    /// ([`Store::with_release_limit`]) for that user and for the node.
+    /// `None` is the app or an operator, never limited.
+    ///
     /// # Errors
     ///
-    /// As [`Store::create_node`], plus [`StoreError::PersonalNode`].
+    /// As [`Store::create_node`], plus [`StoreError::PersonalNode`] and
+    /// [`StoreError::ReleaseLimited`].
     pub async fn rename_node(
         &self,
         node: NsNodeId,
         raw_name: &str,
         origin: NameOrigin,
+        actor: Option<UserId>,
         now: u64,
     ) -> Result<()> {
         let node_s = node.to_string();
+        let actor_s = actor.map(|a| a.to_string());
         let mut tx = self.begin().await?;
         let (kind, parent, personal) = Self::kind_of(&mut tx, &node_s).await?;
         if personal {
@@ -313,6 +322,19 @@ impl Store {
             return Ok(());
         }
         check_name_free(&mut tx, parent.as_deref(), &canonical, None, Some(&node_s)).await?;
+        let releases = crate::users::tomb_name(parent.as_deref(), &old)
+            != crate::users::tomb_name(parent.as_deref(), &canonical);
+        let tomb = NewTomb {
+            parent: parent.as_deref(),
+            canonical: &old,
+            node: Some(&node_s),
+            user: None,
+            released_by: actor_s.as_deref(),
+            cause: ReleaseCause::Rename,
+        };
+        if releases {
+            self.check_release_limit(&mut tx, &tomb, now).await?;
+        }
         sqlx::query("UPDATE forgs_ns_node SET name = ?2, name_canonical = ?3 WHERE id = ?1")
             .bind(&node_s)
             .bind(raw_name.trim())
@@ -321,18 +343,8 @@ impl Store {
             .await?;
         // At the root a case-only change keeps the same tombstone key; the
         // node still holds that name, so there is nothing to release.
-        if crate::users::tomb_name(parent.as_deref(), &old)
-            != crate::users::tomb_name(parent.as_deref(), &canonical)
-        {
-            insert_tombstone(
-                &mut tx,
-                parent.as_deref(),
-                &old,
-                Some(&node_s),
-                None,
-                ts(now)?,
-            )
-            .await?;
+        if releases {
+            insert_tombstone(&mut tx, &tomb, ts(now)?).await?;
         }
         tx.commit().await?;
         Ok(())
@@ -346,10 +358,16 @@ impl Store {
     ///
     /// [`StoreError::NotFound`], [`StoreError::HasChildren`],
     /// [`StoreError::PersonalNode`] (delete the user instead),
-    /// [`StoreError::Dangling`] if an app table still references it, or a
-    /// database error.
-    pub async fn delete_node(&self, node: NsNodeId, now: u64) -> Result<()> {
+    /// [`StoreError::Dangling`] if an app table still references it,
+    /// [`StoreError::ReleaseLimited`], or a database error.
+    ///
+    /// `actor` is the user acting, recorded on the tombstone; deleting a
+    /// root node counts against that user's release limit
+    /// ([`Store::with_release_limit`]) — create-then-delete would otherwise
+    /// burn names as well as renames do. `None` is the app or an operator.
+    pub async fn delete_node(&self, node: NsNodeId, actor: Option<UserId>, now: u64) -> Result<()> {
         let node_s = node.to_string();
+        let actor_s = actor.map(|a| a.to_string());
         let mut tx = self.begin().await?;
         let (_, parent, personal) = Self::kind_of(&mut tx, &node_s).await?;
         if personal {
@@ -360,16 +378,17 @@ impl Store {
                 .bind(&node_s)
                 .fetch_one(&mut *tx)
                 .await?;
+        let tomb = NewTomb {
+            parent: parent.as_deref(),
+            canonical: &name,
+            node: Some(&node_s),
+            user: None,
+            released_by: actor_s.as_deref(),
+            cause: ReleaseCause::Delete,
+        };
+        self.check_release_limit(&mut tx, &tomb, now).await?;
         delete_leaf_tx(&mut tx, &node_s).await?;
-        insert_tombstone(
-            &mut tx,
-            parent.as_deref(),
-            &name,
-            Some(&node_s),
-            None,
-            ts(now)?,
-        )
-        .await?;
+        insert_tombstone(&mut tx, &tomb, ts(now)?).await?;
         tx.commit().await?;
         Ok(())
     }

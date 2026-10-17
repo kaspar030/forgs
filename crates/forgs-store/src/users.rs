@@ -4,6 +4,7 @@ use forgs::{IdentityId, NsNodeId, PendingId, SubjectKey, UserId};
 use sqlx::SqliteConnection;
 
 use crate::error::{from_ts, parse_id, ts, Result, StoreError};
+use crate::tombstones::{insert_tombstone, NewTomb, ReleaseCause};
 use crate::{now_ms, Store};
 
 /// An external identity to link: `(provider, immutable subject)` plus what
@@ -202,28 +203,6 @@ pub(crate) async fn check_name_free(
     if taken {
         return Err(StoreError::NameTaken);
     }
-    Ok(())
-}
-
-pub(crate) async fn insert_tombstone(
-    conn: &mut SqliteConnection,
-    parent: Option<&str>,
-    canonical: &str,
-    node: Option<&str>,
-    user: Option<&str>,
-    now: i64,
-) -> Result<()> {
-    sqlx::query(
-        "INSERT INTO forgs_ns_tombstone (parent_key, name_canonical, node_id, user_id, released_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-    )
-    .bind(parent.unwrap_or(""))
-    .bind(tomb_name(parent, canonical))
-    .bind(node)
-    .bind(user)
-    .bind(now)
-    .execute(&mut *conn)
-    .await?;
     Ok(())
 }
 
@@ -611,13 +590,25 @@ impl Store {
     /// name with it, and a tombstone for the old name so it can never be
     /// claimed again — by anyone, the renamer included.
     ///
+    /// `actor` is the user acting (usually `user` themselves), recorded on
+    /// the tombstone and subject to the release limit
+    /// ([`Store::with_release_limit`]); `None` is the app or an operator,
+    /// recorded as such and never limited.
+    ///
     /// # Errors
     ///
-    /// [`StoreError::NotFound`], the name errors of [`Store::signup`], or a
-    /// database error.
-    pub async fn rename_user(&self, user: UserId, new_username: &str, now: u64) -> Result<()> {
+    /// [`StoreError::NotFound`], the name errors of [`Store::signup`],
+    /// [`StoreError::ReleaseLimited`], or a database error.
+    pub async fn rename_user(
+        &self,
+        user: UserId,
+        new_username: &str,
+        actor: Option<UserId>,
+        now: u64,
+    ) -> Result<()> {
         let new = self.schema.validate_username(new_username)?;
         let user_s = user.to_string();
+        let actor_s = actor.map(|a| a.to_string());
         let mut tx = self.begin().await?;
         let row: Option<(String, Option<String>)> = sqlx::query_as(
             "SELECT u.username, (SELECT n.id FROM forgs_ns_node n WHERE n.personal_of_user_id = u.id)
@@ -633,6 +624,15 @@ impl Store {
             return Ok(());
         }
         check_name_free(&mut tx, None, &new, Some(&user_s), None).await?;
+        let tomb = NewTomb {
+            parent: None,
+            canonical: &old,
+            node: personal.as_deref(),
+            user: Some(&user_s),
+            released_by: actor_s.as_deref(),
+            cause: ReleaseCause::Rename,
+        };
+        self.check_release_limit(&mut tx, &tomb, now).await?;
         sqlx::query("UPDATE forgs_user SET username = ?2 WHERE id = ?1")
             .bind(&user_s)
             .bind(&new)
@@ -645,15 +645,7 @@ impl Store {
                 .execute(&mut *tx)
                 .await?;
         }
-        insert_tombstone(
-            &mut tx,
-            None,
-            &old,
-            personal.as_deref(),
-            Some(&user_s),
-            ts(now)?,
-        )
-        .await?;
+        insert_tombstone(&mut tx, &tomb, ts(now)?).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -702,8 +694,13 @@ impl Store {
     /// transfer or delete them first) or an app table still references the
     /// user or the personal node, or a database error. Nothing is changed on
     /// error.
-    pub async fn delete_user(&self, user: UserId, now: u64) -> Result<()> {
+    ///
+    /// `actor` is recorded on the tombstone (`None`: the app or an
+    /// operator). Deleting is not release-limited: an account can be deleted
+    /// only once.
+    pub async fn delete_user(&self, user: UserId, actor: Option<UserId>, now: u64) -> Result<()> {
         let user_s = user.to_string();
+        let actor_s = actor.map(|a| a.to_string());
         let mut tx = self.begin().await?;
         let row: Option<(String, Option<String>)> = sqlx::query_as(
             "SELECT u.username, (SELECT n.id FROM forgs_ns_node n WHERE n.personal_of_user_id = u.id)
@@ -735,10 +732,14 @@ impl Store {
             .await?;
         insert_tombstone(
             &mut tx,
-            None,
-            &username,
-            personal.as_deref(),
-            Some(&user_s),
+            &NewTomb {
+                parent: None,
+                canonical: &username,
+                node: personal.as_deref(),
+                user: Some(&user_s),
+                released_by: actor_s.as_deref(),
+                cause: ReleaseCause::Delete,
+            },
             ts(now)?,
         )
         .await?;

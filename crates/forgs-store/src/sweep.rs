@@ -7,7 +7,9 @@
 //!
 //! The sweep also enforces audit retention ([`Store::with_audit_retention`],
 //! default [`crate::DEFAULT_AUDIT_RETENTION_SECS`]): `forgs_audit` is
-//! otherwise append-only and would grow without bound.
+//! otherwise append-only and would grow without bound. With a tombstone
+//! cool-down ([`Store::with_tombstone_cooldown`]) it also releases old
+//! tombstones; by default they are kept forever.
 
 use crate::error::{ts, Result};
 use crate::Store;
@@ -29,6 +31,9 @@ pub struct SweepCounts {
     pub pending_devices: u64,
     /// Audit rows older than the retention window.
     pub audit: u64,
+    /// Tombstones past the cool-down ([`Store::with_tombstone_cooldown`]);
+    /// always 0 while tombstones are kept forever (the default).
+    pub tombstones: u64,
 }
 
 impl Store {
@@ -36,7 +41,9 @@ impl Store {
     /// (`expires <= now`, matching verification's exclusive expiry), consumed
     /// single-use API keys no live workload token still references, and
     /// decided device approvals; and audit rows with `ts < now - retention`
-    /// unless retention is `None` ([`Store::with_audit_retention`]).
+    /// unless retention is `None` ([`Store::with_audit_retention`]); and, when
+    /// a cool-down is set ([`Store::with_tombstone_cooldown`]), tombstones with
+    /// `released_at < now - cooldown`.
     ///
     /// Workload tokens are swept before API keys, so a consumed key whose
     /// tokens all just expired goes in the same pass. A consumed key is kept
@@ -47,6 +54,10 @@ impl Store {
     ///
     /// A database error; statements already run stay applied.
     pub async fn sweep(&self, now: u64) -> Result<SweepCounts> {
+        let tomb_cutoff = self
+            .tombstone_cooldown
+            .map(|keep| ts(now.saturating_sub(keep)))
+            .transpose()?;
         let audit_cutoff = self
             .audit_retention
             .map(|keep| ts(now.saturating_sub(keep)))
@@ -84,6 +95,16 @@ impl Store {
                     .execute(&self.pool)
                     .await?
                     .rows_affected(),
+                None => 0,
+            },
+            tombstones: match tomb_cutoff {
+                Some(cutoff) => {
+                    sqlx::query("DELETE FROM forgs_ns_tombstone WHERE released_at < ?1")
+                        .bind(cutoff)
+                        .execute(&self.pool)
+                        .await?
+                        .rows_affected()
+                }
                 None => 0,
             },
         })

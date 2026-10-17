@@ -191,8 +191,26 @@ forgs_membership { ns_node_id, subject (SubjectKey), user_id NULL, role }
   previous holder. Otherwise renaming lets someone squat the old path and
   receive traffic (the same class of issue as GitHub login reuse). The
   tombstone keeps the old node id, so a redirect from the old path can be
-  added without a schema change. Relaxing this to a cool-down is a config
-  change, not a redesign.
+  added without a schema change.
+- **Releasing root names is rate-limited** (security audit 2026-10,
+  HTTP-07). Because tombstones are permanent, an unlimited rename loop would
+  let one account burn every free root name (`google`, `rust-lang`, …) for
+  everyone. `Store::with_release_limit` (default 5 per 30 days) refuses a
+  root-name release — renaming oneself, renaming or deleting a root node —
+  once the acting user released that many root names inside the window, or
+  once the renamed user / root node was renamed that many times (whoever
+  acted). The HTTP layer answers `429 rate_limited` and audits
+  `user.rename.limited` / `namespace.rename.limited`. Names below the root
+  are not limited: only the parent's admins can touch them, so burning them
+  harms only that namespace. The app / an operator (`actor = None`) is never
+  limited.
+- **Every tombstone records its actor and cause** (`released_by`, `cause`:
+  `rename` / `delete`). Operators undo abuse with
+  `Store::tombstones_released_by` (review), `Store::release_tombstones_by`
+  (bulk, optionally since a time) and `Store::release_tombstone` (one name).
+- **Cool-down variant**: `Store::with_tombstone_cooldown(Some(secs))` makes
+  `Store::sweep` delete tombstones older than `secs`, relaxing "forever" to a
+  cool-down. Off by default; it re-opens squatting after the cool-down.
 
 ## 3. Principals and credentials
 
@@ -400,6 +418,7 @@ running their own migrator.
 2. Login is external only: GitHub, Codeberg/Forgejo, GitLab, generic OIDC.
 3. Identities are keyed by `(provider, provider_subject)`; usernames are
    chosen locally.
-4. Renames are allowed; released names are blocked forever.
+4. Renames are allowed; released names are blocked forever (unless a
+   cool-down is configured), and root-name releases are rate-limited.
 5. Teams are not implemented.
 6. One workspace in this repo; apps consume it via a path/git dependency.

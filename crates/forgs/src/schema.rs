@@ -47,7 +47,7 @@
 //!
 //! Collision with existing siblings (root-level kinds share the root name
 //! space), and with **tombstoned** released names, which are blocked forever
-//! (docs/design.md §2), are storage concerns: `forgs-store` enforces them
+//! unless the store sets a cool-down (docs/design.md §2), are storage concerns: `forgs-store` enforces them
 //! transactionally on every creation and rename path.
 
 use std::collections::BTreeMap;

@@ -20,9 +20,15 @@ pub enum StoreError {
     /// The name is held by a sibling node or, at the root, by a user.
     #[error("name is taken")]
     NameTaken,
-    /// The name was released earlier and is blocked forever.
+    /// The name was released earlier and is blocked (forever, unless a
+    /// cool-down is configured).
     #[error("name was released and cannot be claimed again")]
     NameTombstoned,
+    /// Releasing this name would exceed the store's release limit: the
+    /// acting user released too many root names recently, or this user /
+    /// root node was renamed too often (see [`crate::Store::with_release_limit`]).
+    #[error("too many names released recently; try again later")]
+    ReleaseLimited,
     /// The schema does not allow this kind under this parent.
     #[error("a {kind:?} node cannot be placed under {parent_kind:?}")]
     BadPlacement {
