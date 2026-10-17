@@ -594,9 +594,6 @@ impl Store {
         let Some((username, personal)) = row else {
             return Err(StoreError::NotFound);
         };
-        if let Some(node) = &personal {
-            crate::ns::delete_leaf_tx(&mut tx, node).await?;
-        }
         sqlx::query(
             "DELETE FROM forgs_workload_token WHERE api_key_id IN (
                  SELECT id FROM forgs_api_key WHERE created_by = ?1)",
@@ -608,6 +605,9 @@ impl Store {
             .bind(&user_s)
             .execute(&mut *tx)
             .await?;
+        if let Some(node) = &personal {
+            crate::ns::delete_leaf_tx(&mut tx, node).await?;
+        }
         sqlx::query("DELETE FROM forgs_user WHERE id = ?1")
             .bind(&user_s)
             .execute(&mut *tx)

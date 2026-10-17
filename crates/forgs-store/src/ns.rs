@@ -78,7 +78,8 @@ fn node_from_row(r: NodeRow) -> Result<NsNode> {
     })
 }
 
-/// Delete a leaf node inside a transaction (no tombstone; callers add it).
+/// Delete a leaf node inside a transaction (no tombstone; callers add it),
+/// with the workload tokens minted from its API keys.
 pub(crate) async fn delete_leaf_tx(conn: &mut SqliteConnection, node: &str) -> Result<()> {
     let (children,): (bool,) =
         sqlx::query_as("SELECT EXISTS (SELECT 1 FROM forgs_ns_node WHERE parent_id = ?1)")
@@ -88,6 +89,15 @@ pub(crate) async fn delete_leaf_tx(conn: &mut SqliteConnection, node: &str) -> R
     if children {
         return Err(StoreError::HasChildren);
     }
+    // The node's keys cascade with it; the workload tokens minted from them
+    // carry no foreign key, so end them explicitly first.
+    sqlx::query(
+        "DELETE FROM forgs_workload_token WHERE api_key_id IN (
+             SELECT id FROM forgs_api_key WHERE ns_node_id = ?1)",
+    )
+    .bind(node)
+    .execute(&mut *conn)
+    .await?;
     sqlx::query("DELETE FROM forgs_ns_node WHERE id = ?1")
         .bind(node)
         .execute(&mut *conn)
@@ -329,7 +339,8 @@ impl Store {
     }
 
     /// Delete a leaf node, tombstoning its name. Memberships, API keys,
-    /// grants and pending approvals bound to it cascade.
+    /// grants and pending approvals bound to it cascade, and the workload
+    /// tokens minted from its keys are deleted.
     ///
     /// # Errors
     ///

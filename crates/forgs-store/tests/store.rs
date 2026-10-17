@@ -1171,6 +1171,40 @@ async fn deleting_a_user_deletes_their_keys_and_tokens() {
 }
 
 #[tokio::test]
+async fn deleting_a_user_ends_tokens_from_keys_in_their_personal_node() {
+    let s = store(fleet()).await;
+    let (bob, personal) = s.create_local_user("bob", None, NOW).await.unwrap();
+    let personal = personal.unwrap();
+    s.scoped(personal)
+        .insert_api_key(&bobs_key(hash(1), bob, false), NOW)
+        .await
+        .unwrap();
+    // A shell-minted key in the same node: its tokens die with the node too.
+    s.scoped(personal)
+        .insert_api_key(&key(hash(2), false, None), NOW)
+        .await
+        .unwrap();
+    mint_from(&s, &hash(1), &hash(0x51)).await;
+    mint_from(&s, &hash(2), &hash(0x52)).await;
+    s.delete_user(bob, NOW).await.unwrap();
+    assert!(s.lookup_workload(&hash(0x51)).await.unwrap().is_none());
+    assert!(s.lookup_workload(&hash(0x52)).await.unwrap().is_none());
+    assert_eq!(count(&s, "forgs_workload_token").await, 0);
+}
+
+#[tokio::test]
+async fn deleting_a_node_ends_tokens_from_its_keys() {
+    let (s, bob, _, project) = creator_fixture().await;
+    s.scoped(project)
+        .insert_api_key(&bobs_key(hash(1), bob, false), NOW)
+        .await
+        .unwrap();
+    mint_from(&s, &hash(1), &hash(0x51)).await;
+    s.delete_node(project, NOW).await.unwrap();
+    assert!(s.lookup_workload(&hash(0x51)).await.unwrap().is_none());
+}
+
+#[tokio::test]
 async fn revoking_a_key_deletes_its_workload_tokens() {
     let (s, bob, _, project) = creator_fixture().await;
     let scope = s.scoped(project);
