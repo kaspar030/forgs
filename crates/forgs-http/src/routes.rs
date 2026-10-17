@@ -658,9 +658,12 @@ async fn session_logout(
 
 async fn device_start(
     State(ctx): State<AuthContext>,
+    headers: HeaderMap,
+    ext: axum::http::Extensions,
     JsonBody(_req): JsonBody<DeviceStartRequest>,
 ) -> Response {
-    match device::start(&ctx, None, None).await {
+    let source = ctx.client_ip(&headers, &ext);
+    match device::start(&ctx, None, source).await {
         Ok(r) => Json(r).into_response(),
         Err(e) => e.into_response(),
     }
@@ -677,29 +680,15 @@ async fn device_poll(
     }
 }
 
-/// `GET /auth/device[?code=…]`. The code is only reflected after
-/// normalisation (so only the code alphabet can appear), and only pre-fills
-/// the form: approval always takes an explicit, CSRF-checked POST.
-async fn device_page(
-    State(ctx): State<AuthContext>,
-    headers: HeaderMap,
-    RawQuery(q): RawQuery,
-) -> Response {
-    let q = query_map(q);
-    let code = q
-        .get("code")
-        .and_then(|c| forgs::user_code::normalise(c))
-        .map(|c| forgs::user_code::display(&c))
-        .unwrap_or_default();
+/// `GET /auth/device`. Any `?code=` is ignored: the page never pre-fills a
+/// code, so a phished link cannot reduce approval to one click. The user
+/// types the code their device shows, reviews when and where it asked, and
+/// only then approves, each step a CSRF-checked POST.
+async fn device_page(State(ctx): State<AuthContext>, headers: HeaderMap) -> Response {
     let Some(caller) = optional_caller(&ctx, &headers).await else {
-        let here = if code.is_empty() {
-            ctx.path("/auth/device")
-        } else {
-            ctx.path(&format!("/auth/device?code={code}"))
-        };
         return login_links(
             &ctx,
-            Some(&here),
+            Some(&ctx.path("/auth/device")),
             "Log in to confirm the device. You will come back here afterwards.",
         );
     };
@@ -710,25 +699,52 @@ async fn device_page(
     html::device_form(
         &ctx.path("/auth/device"),
         &username,
-        &code,
         &csrf_token(&ctx, caller.auth.hash.as_str()),
     )
 }
 
+fn device_error(e: &ApiError) -> Response {
+    let text = match e {
+        ApiError::BadRequest => "That is not a valid code.",
+        ApiError::NotFound => {
+            "No pending device login has that code. It may have expired or already been used."
+        }
+        _ if *e == ApiError::RATE_LIMITED => "Too many wrong codes. Try again later.",
+        _ => "Something went wrong. Please try again.",
+    };
+    html::message(e.status(), "Device login", text)
+}
+
+/// `POST /auth/device`: `action=review` shows the device's details,
+/// `approve` / `deny` decide (a deny also cancels the user's own
+/// not-yet-redeemed approval).
 async fn device_submit(
     State(ctx): State<AuthContext>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     let form = form_map(&body);
-    let caller = match form_caller(&ctx, &headers, form.get("csrf").map(String::as_str)).await {
+    let csrf = form.get("csrf").map(String::as_str);
+    let caller = match form_caller(&ctx, &headers, csrf).await {
         Ok(c) => c,
         Err(r) => return r,
     };
     let Some(user) = caller.user_id() else {
         return ApiError::Forbidden.into_response();
     };
+    let code = form.get("code").map_or("", String::as_str);
+    let csrf = csrf.unwrap_or_default();
+    let action = ctx.path("/auth/device");
     let approve = match form.get("action").map(String::as_str) {
+        Some("review") => {
+            return match device::review(&ctx, user, code).await {
+                Ok(info) => {
+                    let username = session::username_of(&ctx, user).await.unwrap_or_default();
+                    html::device_confirm(&action, &username, &info, csrf)
+                }
+                Err(e) => device_error(&e),
+            };
+        }
         Some("approve") => true,
         Some("deny") => false,
         _ => {
@@ -739,27 +755,14 @@ async fn device_submit(
             )
         }
     };
-    let code = form.get("code").map_or("", String::as_str);
     match device::decide(&ctx, user, code, None, approve).await {
-        Ok(()) if approve => html::message(
-            StatusCode::OK,
-            "Device approved",
-            "The device is now logged in. You can return to your terminal.",
-        ),
+        Ok(()) if approve => html::device_approved(&action, code, csrf),
         Ok(()) => html::message(
             StatusCode::OK,
             "Device denied",
             "The device login was denied.",
         ),
-        Err(e) => {
-            let text = match e {
-                ApiError::BadRequest => "That is not a valid code.",
-                ApiError::NotFound => "No pending device login has that code. It may have expired.",
-                _ if e == ApiError::CONFLICT => "That code was already used.",
-                _ => "Something went wrong. Please try again.",
-            };
-            html::message(e.status(), "Device login", text)
-        }
+        Err(e) => device_error(&e),
     }
 }
 

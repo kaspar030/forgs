@@ -76,7 +76,7 @@ pub use credentials::{ConsumedApiKey, ConsumedSession, GrantRow};
 pub use error::StoreError;
 pub use migrate::{migrate, SCHEMA_VERSION};
 pub use ns::{Membership, NsNode};
-pub use pending::{ApprovedDevice, PendingDevice, PendingSignup};
+pub use pending::{ApprovedDevice, LiveCounts, PendingDevice, PendingSignup};
 pub use scoped::{ApiKeyRow, AuditEntry, AuditRow, MemberRow, NewApiKey, NewGrant, NsScope};
 pub use sweep::SweepCounts;
 pub use users::{Identity, NewIdentity, NewSignup, User, UserState};

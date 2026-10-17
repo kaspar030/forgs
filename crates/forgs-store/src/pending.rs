@@ -80,6 +80,17 @@ impl PendingDevice {
     }
 }
 
+/// Live device approvals, as [`Store::live_pending_device_counts`] reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LiveCounts {
+    /// CLI logins (no payload).
+    pub logins: u64,
+    /// App approvals (with a payload).
+    pub approvals: u64,
+    /// Either kind, from the asked-for source.
+    pub from_source: u64,
+}
+
 /// An approved device approval, just redeemed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApprovedDevice {
@@ -318,6 +329,35 @@ impl Store {
         Ok(from_ts(n))
     }
 
+    /// Live device approvals split by kind, plus how many came from `source`
+    /// (the per-source bucket key stored in `source_ip`): the ceilings an
+    /// unauthenticated start route enforces, in one read.
+    ///
+    /// # Errors
+    ///
+    /// A database error.
+    pub async fn live_pending_device_counts(
+        &self,
+        now: u64,
+        source: Option<&str>,
+    ) -> Result<LiveCounts> {
+        let (logins, approvals, from_source): (i64, i64, i64) = sqlx::query_as(
+            "SELECT COALESCE(SUM(payload IS NULL), 0),
+                    COALESCE(SUM(payload IS NOT NULL), 0),
+                    COALESCE(SUM(source_ip IS NOT NULL AND source_ip = ?2), 0)
+               FROM forgs_pending_device WHERE consumed_at IS NULL AND expires > ?1",
+        )
+        .bind(ts(now)?)
+        .bind(source)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(LiveCounts {
+            logins: from_ts(logins),
+            approvals: from_ts(approvals),
+            from_source: from_ts(from_source),
+        })
+    }
+
     /// A live (unexpired) device approval by normalised user code. Decided
     /// rows are returned so the caller can report their state; expired and
     /// unknown are both `None`.
@@ -395,16 +435,24 @@ impl Store {
     /// Deny, permanently: "consumed without ever being approved". Same
     /// conditional shape as approval.
     ///
+    /// A row `by` approved but that has not been redeemed yet can also be
+    /// denied (a retracted mistake): the approval is cleared, so the row
+    /// reads as denied and the poll reports `denied`. Nobody else can
+    /// retract someone's approval.
+    ///
     /// # Errors
     ///
     /// A database error.
-    pub async fn deny_pending_device(&self, code: &str, now: u64) -> Result<bool> {
+    pub async fn deny_pending_device(&self, code: &str, by: UserId, now: u64) -> Result<bool> {
         let n = sqlx::query(
-            "UPDATE forgs_pending_device SET consumed_at = ?2
-              WHERE user_code = ?1 AND approved_at IS NULL AND consumed_at IS NULL AND expires > ?2",
+            "UPDATE forgs_pending_device
+                SET consumed_at = ?2, approved_at = NULL, approved_by = NULL, ns_node_id = NULL
+              WHERE user_code = ?1 AND consumed_at IS NULL AND expires > ?2
+                AND (approved_at IS NULL OR approved_by = ?3)",
         )
         .bind(code)
         .bind(ts(now)?)
+        .bind(by.to_string())
         .execute(&self.pool)
         .await?
         .rows_affected();

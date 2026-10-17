@@ -6,15 +6,17 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use axum::http::{Extensions, HeaderMap, HeaderName};
 use forgs::store::{
     ApiKeyRecord, AppRecord, DeviceSecretRecord, RefreshRecord, SessionRecord, WorkloadRecord,
 };
-use forgs::{AppKind, TokenFormat, TokenHash, TokenStore};
+use forgs::{AppKind, TokenFormat, TokenHash, TokenStore, UserId};
 use forgs_idp::{IdentityProvider, WorkloadIssuer};
 use forgs_store::Store;
 use hmac::{Hmac, KeyInit as _, Mac as _};
@@ -277,8 +279,109 @@ pub(crate) struct Inner {
     pub(crate) app_tokens: Option<Arc<dyn AppTokenLookup>>,
     pub(crate) post_login_redirect: String,
     pub(crate) max_pending_devices: u64,
-    /// Last poll time per device-secret hash, for `slow_down`.
-    pub(crate) poll_log: Mutex<HashMap<String, u64>>,
+    pub(crate) max_pending_approvals: u64,
+    pub(crate) max_pending_devices_per_source: u64,
+    pub(crate) client_ip: Arc<dyn ClientIp>,
+    /// Poll state per device-secret hash, for `slow_down`.
+    pub(crate) poll_log: Mutex<HashMap<String, PollState>>,
+    /// Wrong user codes per user, for the guessing lockout.
+    pub(crate) decide_misses: Mutex<HashMap<UserId, MissWindow>>,
+}
+
+/// A live device flow's poll pacing (see [`crate::device`]).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PollState {
+    /// Last accepted-or-refused poll, epoch seconds.
+    pub(crate) last: u64,
+    /// The interval the poller must now keep.
+    pub(crate) interval: u64,
+}
+
+/// A user's wrong-code count in the current window.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MissWindow {
+    pub(crate) count: u32,
+    pub(crate) start: u64,
+}
+
+/// How the unauthenticated device-start route learns who is calling, for the
+/// per-source cap and the source shown on the confirm page.
+///
+/// forgs never trusts a forwarding header by default ([`NoClientIp`]
+/// ignores headers). An app behind a reverse proxy configures
+/// [`ForwardedFor`] with the number of proxies it trusts; an app that owns
+/// its listener inserts [`PeerIp`] into the request extensions (e.g. a
+/// one-line middleware over axum's `ConnectInfo<SocketAddr>`), which every
+/// built-in resolver prefers to read.
+pub trait ClientIp: Send + Sync + 'static {
+    /// The caller's address, or `None` if unknown.
+    fn client_ip(&self, headers: &HeaderMap, ext: &Extensions) -> Option<IpAddr>;
+}
+
+/// The peer address of the connection, inserted into the request
+/// extensions by the app (forgs-http cannot name `ConnectInfo` itself).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerIp(pub IpAddr);
+
+/// The default: the [`PeerIp`] extension if the app inserted one, else
+/// unknown. Never reads a header.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoClientIp;
+
+impl ClientIp for NoClientIp {
+    fn client_ip(&self, _headers: &HeaderMap, ext: &Extensions) -> Option<IpAddr> {
+        ext.get::<PeerIp>().map(|p| p.0)
+    }
+}
+
+/// Behind `trusted_hops` + 1 reverse proxies that each append to a
+/// comma-separated header such as `X-Forwarded-For`: the entry
+/// `trusted_hops` places from the right is the one the outermost trusted
+/// proxy saw. `trusted_hops: 0` means one proxy, which wrote the last entry.
+/// Anything further left is client-supplied and never read. A missing or
+/// unparseable entry is unknown, not the [`PeerIp`] (which would be the
+/// proxy).
+#[derive(Debug, Clone)]
+pub struct ForwardedFor {
+    /// The header (e.g. `x-forwarded-for`).
+    pub header: HeaderName,
+    /// Proxies in front of the outermost one that appends.
+    pub trusted_hops: usize,
+}
+
+impl ClientIp for ForwardedFor {
+    fn client_ip(&self, headers: &HeaderMap, _ext: &Extensions) -> Option<IpAddr> {
+        // Several header lines are one list, in order.
+        let joined = headers
+            .get_all(&self.header)
+            .iter()
+            .map(|v| v.to_str().ok())
+            .collect::<Option<Vec<_>>>()?
+            .join(",");
+        let entry = joined.rsplit(',').nth(self.trusted_hops)?.trim();
+        entry
+            .parse::<IpAddr>()
+            .ok()
+            .or_else(|| entry.parse::<std::net::SocketAddr>().ok().map(|a| a.ip()))
+    }
+}
+
+/// The bucket a source address counts against: an IPv4 address itself
+/// (also when IPv4-mapped), an IPv6 address's `/64` (one host commonly owns
+/// a whole /64, so per-address limits there mean nothing).
+#[must_use]
+pub fn source_key(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return v4.to_string();
+            }
+            let s = v6.segments();
+            let net = std::net::Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0);
+            format!("{net}/64")
+        }
+    }
 }
 
 /// The auth surface's configuration and collaborators. Cheap to clone.
@@ -330,6 +433,9 @@ impl AuthContext {
             app_tokens: None,
             post_login_redirect: "/".to_owned(),
             max_pending_devices: 1024,
+            max_pending_approvals: 1024,
+            max_pending_devices_per_source: 32,
+            client_ip: Arc::new(NoClientIp),
         }
     }
 
@@ -425,6 +531,13 @@ impl AuthContext {
         &self.inner.approvals
     }
 
+    /// The caller's address per the configured [`ClientIp`] resolver, for an
+    /// app's own unauthenticated start route.
+    #[must_use]
+    pub fn client_ip(&self, headers: &HeaderMap, ext: &Extensions) -> Option<IpAddr> {
+        self.inner.client_ip.client_ip(headers, ext)
+    }
+
     /// Where a browser lands after login when no `return_to` was given.
     #[must_use]
     pub fn post_login_redirect(&self) -> &str {
@@ -494,6 +607,9 @@ pub struct AuthContextBuilder {
     app_tokens: Option<Arc<dyn AppTokenLookup>>,
     post_login_redirect: String,
     max_pending_devices: u64,
+    max_pending_approvals: u64,
+    max_pending_devices_per_source: u64,
+    client_ip: Arc<dyn ClientIp>,
 }
 
 impl fmt::Debug for AuthContextBuilder {
@@ -617,11 +733,38 @@ impl AuthContextBuilder {
         self
     }
 
-    /// Ceiling on live device approvals an unauthenticated caller can create
-    /// (default 1024).
+    /// Ceiling on live CLI device logins an unauthenticated caller can
+    /// create (default 1024). App approvals have their own ceiling
+    /// ([`Self::max_pending_approvals`]), so flooding one kind does not
+    /// lock out the other.
     #[must_use]
     pub fn max_pending_devices(mut self, n: u64) -> Self {
         self.max_pending_devices = n;
+        self
+    }
+
+    /// Ceiling on live app pending approvals
+    /// ([`crate::device::start_pending_approval`]; default 1024).
+    #[must_use]
+    pub fn max_pending_approvals(mut self, n: u64) -> Self {
+        self.max_pending_approvals = n;
+        self
+    }
+
+    /// Ceiling on live device flows (both kinds) from one source (default
+    /// 32; `u64::MAX` disables). Only enforced when the source is known: see
+    /// [`Self::client_ip`].
+    #[must_use]
+    pub fn max_pending_devices_per_source(mut self, n: u64) -> Self {
+        self.max_pending_devices_per_source = n;
+        self
+    }
+
+    /// How the device-start route learns the caller's address (default
+    /// [`NoClientIp`]: the [`PeerIp`] extension if present, never a header).
+    #[must_use]
+    pub fn client_ip(mut self, resolver: impl ClientIp) -> Self {
+        self.client_ip = Arc::new(resolver);
         self
     }
 
@@ -709,7 +852,11 @@ impl AuthContextBuilder {
                 app_tokens: self.app_tokens,
                 post_login_redirect: self.post_login_redirect,
                 max_pending_devices: self.max_pending_devices,
+                max_pending_approvals: self.max_pending_approvals,
+                max_pending_devices_per_source: self.max_pending_devices_per_source,
+                client_ip: self.client_ip,
                 poll_log: Mutex::new(HashMap::new()),
+                decide_misses: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -874,5 +1021,36 @@ mod tests {
         assert_eq!(c.now(), 15);
         c.set(3);
         assert_eq!(c.now(), 3);
+    }
+
+    #[test]
+    fn source_keys_bucket_v6_by_64() {
+        let k = |s: &str| source_key(s.parse().unwrap());
+        assert_eq!(k("10.1.2.3"), "10.1.2.3");
+        assert_eq!(k("::ffff:10.1.2.3"), "10.1.2.3");
+        assert_eq!(k("2001:db8:1:2:aaaa::1"), "2001:db8:1:2::/64");
+        assert_eq!(k("2001:db8:1:2:bbbb::9"), "2001:db8:1:2::/64");
+        assert_ne!(k("2001:db8:1:3::1"), k("2001:db8:1:2::1"));
+    }
+
+    #[test]
+    fn forwarded_for_reads_only_trusted_entries() {
+        let mut h = HeaderMap::new();
+        let ext = Extensions::new();
+        h.append("x-forwarded-for", "6.6.6.6, 1.1.1.1".parse().unwrap());
+        h.append("x-forwarded-for", "2.2.2.2".parse().unwrap());
+        let ff = |hops| ForwardedFor {
+            header: HeaderName::from_static("x-forwarded-for"),
+            trusted_hops: hops,
+        };
+        let ip = |s: &str| Some(s.parse::<IpAddr>().unwrap());
+        assert_eq!(ff(0).client_ip(&h, &ext), ip("2.2.2.2"));
+        assert_eq!(ff(1).client_ip(&h, &ext), ip("1.1.1.1"));
+        assert_eq!(ff(5).client_ip(&h, &ext), None);
+        assert_eq!(ff(0).client_ip(&HeaderMap::new(), &ext), None);
+        let mut ext = Extensions::new();
+        ext.insert(PeerIp(ip("9.9.9.9").unwrap()));
+        assert_eq!(NoClientIp.client_ip(&h, &ext), ip("9.9.9.9"));
+        assert_eq!(NoClientIp.client_ip(&h, &Extensions::new()), None);
     }
 }

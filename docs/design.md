@@ -337,6 +337,30 @@ CLI  POST /auth/device/poll { device_secret } → pending | slow_down | denied |
 This makes CLI login provider-agnostic, and the username choice happens in
 the browser only. forgs therefore needs a browser-reachable `public_url`.
 
+The start route is unauthenticated, so it is bounded. Live CLI logins and live
+app approvals have separate ceilings (`max_pending_devices`,
+`max_pending_approvals`), and one source may hold at most
+`max_pending_devices_per_source` live flows. The source comes from the app's
+`ClientIp` hook: `NoClientIp` by default, which reads only a `PeerIp`
+extension the app inserts, or `ForwardedFor` with an explicit number of
+trusted proxy hops. IPv6 counts per /64. The source is stored in the row's
+`source_ip` column (the migration's "advisory" comment predates this). When
+the source is unknown, only the global ceilings apply.
+
+A poll sooner than the interval is answered `slow_down` without a database
+read, and the interval grows by 5s, up to 60s (RFC 8628 §3.5). A well-formed
+but unknown device secret polls as `expired`. Only a non-device-secret or an
+already-redeemed one is `401 invalid_grant`.
+
+On the browser side, the page never pre-fills the code and the start response
+has no `verification_uri_complete`. The user types the code, reviews when and
+from where the device asked, then approves or denies. An unknown, expired or
+already-decided code is one `404`, audited `device.decide.unknown`. Ten misses
+within the flow TTL lock the user out (`429 rate_limited`). The approver can
+cancel an approval until the device redeems it. Poll pacing and the miss
+counter are in-memory and per-process: they are load and nuisance controls,
+not security boundaries.
+
 ## 5. Crate layout
 
 ```

@@ -1513,7 +1513,7 @@ async fn token_store_lookups_round_trip() {
             .id,
         pid
     );
-    s.deny_pending_device(&code, NOW).await.unwrap();
+    s.deny_pending_device(&code, alice, NOW).await.unwrap();
     assert!(s.lookup_device_secret(&dev.hash()).await.unwrap().is_none());
 
     // Deletions.
@@ -1923,12 +1923,14 @@ async fn device_approval_state_machine() {
         .approve_pending_device(&code, ns, alice, NOW)
         .await
         .unwrap());
-    // Approval is exactly once, and cannot then be denied.
+    // Approval is exactly once, and cannot then be denied by anyone but
+    // the approver.
     assert!(!s
         .approve_pending_device(&code, None, alice, NOW)
         .await
         .unwrap());
-    assert!(!s.deny_pending_device(&code, NOW).await.unwrap());
+    let (bob, _) = s.create_local_user("bob", None, NOW).await.unwrap();
+    assert!(!s.deny_pending_device(&code, bob, NOW).await.unwrap());
     let row = s.pending_device_by_code(&code, NOW).await.unwrap().unwrap();
     assert!(row.is_approved());
     let got = s
@@ -1946,13 +1948,42 @@ async fn device_approval_state_machine() {
         .unwrap()
         .is_none());
     assert_eq!(s.live_pending_device_count(NOW).await.unwrap(), 0);
+    // A redeemed row cannot be retracted, even by its approver.
+    assert!(!s.deny_pending_device(&code, alice, NOW).await.unwrap());
+
+    // The approver can retract an unredeemed approval: it reads as denied
+    // and can no longer be redeemed.
+    let (_, code_r) = s
+        .insert_pending_device(|| "RRRRRRRR".into(), &hash(9), None, None, NOW, exp)
+        .await
+        .unwrap();
+    assert!(s
+        .approve_pending_device(&code_r, None, alice, NOW)
+        .await
+        .unwrap());
+    assert!(s.deny_pending_device(&code_r, alice, NOW).await.unwrap());
+    let row = s
+        .pending_device_by_hash(&hash(9), NOW)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(row.is_denied());
+    assert_eq!(
+        (row.approved_by, row.approved_at, row.ns),
+        (None, None, None)
+    );
+    assert!(s
+        .consume_pending_device(&hash(9), NOW)
+        .await
+        .unwrap()
+        .is_none());
 
     // Denial is final.
     let (_, code2) = s
         .insert_pending_device(|| "BBBBBBBB".into(), &hash(2), None, None, NOW, exp)
         .await
         .unwrap();
-    assert!(s.deny_pending_device(&code2, NOW).await.unwrap());
+    assert!(s.deny_pending_device(&code2, alice, NOW).await.unwrap());
     assert!(s
         .pending_device_by_hash(&hash(2), NOW)
         .await
@@ -1983,7 +2014,7 @@ async fn device_approval_state_machine() {
         .approve_pending_device(&code3, None, alice, exp)
         .await
         .unwrap());
-    assert!(!s.deny_pending_device(&code3, exp).await.unwrap());
+    assert!(!s.deny_pending_device(&code3, alice, exp).await.unwrap());
     assert!(s
         .approve_pending_device(&code3, None, alice, exp - 1)
         .await
@@ -1993,6 +2024,72 @@ async fn device_approval_state_machine() {
         .await
         .unwrap()
         .is_none());
+
+    // Live counts split by kind and by source.
+    let c = s
+        .live_pending_device_counts(NOW, Some("10.0.0.1"))
+        .await
+        .unwrap();
+    assert_eq!(
+        c,
+        forgs_store::LiveCounts {
+            logins: 1,
+            approvals: 0,
+            from_source: 0
+        }
+    );
+    s.insert_pending_device(
+        || "SSSSSSS1".into(),
+        &hash(21),
+        Some("{}"),
+        Some("10.0.0.1"),
+        NOW,
+        exp,
+    )
+    .await
+    .unwrap();
+    s.insert_pending_device(
+        || "SSSSSSS2".into(),
+        &hash(22),
+        None,
+        Some("10.0.0.1"),
+        NOW,
+        exp,
+    )
+    .await
+    .unwrap();
+    s.insert_pending_device(
+        || "SSSSSSS3".into(),
+        &hash(23),
+        None,
+        Some("10.0.0.2"),
+        NOW,
+        exp,
+    )
+    .await
+    .unwrap();
+    let c = s
+        .live_pending_device_counts(NOW, Some("10.0.0.1"))
+        .await
+        .unwrap();
+    assert_eq!(
+        c,
+        forgs_store::LiveCounts {
+            logins: 3,
+            approvals: 1,
+            from_source: 2
+        }
+    );
+    let c = s.live_pending_device_counts(NOW, None).await.unwrap();
+    assert_eq!((c.logins, c.approvals, c.from_source), (3, 1, 0));
+    let c = s
+        .live_pending_device_counts(exp, Some("10.0.0.1"))
+        .await
+        .unwrap();
+    assert_eq!(c, forgs_store::LiveCounts::default());
+    for code in ["SSSSSSS1", "SSSSSSS2", "SSSSSSS3"] {
+        s.deny_pending_device(code, alice, NOW).await.unwrap();
+    }
 
     // Code collisions are retried; three in a row surface.
     let mut codes = ["AAAAAAAA", "BBBBBBBB", "DDDDDDDD"].into_iter();
@@ -2089,7 +2186,7 @@ async fn sweep_removes_exactly_the_dead_rows() {
     s.insert_pending_device(|| "BBBBBBBB".into(), &hash(12), None, None, NOW, t + 9)
         .await
         .unwrap();
-    s.deny_pending_device("BBBBBBBB", NOW).await.unwrap(); // dead (decided)
+    s.deny_pending_device("BBBBBBBB", alice, NOW).await.unwrap(); // dead (decided)
     s.insert_pending_device(|| "CCCCCCCC".into(), &hash(13), None, None, NOW, t + 9)
         .await
         .unwrap();

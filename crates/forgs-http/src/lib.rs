@@ -57,8 +57,8 @@ pub use auth::{
     Carrier, CarrierSpec, CookieOk, HeaderOnly, SessionOnly, SessionOrWorkload,
 };
 pub use context::{
-    AuthContext, AuthContextBuilder, Clock, ConfigError, CookieNames, CsrfKey, FixedClock,
-    SystemClock, Ttls,
+    source_key, AuthContext, AuthContextBuilder, ClientIp, Clock, ConfigError, CookieNames,
+    CsrfKey, FixedClock, ForwardedFor, NoClientIp, PeerIp, SystemClock, Ttls,
 };
 pub use error::{reject, ApiError};
 pub use hooks::{

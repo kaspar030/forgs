@@ -131,6 +131,9 @@ impl ApiError {
         StatusCode::SERVICE_UNAVAILABLE,
         code::TEMPORARILY_UNAVAILABLE,
     );
+    /// `429 rate_limited`.
+    pub const RATE_LIMITED: ApiError =
+        ApiError::Code(StatusCode::TOO_MANY_REQUESTS, code::RATE_LIMITED);
 }
 
 impl IntoResponse for ApiError {

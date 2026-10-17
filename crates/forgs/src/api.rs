@@ -63,6 +63,8 @@ pub mod error_code {
     /// Adding a login method needs a fresh login with one already linked to
     /// the account (and the account has none usable).
     pub const REAUTH_REQUIRED: &str = "reauth_required";
+    /// Too many failed attempts; retry later.
+    pub const RATE_LIMITED: &str = "rate_limited";
 }
 
 /// A token-exchange request to `POST /auth/token`.

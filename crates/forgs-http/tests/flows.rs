@@ -392,6 +392,14 @@ async fn harness_with(issuer: bool) -> H {
 }
 
 async fn harness_at(issuer: bool, public_url: &str) -> H {
+    harness_cfg(issuer, public_url, |b| b).await
+}
+
+async fn harness_cfg(
+    issuer: bool,
+    public_url: &str,
+    cfg: impl FnOnce(forgs_http::AuthContextBuilder) -> forgs_http::AuthContextBuilder,
+) -> H {
     let store = Store::connect_in_memory(schema(), RoleLadder::new(&["member", "admin"]).unwrap())
         .await
         .unwrap();
@@ -425,7 +433,7 @@ async fn harness_at(issuer: bool, public_url: &str) -> H {
                 prefix: "ghes",
             }));
     }
-    let ctx = b.build().unwrap();
+    let ctx = cfg(b).build().unwrap();
     let app = forgs_http::router::<AuthContext>()
         .route("/api/me", get(app_me).post(app_me))
         .route("/other/me", post(app_me))
@@ -884,10 +892,8 @@ async fn cli_device_flow_end_to_end() {
     let code = start["user_code"].as_str().unwrap().to_owned();
     assert!(secret.starts_with("frgd1_"));
     assert_eq!(start["verification_uri"], format!("{PUBLIC}/auth/device"));
-    assert_eq!(
-        start["verification_uri_complete"],
-        format!("{PUBLIC}/auth/device?code={code}")
-    );
+    // No link that carries the code: the user must type it.
+    assert!(start.get("verification_uri_complete").is_none());
 
     let poll = |s: String| {
         let h = &h;
@@ -903,8 +909,11 @@ async fn cli_device_flow_end_to_end() {
         }
     };
     assert_eq!(poll(secret.clone()).await.json()["status"], "pending");
+    // Too fast: slow_down, and the interval grows by 5s each time.
     assert_eq!(poll(secret.clone()).await.json()["status"], "slow_down");
     h.clock.advance(5);
+    assert_eq!(poll(secret.clone()).await.json()["status"], "slow_down");
+    h.clock.advance(15);
     assert_eq!(poll(secret.clone()).await.json()["status"], "pending");
 
     // Logged out: the page offers logins that come back here.
@@ -913,14 +922,32 @@ async fn cli_device_flow_end_to_end() {
     assert!(anon.text().contains("/auth/stub/start?return_to="));
     assert!(!anon.text().contains("<form"));
 
-    // Logged in: a form with the code pre-filled and a CSRF field.
+    // Logged in: a form with a CSRF field, never pre-filled from the link.
     let page = h
         .get(&format!("/auth/device?code={code}"), Some(&browser), &[])
         .await;
     page.expect(StatusCode::OK);
     let csrf = browser.get("__Host-frg_csrf");
     assert!(page.text().contains(&csrf));
-    assert!(page.text().contains(&code));
+    assert!(!page.text().contains(&code));
+    assert!(page.text().contains("value=\"review\""));
+
+    // The review step shows when the device asked; nothing is decided.
+    let review = h
+        .post_form(
+            "/auth/device",
+            &browser,
+            &[("code", &code), ("action", "review"), ("csrf", &csrf)],
+        )
+        .await;
+    review.expect(StatusCode::OK);
+    assert!(
+        review.text().contains("2027-01-15 08:00:00 UTC"),
+        "{}",
+        review.text()
+    );
+    assert!(review.text().contains("an unknown address"));
+    assert!(review.text().contains("value=\"approve\""));
 
     // Without CSRF: refused, and nothing approved.
     h.post_form(
@@ -930,7 +957,8 @@ async fn cli_device_flow_end_to_end() {
     )
     .await
     .expect(StatusCode::FORBIDDEN);
-    assert_eq!(poll(secret.clone()).await.json()["status"], "slow_down");
+    h.clock.advance(60);
+    assert_eq!(poll(secret.clone()).await.json()["status"], "pending");
 
     h.post_form(
         "/auth/device",
@@ -939,15 +967,17 @@ async fn cli_device_flow_end_to_end() {
     )
     .await
     .expect(StatusCode::OK);
-    // A second approval of the same code is a conflict.
+    // A second approval of the same code looks like an unknown code.
     h.post_form(
         "/auth/device",
         &browser,
         &[("code", &code), ("action", "approve"), ("csrf", &csrf)],
     )
     .await
-    .expect(StatusCode::CONFLICT);
+    .expect(StatusCode::NOT_FOUND);
+    assert!(h.audit.has("device.decide.unknown"));
 
+    h.clock.advance(15);
     let granted = poll(secret.clone()).await;
     granted.expect(StatusCode::OK);
     let g = granted.json();
@@ -3104,4 +3134,257 @@ async fn store_audit_sink_can_opt_into_noise() {
         .await
         .unwrap();
     assert_eq!(n, 1);
+}
+
+// ---------------------------------------------------------------------------
+// Device flow abuse controls
+// ---------------------------------------------------------------------------
+
+async fn device_start_from(h: &H, ip: Option<&str>) -> Resp {
+    let extra: Vec<(&str, &str)> = ip.map(|i| ("x-forwarded-for", i)).into_iter().collect();
+    h.post_json("/auth/device/start", None, None, &extra, &json!({}))
+        .await
+}
+
+async fn device_poll_status(h: &H, secret: &str) -> Value {
+    h.post_json(
+        "/auth/device/poll",
+        None,
+        None,
+        &[],
+        &json!({"device_secret": secret}),
+    )
+    .await
+    .json()["status"]
+        .clone()
+}
+
+#[tokio::test]
+async fn device_caps_are_per_kind() {
+    let h = harness_cfg(true, &format!("{PUBLIC}/"), |b| {
+        b.max_pending_devices(2).max_pending_approvals(1)
+    })
+    .await;
+    for _ in 0..2 {
+        device_start_from(&h, None).await.expect(StatusCode::OK);
+    }
+    device_start_from(&h, None)
+        .await
+        .expect(StatusCode::SERVICE_UNAVAILABLE);
+    // A login flood does not block app approvals, and vice versa.
+    forgs_http::device::start_pending_approval(&h.ctx, "{}", None)
+        .await
+        .unwrap();
+    assert_eq!(
+        forgs_http::device::start_pending_approval(&h.ctx, "{}", None).await,
+        Err(forgs_http::ApiError::UNAVAILABLE)
+    );
+    // Rows age out.
+    h.clock.advance(h.ctx.ttl().device_flow);
+    device_start_from(&h, None).await.expect(StatusCode::OK);
+}
+
+#[tokio::test]
+async fn device_starts_are_capped_per_source() {
+    let h = harness_cfg(true, &format!("{PUBLIC}/"), |b| {
+        b.client_ip(forgs_http::ForwardedFor {
+            header: axum::http::HeaderName::from_static("x-forwarded-for"),
+            trusted_hops: 0,
+        })
+        .max_pending_devices_per_source(2)
+    })
+    .await;
+    let browser = h.signup("a", "1", "a@x.example", "alice").await;
+    let mut first = None;
+    for _ in 0..2 {
+        let r = device_start_from(&h, Some("spoofed, 203.0.113.7")).await;
+        r.expect(StatusCode::OK);
+        first.get_or_insert(r.json());
+    }
+    device_start_from(&h, Some("203.0.113.7"))
+        .await
+        .expect(StatusCode::SERVICE_UNAVAILABLE);
+    // Another source has its own allowance; an IPv6 /64 is one source.
+    device_start_from(&h, Some("198.51.100.1"))
+        .await
+        .expect(StatusCode::OK);
+    device_start_from(&h, Some("2001:db8:1:2::1"))
+        .await
+        .expect(StatusCode::OK);
+    device_start_from(&h, Some("2001:db8:1:2::ffff"))
+        .await
+        .expect(StatusCode::OK);
+    device_start_from(&h, Some("2001:db8:1:2:dead::"))
+        .await
+        .expect(StatusCode::SERVICE_UNAVAILABLE);
+    // An unknown source only meets the global ceiling.
+    device_start_from(&h, None).await.expect(StatusCode::OK);
+
+    // The review page shows where the device asked from.
+    let code = first.unwrap()["user_code"].as_str().unwrap().to_owned();
+    let review = h
+        .post_form(
+            "/auth/device",
+            &browser,
+            &[
+                ("code", &code),
+                ("action", "review"),
+                ("csrf", &browser.get("__Host-frg_csrf")),
+            ],
+        )
+        .await;
+    review.expect(StatusCode::OK);
+    assert!(review.text().contains("203.0.113.7"), "{}", review.text());
+    assert!(!review.text().contains("spoofed"));
+}
+
+#[tokio::test]
+async fn device_slow_down_skips_the_store_and_is_capped() {
+    let h = harness().await;
+    let start = device_start_from(&h, None).await.json();
+    let secret = start["device_secret"].as_str().unwrap().to_owned();
+    assert_eq!(device_poll_status(&h, &secret).await, "pending");
+    // Each too-fast poll adds 5s, up to 60s.
+    for _ in 0..20 {
+        assert_eq!(device_poll_status(&h, &secret).await, "slow_down");
+    }
+    h.clock.advance(59);
+    assert_eq!(device_poll_status(&h, &secret).await, "slow_down");
+    h.clock.advance(60);
+    assert_eq!(device_poll_status(&h, &secret).await, "pending");
+    // Unknown secrets get no pacing state: they are simply expired.
+    let other = h
+        .ctx
+        .format()
+        .mint(TokenKind::DeviceSecret)
+        .to_secret_string();
+    assert_eq!(device_poll_status(&h, &other).await, "expired");
+    assert_eq!(device_poll_status(&h, &other).await, "expired");
+}
+
+#[tokio::test]
+async fn device_code_guessing_is_uniform_audited_and_locked_out() {
+    let h = harness().await;
+    let browser = h.signup("a", "1", "a@x.example", "alice").await;
+    let csrf = browser.get("__Host-frg_csrf");
+    let submit = |code: String, action: &'static str| {
+        let (h, browser, csrf) = (&h, &browser, &csrf);
+        async move {
+            h.post_form(
+                "/auth/device",
+                browser,
+                &[("code", &code), ("action", action), ("csrf", csrf)],
+            )
+            .await
+        }
+    };
+    let real = device_start_from(&h, None).await.json()["user_code"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // A decided code is the same 404 as an unknown one.
+    let decided = device_start_from(&h, None).await.json()["user_code"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    submit(decided.clone(), "deny").await.expect(StatusCode::OK);
+    let a = submit(decided, "approve").await;
+    a.expect(StatusCode::NOT_FOUND);
+    let b = submit("ZZZZ-ZZZZ".into(), "approve").await;
+    b.expect(StatusCode::NOT_FOUND);
+    assert_eq!(a.text(), b.text());
+    assert!(h.audit.has("device.decide.unknown"));
+    // Malformed codes do not count.
+    for _ in 0..20 {
+        submit("!".into(), "approve")
+            .await
+            .expect(StatusCode::BAD_REQUEST);
+    }
+    // 10 misses in all (2 so far), then even a valid code is refused.
+    for i in 0..8 {
+        submit(format!("ZZZZ-ZZZ{i}"), "review")
+            .await
+            .expect(StatusCode::NOT_FOUND);
+    }
+    let locked = submit(real.clone(), "approve").await;
+    locked.expect(StatusCode::TOO_MANY_REQUESTS);
+    assert!(locked.text().contains("Too many wrong codes"));
+    submit(real.clone(), "review")
+        .await
+        .expect(StatusCode::TOO_MANY_REQUESTS);
+    assert!(h.audit.has("device.decide.locked"));
+    // Another user is unaffected.
+    let bob = h.signup("b", "2", "b@x.example", "bob").await;
+    h.post_form(
+        "/auth/device",
+        &bob,
+        &[
+            ("code", &real),
+            ("action", "review"),
+            ("csrf", &bob.get("__Host-frg_csrf")),
+        ],
+    )
+    .await
+    .expect(StatusCode::OK);
+    // The window passes.
+    h.clock.advance(h.ctx.ttl().device_flow);
+    let fresh = device_start_from(&h, None).await.json()["user_code"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    submit(fresh, "approve").await.expect(StatusCode::OK);
+}
+
+#[tokio::test]
+async fn device_approval_can_be_cancelled_by_its_approver() {
+    let h = harness().await;
+    let alice = h.signup("a", "1", "a@x.example", "alice").await;
+    let bob = h.signup("b", "2", "b@x.example", "bob").await;
+    let form = |jar: &Jar, code: &str, action: &str| {
+        vec![
+            ("code".to_owned(), code.to_owned()),
+            ("action".to_owned(), action.to_owned()),
+            ("csrf".to_owned(), jar.get("__Host-frg_csrf")),
+        ]
+    };
+    let post = |jar: &Jar, f: Vec<(String, String)>| {
+        let (h, jar) = (&h, jar.clone());
+        async move {
+            let f: Vec<(&str, &str)> = f.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            h.post_form("/auth/device", &jar, &f).await
+        }
+    };
+    let start = device_start_from(&h, None).await.json();
+    let secret = start["device_secret"].as_str().unwrap().to_owned();
+    let code = start["user_code"].as_str().unwrap().to_owned();
+    let ok = post(&alice, form(&alice, &code, "approve")).await;
+    ok.expect(StatusCode::OK);
+    assert!(ok.text().contains("Cancel this approval"));
+    // Someone else cannot retract it.
+    post(&bob, form(&bob, &code, "deny"))
+        .await
+        .expect(StatusCode::NOT_FOUND);
+    post(&alice, form(&alice, &code, "deny"))
+        .await
+        .expect(StatusCode::OK);
+    assert!(h
+        .audit
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|e| e.action == "device.deny" && e.detail.as_deref() == Some("cancelled approval")));
+    assert_eq!(device_poll_status(&h, &secret).await, "denied");
+
+    // Once redeemed it can no longer be cancelled.
+    let start = device_start_from(&h, None).await.json();
+    let secret = start["device_secret"].as_str().unwrap().to_owned();
+    let code = start["user_code"].as_str().unwrap().to_owned();
+    post(&alice, form(&alice, &code, "approve"))
+        .await
+        .expect(StatusCode::OK);
+    assert_eq!(device_poll_status(&h, &secret).await, "granted");
+    post(&alice, form(&alice, &code, "deny"))
+        .await
+        .expect(StatusCode::NOT_FOUND);
 }

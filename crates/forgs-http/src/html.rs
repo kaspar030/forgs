@@ -111,25 +111,104 @@ pub fn signup(action: &str, suggestion: &str, error: Option<&str>, status: Statu
     page(status, "Choose a username", &body)
 }
 
-/// The device-verification form for a logged-in user.
+/// The device-verification form for a logged-in user: an empty code field.
+/// It is never pre-filled, so the user must type what their device shows.
 #[must_use]
-pub fn device_form(action: &str, username: &str, code: &str, csrf: &str) -> Response {
+pub fn device_form(action: &str, username: &str, csrf: &str) -> Response {
     let body = format!(
         "<p>You are logged in as <strong>{}</strong>.</p>\n\
-         <p>A device is asking to log in <strong>as you</strong>. Only continue if you \
-         started this yourself and the code below matches the one it shows.</p>\n\
+         <p>A device is asking to log in <strong>as you</strong>. Type the code your \
+         device shows. Never enter a code someone sent you.</p>\n\
          <form method=\"post\" action=\"{}\">\n\
          <input type=\"hidden\" name=\"csrf\" value=\"{}\">\n\
-         <label>Code <input name=\"code\" value=\"{}\" required autocomplete=\"off\" \
+         <label>Code <input name=\"code\" value=\"\" required autocomplete=\"off\" \
          autocapitalize=\"characters\" spellcheck=\"false\"></label>\n\
-         <button type=\"submit\" name=\"action\" value=\"approve\">Approve</button>\n\
-         <button type=\"submit\" name=\"action\" value=\"deny\">Deny</button>\n</form>",
+         <button type=\"submit\" name=\"action\" value=\"review\">Continue</button>\n</form>",
         escape(username),
         escape(action),
         escape(csrf),
-        escape(code)
     );
     page(StatusCode::OK, "Confirm device login", &body)
+}
+
+/// The review step: what is asking, from where and when, then Approve/Deny.
+#[must_use]
+pub fn device_confirm(
+    action: &str,
+    username: &str,
+    info: &crate::device::DeviceInfo,
+    csrf: &str,
+) -> Response {
+    let what = if info.is_app {
+        "A machine is asking for approval"
+    } else {
+        "A device is asking to log in"
+    };
+    let body = format!(
+        "<p>You are logged in as <strong>{}</strong>.</p>\n\
+         <p>{} <strong>as you</strong> with code <strong>{}</strong>. It asked at \
+         <strong>{}</strong> from <strong>{}</strong>.</p>\n\
+         <p>Only approve if you started this yourself, just now, on that device.</p>\n\
+         <form method=\"post\" action=\"{}\">\n\
+         <input type=\"hidden\" name=\"csrf\" value=\"{}\">\n\
+         <input type=\"hidden\" name=\"code\" value=\"{}\">\n\
+         <button type=\"submit\" name=\"action\" value=\"approve\">Approve</button>\n\
+         <button type=\"submit\" name=\"action\" value=\"deny\">Deny</button>\n</form>",
+        escape(username),
+        escape(what),
+        escape(&info.display_code),
+        escape(&utc(info.created_at)),
+        escape(info.source_ip.as_deref().unwrap_or("an unknown address")),
+        escape(action),
+        escape(csrf),
+        escape(&info.display_code),
+    );
+    page(StatusCode::OK, "Confirm device login", &body)
+}
+
+/// After an approval: a way to take it back before the device redeems it.
+#[must_use]
+pub fn device_approved(action: &str, code: &str, csrf: &str) -> Response {
+    let body = format!(
+        "<p>The device is now logged in. You can return to your terminal.</p>\n\
+         <form method=\"post\" action=\"{}\">\n\
+         <input type=\"hidden\" name=\"csrf\" value=\"{}\">\n\
+         <input type=\"hidden\" name=\"code\" value=\"{}\">\n\
+         <p>Not you? <button type=\"submit\" name=\"action\" value=\"deny\">Cancel this \
+         approval</button></p>\n</form>",
+        escape(action),
+        escape(csrf),
+        escape(code),
+    );
+    page(StatusCode::OK, "Device approved", &body)
+}
+
+/// Epoch seconds as `YYYY-MM-DD HH:MM:SS UTC`.
+#[must_use]
+pub fn utc(epoch: u64) -> String {
+    let days = epoch / 86_400;
+    let rem = epoch % 86_400;
+    let (y, m, d) = civil_from_days(days);
+    format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02} UTC",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
+}
+
+/// Howard Hinnant's `civil_from_days`, for days since 1970-01-01 (>= 0).
+fn civil_from_days(days: u64) -> (u64, u64, u64) {
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let doe = z % 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + u64::from(m <= 2);
+    (y, m, d)
 }
 
 #[cfg(test)]
@@ -151,5 +230,13 @@ mod tests {
         assert_eq!(h[header::CONTENT_SECURITY_POLICY], CSP);
         assert_eq!(h[header::X_FRAME_OPTIONS], "DENY");
         assert_eq!(h[header::CACHE_CONTROL], "no-store");
+    }
+
+    #[test]
+    fn utc_formats_epoch_seconds() {
+        assert_eq!(utc(0), "1970-01-01 00:00:00 UTC");
+        assert_eq!(utc(951_782_400), "2000-02-29 00:00:00 UTC");
+        assert_eq!(utc(1_792_186_285), "2026-10-16 21:31:25 UTC");
+        assert_eq!(utc(4_107_542_399), "2100-02-28 23:59:59 UTC");
     }
 }
