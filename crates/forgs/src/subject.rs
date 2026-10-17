@@ -167,8 +167,51 @@ impl SubjectKey {
     /// of a grant or membership row. Returns `None` on any shape or kind it
     /// does not recognise — a grant whose subject will not parse must be
     /// dropped closed, never widened into a match-anything.
+    ///
+    /// # Canonical form
+    ///
+    /// Grants and memberships match on the **whole rendered key**, so two
+    /// spellings of one identity would silently never match (security audit
+    /// 2026-10, AN-8). `parse` therefore returns the canonical key, the one
+    /// the constructors build, or refuses:
+    ///
+    /// * a namespace slot or `user:` id that parses as an id is re-rendered
+    ///   in canonical (upper) case — `user:01j…` becomes `user:01J…`;
+    /// * `workload:id:<owner>/<repo>` ids must pass [`normalise_github_id`]
+    ///   (`id:01/2` is refused, not repaired);
+    /// * `workload:key:<id>` must carry an id, re-rendered canonically;
+    /// * `workload:agent:<name>` must pass [`normalise_service_name`] and is
+    ///   lowercased;
+    /// * any other workload id that is an `owner/name` repo (the legacy
+    ///   name-keyed shape) is lowercased, as [`normalise_repo`] does.
+    ///
+    /// Other ids are opaque and kept as given.
     #[must_use]
     pub fn parse_with(s: &str, app_kinds: &[&'static str]) -> Option<Self> {
+        Self::parse_raw(s, app_kinds)?.canonicalised()
+    }
+
+    fn canonicalised(mut self) -> Option<Self> {
+        if let Some(ns) = &self.ns {
+            if let Ok(id) = NsNodeId::parse(ns) {
+                self.ns = Some(id.to_string());
+            }
+        }
+        match self.kind {
+            SubjectKind::User => {
+                if let Ok(id) = UserId::parse(&self.id) {
+                    self.id = id.to_string();
+                }
+            }
+            SubjectKind::Workload => {
+                self.id = canonical_workload_id(&self.id)?;
+            }
+            SubjectKind::App(_) => {}
+        }
+        Some(self)
+    }
+
+    fn parse_raw(s: &str, app_kinds: &[&'static str]) -> Option<Self> {
         let colon = s.find(':')?;
         let (ns, rest) = match s.find('/') {
             Some(slash) if slash < colon => (Some(&s[..slash]), &s[slash + 1..]),
@@ -182,6 +225,34 @@ impl SubjectKey {
         };
         Self::new(ns, kind, id)
     }
+}
+
+/// The canonical spelling of a workload subject id (see
+/// [`SubjectKey::parse_with`]), or `None` if a known form is malformed.
+fn canonical_workload_id(id: &str) -> Option<String> {
+    if let Some(ids) = id.strip_prefix("id:") {
+        let (owner, repo) = ids.split_once('/')?;
+        let owner = normalise_github_id(owner)?;
+        let repo = normalise_github_id(repo)?;
+        return Some(format!("id:{owner}/{repo}"));
+    }
+    if let Some(key) = id.strip_prefix("key:") {
+        let key = crate::ids::ApiKeyId::parse(key).ok()?;
+        return Some(format!("key:{key}"));
+    }
+    if let Some(name) = id.strip_prefix("agent:") {
+        // No trimming here: a padded name is not a spelling of the name.
+        if name.trim() != name {
+            return None;
+        }
+        return Some(format!("agent:{}", normalise_service_name(name)?));
+    }
+    if !id.contains(':') && id.trim() == id {
+        if let Some(repo) = normalise_repo(id) {
+            return Some(repo);
+        }
+    }
+    Some(id.to_owned())
 }
 
 fn has_control(s: &str) -> bool {
@@ -345,8 +416,8 @@ pub const MAX_WORKLOAD_NS_LEN: usize = 32;
 /// workload subject, e.g. [`WORKLOAD_NS_GHA`]).
 ///
 /// 1–[`MAX_WORKLOAD_NS_LEN`] characters over `[a-z0-9-]`, starting with
-/// `[a-z]`. Lowercase-only means a label can never equal a namespace-node id,
-/// which renders as an uppercase ULID, and excluding `/` and `:` keeps the
+/// `[a-z]`, and not id-shaped ([`crate::ids::is_id_shaped`]). So a label
+/// can never equal (or be canonicalised into) a namespace-node id, and excluding `/` and `:` keeps the
 /// rendered key round-tripping through [`SubjectKey::parse`].
 #[must_use]
 pub fn valid_workload_ns(label: &str) -> bool {
@@ -356,6 +427,7 @@ pub fn valid_workload_ns(label: &str) -> bool {
         && label
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && !crate::ids::is_id_shaped(label)
 }
 
 /// Validate and canonicalise a GitHub numeric id (`repository_id`,
@@ -547,6 +619,56 @@ mod tests {
         assert!(SubjectKey::new(None, SubjectKind::App("Bad"), "x").is_none());
     }
 
+    /// AN-8: `parse` returns the canonical key or nothing, so a key built
+    /// from admin input equals the one the token paths build.
+    #[test]
+    fn parse_canonicalises_or_refuses() {
+        let user = UserId::from_parts(1, 2);
+        let lower = format!("user:{}", user.to_string().to_ascii_lowercase());
+        assert_eq!(SubjectKey::parse(&lower), Some(SubjectKey::user(user)));
+        let ns = NsNodeId::from_parts(3, 4);
+        let agent = format!(
+            "{}/workload:agent:Builder",
+            ns.to_string().to_ascii_lowercase()
+        );
+        assert_eq!(
+            SubjectKey::parse(&agent),
+            Some(agent_subject_key(&ns, "builder"))
+        );
+        let key = crate::ids::ApiKeyId::from_parts(5, 6);
+        let k = SubjectKey::parse(&format!(
+            "{ns}/workload:key:{}",
+            key.to_string().to_ascii_lowercase()
+        ))
+        .unwrap();
+        assert_eq!(k.id(), format!("key:{key}"));
+        assert_eq!(
+            SubjectKey::parse("gha/workload:Octo/Widgets").unwrap().id(),
+            "octo/widgets"
+        );
+        for bad in [
+            "gha/workload:id:01/2",
+            "gha/workload:id:1/x",
+            "gha/workload:id:1",
+            "x/workload:key:nope",
+            "x/workload:agent:a b",
+            "x/workload:agent: a",
+            "x/workload:agent:a/b",
+        ] {
+            assert_eq!(SubjectKey::parse(bad), None, "{bad:?}");
+        }
+        // Opaque ids are kept as given.
+        assert_eq!(SubjectKey::parse("user:Gh-1").unwrap().id(), "Gh-1");
+        // Canonical keys are fixed points.
+        for k in [
+            SubjectKey::user(user),
+            agent_subject_key(&ns, "ci-2"),
+            workload_subject_key("gha", "1", "2").unwrap(),
+        ] {
+            assert_eq!(SubjectKey::parse(&k.to_string()), Some(k));
+        }
+    }
+
     #[test]
     fn subject_key_excludes_acting_in() {
         let key = SubjectKey::user(UserId::from_parts(1, 1));
@@ -621,6 +743,7 @@ mod tests {
             "-gha",
             "1gha",
             "01J0000000000000000000000A",
+            "abcdefghjkmnpqrstvwxyz0123",
         ] {
             assert!(!valid_workload_ns(bad), "{bad:?}");
             assert!(workload_subject_key(bad, "1", "2").is_none());

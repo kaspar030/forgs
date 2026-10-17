@@ -22,6 +22,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (4, include_str!("../migrations/0004_audit_ts_index.sql")),
     (5, include_str!("../migrations/0005_tombstone_actor.sql")),
     (6, include_str!("../migrations/0006_workload_jti.sql")),
+    (7, include_str!("../migrations/0007_child_names_nocase.sql")),
 ];
 
 /// The newest schema version this build knows.

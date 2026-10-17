@@ -1913,9 +1913,12 @@ async fn oauth_state_is_bound_and_redirect_uri_ignores_host() {
     .expect(StatusCode::BAD_REQUEST);
     let mut forged = jar.clone();
     let v = forged.get("__Host-frg_oauth");
-    forged
-        .0
-        .insert("__Host-frg_oauth".into(), format!("{}0", &v[..v.len() - 1]));
+    forged.0.insert("__Host-frg_oauth".into(), {
+        // Always a different last character (a fixed `0` would be a
+        // no-op whenever the cookie already ends in `0`).
+        let last = if v.ends_with('0') { '1' } else { '0' };
+        format!("{}{last}", &v[..v.len() - 1])
+    });
     h.get(
         &format!("/auth/stub/callback?code=c&state={state}"),
         Some(&forged),
@@ -3178,6 +3181,27 @@ async fn create_and_delete_namespace() {
         .await
         .unwrap_err();
     assert_eq!(e.status(), StatusCode::BAD_REQUEST);
+    // AN-5: a root name that parses as an id is refused, so a
+    // single-segment `namespace` reference is never both an id and a name.
+    let id_shaped = team.to_string().to_ascii_lowercase();
+    let e = create_namespace(&h.ctx, bob, None, "org", &id_shaped, None)
+        .await
+        .unwrap_err();
+    assert_eq!(e, ApiError::USERNAME_INVALID);
+    // An id-shaped reference resolves as an id only: the node's id (any
+    // case) finds it, an unknown id is the flat 403, never a path lookup.
+    assert_eq!(
+        forgs_http::auth::resolve_ns(&h.ctx, &id_shaped)
+            .await
+            .unwrap(),
+        team
+    );
+    assert_eq!(
+        forgs_http::auth::resolve_ns(&h.ctx, &forgs::NsNodeId::from_parts(1, 1).to_string())
+            .await
+            .unwrap_err(),
+        ApiError::Forbidden
+    );
     // The schema's org kind is a leaf: nothing can go under it, and only an
     // admin of the parent gets that far.
     let e = create_namespace(&h.ctx, bob, Some("team"), "org", "x", None)

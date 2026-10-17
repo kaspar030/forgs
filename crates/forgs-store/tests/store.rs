@@ -723,6 +723,211 @@ async fn renamed_and_deleted_node_names_are_blocked_under_their_parent_only() {
     assert_eq!(count(&s, "forgs_ns_tombstone").await, 3);
 }
 
+/// A child kind whose rules keep case.
+fn case_keeping() -> Schema {
+    Schema::builder()
+        .kind("org", KindSpec::root().children(&["project"]))
+        .kind(
+            "project",
+            KindSpec::child().leaf().name_rules(NameRules {
+                fold_case: false,
+                ..NameRules::default()
+            }),
+        )
+        .build()
+        .unwrap()
+}
+
+/// AN-6: child names compare case-insensitively for uniqueness, tombstones
+/// and lookups, even when the kind keeps case; the display case is kept.
+#[tokio::test]
+async fn child_names_compare_case_insensitively_even_when_case_is_kept() {
+    let s = store(case_keeping()).await;
+    let a = s
+        .create_node(None, "org", "a-org", NameOrigin::User, None, NOW)
+        .await
+        .unwrap();
+    let p = s
+        .create_node(Some(a), "project", "Foo", NameOrigin::User, None, NOW)
+        .await
+        .unwrap();
+    assert_eq!(s.node(p).await.unwrap().unwrap().name_canonical, "Foo");
+    assert!(matches!(
+        s.create_node(Some(a), "project", "foo", NameOrigin::User, None, NOW)
+            .await,
+        Err(StoreError::NameTaken)
+    ));
+    // Lookups ignore case.
+    for seg in ["Foo", "foo", "FOO"] {
+        assert_eq!(
+            s.node_by_path(&["a-org", seg]).await.unwrap().map(|n| n.id),
+            Some(p),
+            "{seg}"
+        );
+    }
+    // A case-only rename releases nothing and changes the stored case.
+    s.rename_node(p, "FOO", NameOrigin::User, None, NOW)
+        .await
+        .unwrap();
+    assert_eq!(s.node(p).await.unwrap().unwrap().name_canonical, "FOO");
+    assert_eq!(count(&s, "forgs_ns_tombstone").await, 0);
+    // A real rename tombstones the old name in every case.
+    s.rename_node(p, "Bar", NameOrigin::User, None, NOW)
+        .await
+        .unwrap();
+    for name in ["foo", "Foo", "FOO"] {
+        assert!(matches!(
+            s.create_node(Some(a), "project", name, NameOrigin::User, None, NOW)
+                .await,
+            Err(StoreError::NameTombstoned)
+        ));
+    }
+    // So does a delete.
+    s.delete_node(p, None, NOW).await.unwrap();
+    assert!(matches!(
+        s.create_node(Some(a), "project", "bAR", NameOrigin::User, None, NOW)
+            .await,
+        Err(StoreError::NameTombstoned)
+    ));
+    // The triggers and index hold for raw SQL writers too.
+    let q = s
+        .create_node(Some(a), "project", "Baz", NameOrigin::User, None, NOW)
+        .await
+        .unwrap();
+    for name in ["baz", "foo", "bar"] {
+        let raw = sqlx::query(
+            "INSERT INTO forgs_ns_node (id, parent_id, kind, name, name_canonical, created_at)
+             VALUES (?1, ?2, 'project', ?3, ?3, 0)",
+        )
+        .bind(NsNodeId::generate(1).to_string())
+        .bind(a.to_string())
+        .bind(name)
+        .execute(s.pool())
+        .await;
+        assert!(raw.is_err(), "{name}");
+    }
+    let raw = sqlx::query("UPDATE forgs_ns_node SET name_canonical = 'FOO' WHERE id = ?1")
+        .bind(q.to_string())
+        .execute(s.pool())
+        .await;
+    assert!(raw.is_err());
+}
+
+/// Migration 7 lower-cases existing child tombstones, collapsing case-only
+/// duplicates, and refuses to run while case-only siblings exist.
+#[tokio::test]
+async fn migration_7_folds_child_tombstones() {
+    async fn at_v6() -> sqlx::SqlitePool {
+        let opts = forgs_store::connect_options("sqlite::memory:").unwrap();
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await
+            .unwrap();
+        sqlx::raw_sql(
+            "CREATE TABLE forgs_schema_version (
+                 version INTEGER NOT NULL PRIMARY KEY, applied_at INTEGER NOT NULL) STRICT",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for (v, sql) in [
+            (1, include_str!("../migrations/0001_init.sql")),
+            (2, include_str!("../migrations/0002_session_auth_time.sql")),
+            (
+                3,
+                include_str!("../migrations/0003_workload_token_source_key.sql"),
+            ),
+            (4, include_str!("../migrations/0004_audit_ts_index.sql")),
+            (5, include_str!("../migrations/0005_tombstone_actor.sql")),
+            (6, include_str!("../migrations/0006_workload_jti.sql")),
+        ] {
+            sqlx::raw_sql(sql).execute(&pool).await.unwrap();
+            sqlx::query("INSERT INTO forgs_schema_version VALUES (?1, 0)")
+                .bind(v)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        let a = NsNodeId::from_parts(1, 1).to_string();
+        sqlx::query(
+            "INSERT INTO forgs_ns_node (id, parent_id, kind, name, name_canonical, created_at)
+             VALUES (?1, NULL, 'org', 'a', 'a', 0)",
+        )
+        .bind(&a)
+        .execute(&pool)
+        .await
+        .unwrap();
+        for (name, at) in [("Foo", 1), ("foo", 2), ("Bar", 3)] {
+            sqlx::query(
+                "INSERT INTO forgs_ns_tombstone (parent_key, name_canonical, released_at)
+                 VALUES (?1, ?2, ?3)",
+            )
+            .bind(&a)
+            .bind(name)
+            .bind(at)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        pool
+    }
+    let pool = at_v6().await;
+    forgs_store::migrate(&pool).await.unwrap();
+    let rows: Vec<(String,)> =
+        sqlx::query_as("SELECT name_canonical FROM forgs_ns_tombstone ORDER BY 1")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(rows, [("bar".to_owned(),), ("foo".to_owned(),)]);
+
+    // Case-only siblings block the migration, leaving version 6 in place.
+    let pool = at_v6().await;
+    for (i, name) in ["Qux", "qux"].into_iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO forgs_ns_node (id, parent_id, kind, name, name_canonical, created_at)
+             VALUES (?1, ?2, 'project', ?3, ?3, 0)",
+        )
+        .bind(NsNodeId::from_parts(2, i as u128).to_string())
+        .bind(NsNodeId::from_parts(1, 1).to_string())
+        .bind(name)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    assert!(forgs_store::migrate(&pool).await.is_err());
+    let (v,): (i64,) = sqlx::query_as("SELECT MAX(version) FROM forgs_schema_version")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(v, 6);
+}
+
+/// AN-5: root names may not be id-shaped, so a single-segment reference
+/// never means both a node id and a name.
+#[tokio::test]
+async fn root_names_and_usernames_may_not_be_id_shaped() {
+    let s = store(forge()).await;
+    let id = NsNodeId::from_parts(9, 9).to_string().to_ascii_lowercase();
+    assert!(matches!(
+        s.create_node(None, "org", &id, NameOrigin::User, None, NOW)
+            .await,
+        Err(StoreError::Name(NameError::IdShaped))
+    ));
+    assert!(matches!(
+        s.create_local_user(&id, None, NOW).await,
+        Err(StoreError::Name(NameError::IdShaped))
+    ));
+    let a = s
+        .create_node(None, "org", "a-org", NameOrigin::User, None, NOW)
+        .await
+        .unwrap();
+    // A child may be id-shaped: its path has a `/`.
+    s.create_node(Some(a), "project", &id, NameOrigin::User, None, NOW)
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 async fn root_name_releases_are_rate_limited_per_actor_and_per_holder() {
     const DAY: u64 = 24 * 60 * 60;

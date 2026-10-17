@@ -46,6 +46,18 @@ fn parse_ulid(s: &str) -> Result<Ulid, IdError> {
     })
 }
 
+/// Whether `s` parses as an id (of any id type): 26 Crockford base32
+/// characters, in either case.
+///
+/// Names that are id-shaped are refused wherever a name and an id can be
+/// given in the same slot (a root namespace name or username versus a node
+/// id in `resolve_ns`, a workload issuer label versus a node id in a subject
+/// key), so one string can never mean both (security audit 2026-10, AN-5).
+#[must_use]
+pub fn is_id_shaped(s: &str) -> bool {
+    parse_ulid(s).is_ok()
+}
+
 /// Draw the 80 random bits of a fresh ULID from the OS.
 ///
 /// # Panics

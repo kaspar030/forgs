@@ -13,6 +13,10 @@
 //! * **Alphanumeric at both ends, no `--`.** A leading `-` reads as a flag in
 //!   every CLI example that quotes the name; `--` and trailing `-` make
 //!   look-alike handles (`bob-` vs `bob`).
+//! * **Not id-shaped.** A name that parses as an id (26 Crockford base32
+//!   characters, [`crate::ids::is_id_shaped`]) is refused: wherever a
+//!   namespace is named, a node id is accepted too, and one string must not
+//!   mean both (security audit 2026-10, AN-5).
 //!
 //! [`UsernamePolicy::canonicalise`] trims and lowercases and **never repairs
 //! anything else**: a name that does not pass is refused with the rule named,
@@ -51,6 +55,9 @@ pub enum NameError {
     /// `.` or `..`.
     #[error("name must not be \".\" or \"..\"")]
     DotName,
+    /// Parses as an id, so it could be confused with one.
+    #[error("name must not have the shape of an id")]
+    IdShaped,
     /// On the reserved list.
     #[error("name is reserved")]
     Reserved,
@@ -117,6 +124,9 @@ impl UsernamePolicy {
         if name.contains("--") {
             return Err(NameError::DoubleHyphen);
         }
+        if crate::ids::is_id_shaped(&name) {
+            return Err(NameError::IdShaped);
+        }
         Ok(name)
     }
 }
@@ -151,6 +161,16 @@ mod tests {
             Err(NameError::TooLong { max: 39 })
         );
         assert!(p.canonicalise(&"x".repeat(39)).is_ok());
+        // Id-shaped, in either case: 26 Crockford base32 characters.
+        let id = crate::NsNodeId::from_parts(1, 2).to_string();
+        assert_eq!(p.canonicalise(&id), Err(NameError::IdShaped));
+        assert_eq!(
+            p.canonicalise(&id.to_ascii_lowercase()),
+            Err(NameError::IdShaped)
+        );
+        // One character off the alphabet (`u`) or the length is fine.
+        assert!(p.canonicalise(&format!("u{}", &id[1..])).is_ok());
+        assert!(p.canonicalise(&id[1..]).is_ok());
         let strict = UsernamePolicy {
             min_len: 3,
             max_len: 10,

@@ -141,6 +141,27 @@ forgs_ns_node { id (ulid, immutable), parent_id NULL, kind, name,
   space. That gives GitHub's "users and orgs cannot share a name" rule for free,
   and forgefront's forge nodes (`github`, `codeberg`) automatically block those
   usernames.
+- **Names compare case-insensitively everywhere** (security audit 2026-10,
+  AN-6). Sibling uniqueness, tombstones and path lookups use
+  `lower(name_canonical)` at the root and below it, even for a kind whose
+  `NameRules` keep case (`fold_case: false`). Such a kind keeps its display
+  case, but `Foo` and `foo` cannot be siblings, and releasing `Foo` blocks
+  `foo` too (migration 7).
+- **No root name or username may be id-shaped** (AN-5): a name that parses as
+  a ULID is refused (`NameError::IdShaped`). A `namespace` reference that
+  parses as an id is resolved only as an id, so one string never names one
+  node to a human and resolves to another. Child names are unaffected (their
+  path contains a `/`).
+- **Subject keys are canonical** (AN-8): `SubjectKey::parse` re-renders ids in
+  canonical case (`user:01j…` → `user:01J…`), validates and lowercases the
+  structured workload forms (`id:`, `key:`, `agent:`, legacy repo names), and
+  refuses malformed ones, so a key from admin input equals the one the token
+  paths build.
+- **Root-name existence is observable** (AN-9, by design): creating a root
+  namespace, signing up and renaming answer `409 username_taken` for a name
+  held by any root node, private ones included, or tombstoned. This is
+  inherent to a shared root name space (GitHub behaves the same). Namespace
+  *resolution* stays oracle-free: unknown and not-a-member are the same 403.
 
 The three consumers, expressed in this model:
 

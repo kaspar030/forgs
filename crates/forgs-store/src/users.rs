@@ -141,19 +141,19 @@ fn user_from_row(r: UserRow) -> Result<User> {
     })
 }
 
-/// The tombstone key of a name: root names compare case-insensitively.
-pub(crate) fn tomb_name(parent: Option<&str>, canonical: &str) -> String {
-    if parent.is_none() {
-        canonical.to_ascii_lowercase()
-    } else {
-        canonical.to_owned()
-    }
+/// The tombstone key of a name: names compare case-insensitively, at the
+/// root and below it (security audit 2026-10, AN-6), whether or not the
+/// kind's rules fold case. `parent` is unused but kept so every caller says
+/// which name space it means.
+pub(crate) fn tomb_name(_parent: Option<&str>, canonical: &str) -> String {
+    canonical.to_ascii_lowercase()
 }
 
 /// Refuse `canonical` under `parent` if it is tombstoned or held.
 ///
-/// At the root, users and root nodes share one name space (compared
-/// case-insensitively): a root name collides with a username, and a username
+/// Names compare case-insensitively everywhere, so siblings cannot differ
+/// by case alone even under a kind whose rules keep case (AN-6). At the
+/// root, users and root nodes share one name space: a root name collides with a username, and a username
 /// with a root node's name. `except_user` excludes that user and their
 /// personal node (a user renaming themselves); `except_node` excludes one node
 /// (a node renaming itself).
@@ -192,10 +192,10 @@ pub(crate) async fn check_name_free(
     } else {
         sqlx::query_as(
             "SELECT EXISTS (SELECT 1 FROM forgs_ns_node
-                             WHERE parent_id = ?1 AND name_canonical = ?2 AND id IS NOT ?3)",
+                             WHERE parent_id = ?1 AND lower(name_canonical) = ?2 AND id IS NOT ?3)",
         )
         .bind(key)
-        .bind(canonical)
+        .bind(&tomb)
         .bind(except_node)
         .fetch_one(&mut *conn)
         .await?

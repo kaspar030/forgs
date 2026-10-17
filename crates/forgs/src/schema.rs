@@ -558,7 +558,13 @@ impl Schema {
     /// * externally named and app-created kinds: refused for
     ///   [`NameOrigin::User`] ([`NameError::NotUserNameable`]); for
     ///   [`NameOrigin::App`] only the kind's own rules apply, never the
-    ///   reserved list.
+    ///   reserved list;
+    /// * every **root** kind, however named: a name that parses as an id is
+    ///   refused ([`NameError::IdShaped`]). A single-segment namespace
+    ///   reference may be a node id or a root name, and one string must not
+    ///   mean both (security audit 2026-10, AN-5). Child names cannot be
+    ///   confused with an id (their path contains a `/`), so mirrored names
+    ///   below the root are unaffected.
     ///
     /// # Errors
     ///
@@ -573,6 +579,19 @@ impl Schema {
             .kinds
             .get(kind)
             .ok_or_else(|| NameError::UnknownKind(kind.to_owned()))?;
+        let name = self.canonical_name_inner(spec, raw, origin)?;
+        if spec.root && crate::ids::is_id_shaped(&name) {
+            return Err(NameError::IdShaped);
+        }
+        Ok(name)
+    }
+
+    fn canonical_name_inner(
+        &self,
+        spec: &KindSpec,
+        raw: &str,
+        origin: NameOrigin,
+    ) -> Result<String, NameError> {
         match spec.naming {
             Naming::External | Naming::App => {
                 if origin == NameOrigin::User {
@@ -793,6 +812,35 @@ mod tests {
             ff.canonical_name("forge", "GitHub", NameOrigin::App)
                 .as_deref(),
             Ok("github")
+        );
+    }
+
+    /// AN-5: no root name, however the kind is named, may parse as an id;
+    /// child names may.
+    #[test]
+    fn root_names_may_not_be_id_shaped() {
+        let id = crate::NsNodeId::from_parts(5, 5).to_string();
+        let lower = id.to_ascii_lowercase();
+        let ff = forgefront();
+        assert_eq!(
+            ff.canonical_name("forge", &id, NameOrigin::App),
+            Err(NameError::IdShaped)
+        );
+        assert_eq!(
+            ff.canonical_name("user", &lower, NameOrigin::User),
+            Err(NameError::IdShaped)
+        );
+        assert_eq!(ff.validate_username(&lower), Err(NameError::IdShaped));
+        assert_eq!(
+            ff.canonical_name("remote_owner", &id, NameOrigin::App)
+                .as_deref(),
+            Ok(lower.as_str())
+        );
+        assert_eq!(
+            forge()
+                .canonical_name("project", &lower, NameOrigin::User)
+                .as_deref(),
+            Ok(lower.as_str())
         );
     }
 

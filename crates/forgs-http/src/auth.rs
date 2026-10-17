@@ -395,6 +395,11 @@ where
 
 /// Resolve a `namespace` field (an id, or a `/`-separated path) to a node id.
 ///
+/// The two syntaxes cannot overlap: a string that parses as an id is
+/// **only** an id (no path fallback), and no root name may be id-shaped
+/// (`NameError::IdShaped`, security audit 2026-10, AN-5). So a reference never
+/// names one node to a human and resolves to another.
+///
 /// # Errors
 ///
 /// [`ApiError::Forbidden`] if nothing matches — the same answer as "not a
@@ -405,15 +410,15 @@ pub async fn resolve_ns(ctx: &AuthContext, raw: &str) -> Result<forgs::NsNodeId,
         return Err(ApiError::BadRequest);
     }
     if let Ok(id) = forgs::NsNodeId::parse(raw) {
-        if ctx
+        return match ctx
             .store()
             .node(id)
             .await
             .map_err(crate::error::store_err("node"))?
-            .is_some()
         {
-            return Ok(id);
-        }
+            Some(_) => Ok(id),
+            None => Err(ApiError::Forbidden),
+        };
     }
     let segs: Vec<&str> = raw.trim_matches('/').split('/').collect();
     match ctx.store().node_by_path(&segs).await {

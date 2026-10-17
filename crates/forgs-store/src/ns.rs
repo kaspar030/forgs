@@ -493,7 +493,7 @@ impl Store {
                     Some(p) => {
                         sqlx::query_as(sqlx::AssertSqlSafe(format!(
                             "SELECT {NODE_COLS} FROM forgs_ns_node n
-                          WHERE n.parent_id = ?1 AND n.name_canonical = ?2"
+                          WHERE n.parent_id = ?1 AND lower(n.name_canonical) = lower(?2)"
                         )))
                         .bind(p.id.to_string())
                         .bind(&name)
@@ -503,7 +503,7 @@ impl Store {
                     None => {
                         sqlx::query_as(sqlx::AssertSqlSafe(format!(
                             "SELECT {NODE_COLS} FROM forgs_ns_node n
-                          WHERE n.parent_id IS NULL AND n.name_canonical = ?1"
+                          WHERE n.parent_id IS NULL AND lower(n.name_canonical) = lower(?1)"
                         )))
                         .bind(&name)
                         .fetch_optional(&self.pool)
