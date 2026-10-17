@@ -246,7 +246,11 @@ forgs_membership { ns_node_id, subject (SubjectKey), user_id NULL, role }
 - Browser: an HttpOnly session cookie that is the same credential as the bearer
   token, a double-submit HMAC CSRF token, a cookie accepted only on the
   explicitly marked browser routes and under a configurable API prefix, and
-  `redirect_uri` derived only from `public_url`.
+  `redirect_uri` derived only from `public_url`. Every cookie is named
+  `__Host-{brand}_*` (`Secure`, `Path=/`, no `Domain`), so a sibling
+  subdomain or an on-path attacker cannot toss or shadow one; forgs does not
+  emit HSTS — deploy with it (ideally preloaded) and without untrusted
+  sibling subdomains.
 
 ## 4. External identity
 

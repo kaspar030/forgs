@@ -361,7 +361,7 @@ async fn app_me(auth: Authenticated<SessionOnly, ApiCookie>) -> String {
     auth.subject.key().to_string()
 }
 
-/// Brand `frg` (cookie names unchanged) plus fleet-like app kinds.
+/// Brand `frg` (cookies `__Host-frg_*`) plus fleet-like app kinds.
 fn test_format() -> (TokenFormat, AppKind, AppKind) {
     let mut b = TokenFormat::builder("frg");
     let node = b.app_kind("node", "n", TokenUse::Connection);
@@ -503,7 +503,24 @@ impl H {
         self.post_form_with(uri, jar, &[], form).await
     }
 
+    /// A browser form POST: `Origin: PUBLIC` unless `extra` sets one.
     async fn post_form_with(
+        &self,
+        uri: &str,
+        jar: &Jar,
+        extra: &[(&str, &str)],
+        form: &[(&str, &str)],
+    ) -> Resp {
+        if extra.iter().any(|(k, _)| k.eq_ignore_ascii_case("origin")) {
+            return self.post_form_raw(uri, jar, extra, form).await;
+        }
+        let mut with_origin = vec![("origin", PUBLIC)];
+        with_origin.extend_from_slice(extra);
+        self.post_form_raw(uri, jar, &with_origin, form).await
+    }
+
+    /// A form POST carrying exactly `extra` (no default `Origin`).
+    async fn post_form_raw(
         &self,
         uri: &str,
         jar: &Jar,
@@ -557,7 +574,7 @@ impl H {
     }
 
     fn session(jar: &Jar) -> String {
-        jar.get("frg_session")
+        jar.get("__Host-frg_session")
     }
 
     async fn whoami(&self, token: &str) -> Resp {
@@ -615,9 +632,20 @@ async fn signup_origin_checks() {
             &[("origin", PUBLIC), ("sec-fetch-site", "cross-site")],
             StatusCode::FORBIDDEN,
         ),
+        // No Origin: the cookie ticket is an ambient credential, so only the
+        // browser's own fetch metadata can vouch for the request.
+        (&[], StatusCode::FORBIDDEN),
+        (&[("sec-fetch-site", "same-origin")], StatusCode::SEE_OTHER),
+        (&[("sec-fetch-site", "same-site")], StatusCode::FORBIDDEN),
+        (&[("sec-fetch-site", "none")], StatusCode::FORBIDDEN),
     ];
-    // A trailing slash or a path in public_url still yields the bare origin.
-    for public_url in [format!("{PUBLIC}/"), format!("{PUBLIC}/app/")] {
+    // A trailing slash, a path or an explicit default port in public_url
+    // still yields the bare origin.
+    for public_url in [
+        format!("{PUBLIC}/"),
+        format!("{PUBLIC}/app/"),
+        format!("{PUBLIC}:443/"),
+    ] {
         let h = harness_at(true, &public_url).await;
         for (i, (extra, want)) in cases.iter().enumerate() {
             let name = format!("user{i}");
@@ -632,7 +660,7 @@ async fn signup_origin_checks() {
             cb.expect(StatusCode::FOUND);
             assert_eq!(cb.location(), "/auth/signup");
             let r = h
-                .post_form_with("/auth/signup", &jar, extra, &[("username", &name)])
+                .post_form_raw("/auth/signup", &jar, extra, &[("username", &name)])
                 .await;
             assert_eq!(r.status, *want, "{public_url} {extra:?}");
             if *want == StatusCode::FORBIDDEN {
@@ -660,12 +688,15 @@ async fn first_login_signup_then_second_login() {
     let cb = h.browser_login(&mut jar, "stub", "c1").await;
     cb.expect(StatusCode::FOUND);
     assert_eq!(cb.location(), "/auth/signup");
-    assert!(jar.0.contains_key("frg_signup"));
+    assert!(jar.0.contains_key("__Host-frg_signup"));
     assert!(
-        !jar.0.contains_key("frg_session"),
+        !jar.0.contains_key("__Host-frg_session"),
         "no session before signup"
     );
-    assert!(!jar.0.contains_key("frg_oauth"), "flow cookie is spent");
+    assert!(
+        !jar.0.contains_key("__Host-frg_oauth"),
+        "flow cookie is spent"
+    );
 
     // The form pre-fills the (validated) suggestion and is locked down.
     let page = h.get("/auth/signup", Some(&jar), &[]).await;
@@ -683,9 +714,9 @@ async fn first_login_signup_then_second_login() {
     r.expect(StatusCode::SEE_OTHER);
     assert_eq!(r.location(), "/");
     jar.absorb(&r);
-    assert!(!jar.0.contains_key("frg_signup"));
+    assert!(!jar.0.contains_key("__Host-frg_signup"));
     let cookies = r.set_cookies().join("\n");
-    assert!(cookies.contains("frg_session=frgs1_"));
+    assert!(cookies.contains("__Host-frg_session=frgs1_"));
     assert!(cookies.contains("HttpOnly"));
 
     // The cookie works on the whoami route; personal ns + admin membership.
@@ -712,7 +743,7 @@ async fn first_login_signup_then_second_login() {
     let cb = h.browser_login(&mut jar2, "stub", "c2").await;
     cb.expect(StatusCode::FOUND);
     assert_eq!(cb.location(), "/");
-    assert!(!jar2.0.contains_key("frg_signup"));
+    assert!(!jar2.0.contains_key("__Host-frg_signup"));
     let me = h.whoami(&H::session(&jar2)).await;
     assert_eq!(me.json()["username"], "alice");
 
@@ -729,7 +760,7 @@ async fn json_signup_and_ticket_survives_a_failed_name() {
     h.idp.add("b", "2", "b@x.example", None);
     let mut jar = Jar::default();
     h.browser_login(&mut jar, "stub", "b").await;
-    let ticket = jar.get("frg_signup");
+    let ticket = jar.get("__Host-frg_signup");
 
     let taken = h
         .post_json(
@@ -790,6 +821,56 @@ async fn json_signup_and_ticket_survives_a_failed_name() {
 }
 
 #[tokio::test]
+async fn a_new_login_ends_the_browsers_previous_session() {
+    let h = harness().await;
+    let mut jar = h.signup("a", "1", "a@x.example", "alice").await;
+    h.signup("b", "2", "b@x.example", "bob").await;
+    let old = H::session(&jar);
+    h.whoami(&old).await.expect(StatusCode::OK);
+
+    // Same browser, logging in again (here as bob): alice's session ends.
+    h.idp.add("b2", "2", "b@x.example", None);
+    let cb = h.browser_login(&mut jar, "stub", "b2").await;
+    cb.expect(StatusCode::FOUND);
+    let new = H::session(&jar);
+    assert_ne!(new, old);
+    h.whoami(&old).await.expect(StatusCode::UNAUTHORIZED);
+    let me = h.whoami(&new).await;
+    me.expect(StatusCode::OK);
+    assert_eq!(me.json()["username"], "bob");
+}
+
+#[tokio::test]
+async fn json_signup_from_the_cookie_needs_an_origin() {
+    let h = harness().await;
+    h.idp.add("b", "2", "b@x.example", None);
+    let mut jar = Jar::default();
+    h.browser_login(&mut jar, "stub", "b").await;
+    // The ticket rides in the cookie (empty body ticket): with no Origin and
+    // no fetch metadata that is an unvouched ambient credential.
+    let bare = h
+        .post_json(
+            "/auth/signup",
+            None,
+            Some(&jar),
+            &[],
+            &json!({"ticket": "", "username": "bob"}),
+        )
+        .await;
+    bare.expect(StatusCode::FORBIDDEN);
+    let ok = h
+        .post_json(
+            "/auth/signup",
+            None,
+            Some(&jar),
+            &[("origin", PUBLIC)],
+            &json!({"ticket": "", "username": "bob"}),
+        )
+        .await;
+    ok.expect(StatusCode::OK);
+}
+
+#[tokio::test]
 async fn cli_device_flow_end_to_end() {
     let h = harness().await;
     let mut browser = h.signup("a", "1", "a@x.example", "alice").await;
@@ -837,7 +918,7 @@ async fn cli_device_flow_end_to_end() {
         .get(&format!("/auth/device?code={code}"), Some(&browser), &[])
         .await;
     page.expect(StatusCode::OK);
-    let csrf = browser.get("frg_csrf");
+    let csrf = browser.get("__Host-frg_csrf");
     assert!(page.text().contains(&csrf));
     assert!(page.text().contains(&code));
 
@@ -959,7 +1040,7 @@ async fn device_denial_and_expiry() {
         &[
             ("code", &code.to_lowercase()),
             ("action", "deny"),
-            ("csrf", &browser.get("frg_csrf")),
+            ("csrf", &browser.get("__Host-frg_csrf")),
         ],
     )
     .await
@@ -1007,7 +1088,7 @@ async fn csrf_and_cookie_confinement() {
     let h = harness().await;
     let jar = h.signup("a", "1", "a@x.example", "alice").await;
     let token = H::session(&jar);
-    let csrf = jar.get("frg_csrf");
+    let csrf = jar.get("__Host-frg_csrf");
 
     // Cookie under the API prefix: GET needs no CSRF, POST does.
     h.get("/api/me", Some(&jar), &[])
@@ -1098,7 +1179,16 @@ async fn csrf_and_cookie_confinement() {
     assert!(out
         .set_cookies()
         .iter()
-        .any(|c| c.starts_with("frg_session=;")));
+        .any(|c| c.starts_with("__Host-frg_session=;")));
+    // The flow cookies go too: no half-finished login or signup outlives it.
+    for name in ["__Host-frg_oauth", "__Host-frg_signup"] {
+        assert!(
+            out.set_cookies()
+                .iter()
+                .any(|c| c.starts_with(&format!("{name}=;")) && c.contains("Max-Age=0")),
+            "{name}"
+        );
+    }
     h.whoami(&token).await.expect(StatusCode::UNAUTHORIZED);
 }
 
@@ -1275,7 +1365,7 @@ async fn tombstoned_reserved_and_invalid_usernames() {
     h.idp.add("b", "2", "b@x.example", None);
     let mut jar2 = Jar::default();
     h.browser_login(&mut jar2, "stub", "b").await;
-    let ticket = jar2.get("frg_signup");
+    let ticket = jar2.get("__Host-frg_signup");
     let try_name = |name: &'static str| {
         let h = &h;
         let ticket = ticket.clone();
@@ -1320,7 +1410,7 @@ async fn email_match_does_not_auto_link() {
     let mut jar = Jar::default();
     let cb = h.browser_login(&mut jar, "stub2", "z").await;
     assert_eq!(cb.location(), "/auth/signup");
-    assert!(!jar.0.contains_key("frg_session"));
+    assert!(!jar.0.contains_key("__Host-frg_session"));
     let r = h
         .post_form("/auth/signup", &jar, &[("username", "bobby")])
         .await;
@@ -1331,7 +1421,7 @@ async fn email_match_does_not_auto_link() {
             "/auth/signup",
             None,
             Some(&jar),
-            &[],
+            &[("origin", PUBLIC)],
             &json!({"ticket": "", "username": "bobby"}),
         )
         .await;
@@ -1353,7 +1443,7 @@ async fn email_match_does_not_auto_link() {
         .post_form(
             "/auth/identities/link/stub2",
             &bob,
-            &[("csrf", &bob.get("frg_csrf"))],
+            &[("csrf", &bob.get("__Host-frg_csrf"))],
         )
         .await;
     start.expect(StatusCode::SEE_OTHER);
@@ -1361,7 +1451,9 @@ async fn email_match_does_not_auto_link() {
     let state = query_param(&start.location(), "state");
     // The link intent is bound to bob's session: without it, refused.
     let mut stranger = Jar::default();
-    stranger.0.insert("frg_oauth".into(), bob.get("frg_oauth"));
+    stranger
+        .0
+        .insert("__Host-frg_oauth".into(), bob.get("__Host-frg_oauth"));
     h.get(
         &format!("/auth/stub2/callback?code=z&state={state}"),
         Some(&stranger),
@@ -1426,10 +1518,10 @@ async fn oauth_state_is_bound_and_redirect_uri_ignores_host() {
     .await
     .expect(StatusCode::BAD_REQUEST);
     let mut forged = jar.clone();
-    let v = forged.get("frg_oauth");
+    let v = forged.get("__Host-frg_oauth");
     forged
         .0
-        .insert("frg_oauth".into(), format!("{}0", &v[..v.len() - 1]));
+        .insert("__Host-frg_oauth".into(), format!("{}0", &v[..v.len() - 1]));
     h.get(
         &format!("/auth/stub/callback?code=c&state={state}"),
         Some(&forged),
@@ -1969,7 +2061,7 @@ async fn disabled_users_are_locked_out_uniformly() {
     h.browser_login(&mut j, "stub", "again")
         .await
         .expect(StatusCode::FORBIDDEN);
-    assert!(!j.0.contains_key("frg_session"));
+    assert!(!j.0.contains_key("__Host-frg_session"));
 }
 
 /// Audit HTTP-03 / HTTP-10: a key and the workload tokens it minted are only

@@ -117,6 +117,12 @@ impl Default for Ttls {
 
 /// The cookie names, all derived from one brand so two forgs apps on one
 /// host (or one app with two brands) never read each other's cookies.
+///
+/// Every name carries the `__Host-` prefix. A browser only accepts a
+/// `__Host-` cookie that is `Secure`, `Path=/` and has no `Domain` — exactly
+/// what [`crate::cookies::set_cookie`] emits — so no sibling or parent domain
+/// can write (or shadow, via a longer `Path`) these cookies, and neither can
+/// an on-path attacker over plain http (cookie tossing).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CookieNames {
     /// The session token. `HttpOnly`.
@@ -130,14 +136,15 @@ pub struct CookieNames {
 }
 
 impl CookieNames {
-    /// `{brand}_session`, `{brand}_csrf`, `{brand}_oauth`, `{brand}_signup`.
+    /// `__Host-{brand}_session`, `__Host-{brand}_csrf`,
+    /// `__Host-{brand}_oauth`, `__Host-{brand}_signup`.
     #[must_use]
     pub fn for_brand(brand: &str) -> Self {
         Self {
-            session: format!("{brand}_session"),
-            csrf: format!("{brand}_csrf"),
-            oauth: format!("{brand}_oauth"),
-            signup: format!("{brand}_signup"),
+            session: format!("__Host-{brand}_session"),
+            csrf: format!("__Host-{brand}_csrf"),
+            oauth: format!("__Host-{brand}_oauth"),
+            signup: format!("__Host-{brand}_signup"),
         }
     }
 }
@@ -155,8 +162,10 @@ impl CookieNames {
 /// * `csrf = HMAC-SHA256(secret, "forgs/csrf/v1\0" ‖ app_label)` — the
 ///   double-submit token is `hex(HMAC(csrf, session_token_hash))`;
 /// * `flow = HMAC-SHA256(secret, "forgs/flow/v1\0" ‖ app_label)` — seals the
-///   `oauth` and `signup` cookies, so a cookie planted by a sibling origin
-///   cannot inject a login state, a link intent or a ticket.
+///   `oauth` and `signup` cookies, so a *forged* value is refused. The seal
+///   binds name and expiry, not the browser: it does not stop a valid value
+///   minted in an attacker's own browser being planted — the `__Host-`
+///   cookie prefix ([`CookieNames`]) is what stops that.
 ///
 /// Versioned labels: a future derivation is a new label, never a silent
 /// reinterpretation of the same bytes.
@@ -774,7 +783,16 @@ fn origin_of(url: &str) -> Option<String> {
     if authority.is_empty() || authority.contains('@') {
         return None;
     }
-    Some(format!("{scheme}://{}", authority.to_ascii_lowercase()))
+    let mut authority = authority.to_ascii_lowercase();
+    // An explicit default port is the same origin as none: browsers never
+    // send it in `Origin`, so keeping it would make every check fail closed.
+    let default_port = if scheme == "https" { ":443" } else { ":80" };
+    if let Some(host) = authority.strip_suffix(default_port) {
+        if !host.is_empty() && !host.ends_with(':') {
+            authority = host.to_owned();
+        }
+    }
+    Some(format!("{scheme}://{authority}"))
 }
 
 /// A provider or workload issuer name: 1–64 chars over `[a-z0-9_-]`.
@@ -800,6 +818,22 @@ mod tests {
             origin_of("http://127.0.0.1:7000").as_deref(),
             Some("http://127.0.0.1:7000")
         );
+        assert_eq!(
+            origin_of("https://X.example:443/app").as_deref(),
+            Some("https://x.example")
+        );
+        assert_eq!(
+            origin_of("http://x.example:80").as_deref(),
+            Some("http://x.example")
+        );
+        assert_eq!(
+            origin_of("http://x.example:443").as_deref(),
+            Some("http://x.example:443")
+        );
+        assert_eq!(
+            origin_of("https://x.example:8443").as_deref(),
+            Some("https://x.example:8443")
+        );
         for bad in [
             "ftp://x",
             "https://",
@@ -810,6 +844,15 @@ mod tests {
         ] {
             assert_eq!(origin_of(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn cookie_names_are_host_prefixed() {
+        let n = CookieNames::for_brand("frg");
+        assert_eq!(n.session, "__Host-frg_session");
+        assert_eq!(n.csrf, "__Host-frg_csrf");
+        assert_eq!(n.oauth, "__Host-frg_oauth");
+        assert_eq!(n.signup, "__Host-frg_signup");
     }
 
     #[test]

@@ -4,10 +4,10 @@
 //!
 //! Two carry a login, set together and cleared together:
 //!
-//! * `{brand}_session` — the session token itself, byte-for-byte the bearer
+//! * `__Host-{brand}_session` — the session token itself, byte-for-byte the bearer
 //!   credential. `HttpOnly`, so a single XSS cannot exfiltrate it; the CSRF
 //!   machinery below is the price of that.
-//! * `{brand}_csrf` — the double-submit token, deliberately **not**
+//! * `__Host-{brand}_csrf` — the double-submit token, deliberately **not**
 //!   `HttpOnly`: the page reads it and echoes it in the CSRF header (or a
 //!   hidden form field on forgs' own no-JS pages).
 //!
@@ -19,6 +19,16 @@
 //! any other plain-HTTP deployment is unsupported rather than silently
 //! downgraded. Please do not make this conditional on the scheme — that is
 //! the obvious "fix" and it would hand every session to anyone on the path.
+//!
+//! # Cookie names
+//!
+//! Every forgs cookie is named `__Host-{brand}_*` ([`crate::CookieNames`]).
+//! The prefix makes the browser refuse the cookie unless it is `Secure`,
+//! `Path=/` and has no `Domain`, so a sibling or parent domain (`Domain=`
+//! the parent) cannot write one, cannot shadow one with a longer `Path`, and
+//! an on-path attacker cannot write one over plain http. That is what stops
+//! cookie tossing; nothing else here does. Deploy with HSTS (ideally
+//! preloaded) — forgs does not emit it, that is the app's or the proxy's job.
 //!
 //! # CSRF
 //!
@@ -33,12 +43,14 @@
 //!
 //! # Sealed flow cookies
 //!
-//! The in-flight login (`{brand}_oauth`) and the pending-signup ticket
-//! (`{brand}_signup`) are `MACed` with a separate key and bound to their
-//! cookie name and an expiry. `HttpOnly` + `SameSite=Lax` already stop a
-//! cross-site page reading or sending them; the seal additionally stops a
-//! sibling origin that can *write* cookies for this host (cookie tossing)
-//! from planting a login state, a link intent or a ticket.
+//! The in-flight login (`__Host-{brand}_oauth`) and the pending-signup
+//! ticket (`__Host-{brand}_signup`) are `MACed` with a separate key and bound
+//! to their cookie name and an expiry. `HttpOnly` + `SameSite=Lax` already
+//! stop a cross-site page reading or sending them; the seal stops a *forged*
+//! value. It binds name and expiry, **not the browser**: a valid value minted
+//! in an attacker's own browser would pass it. Planting such a value is what
+//! the `__Host-` prefix (above) prevents. Binding the flow cookies to a
+//! separate per-browser nonce would be a further, independent hardening.
 
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -83,6 +95,10 @@ fn is_cookie_byte(b: u8) -> bool {
 /// it would end the value and start an *attribute*. Every value forgs writes
 /// is minted here (a token, hex, base64url), so it holds by construction; a
 /// violation is refused (empty value) rather than emitted.
+///
+/// **Never change `Secure`, `Path=/` or add a `Domain`:** every forgs cookie
+/// name is `__Host-` prefixed, and browsers silently drop a `__Host-` cookie
+/// lacking any of those — logins would stop working without an error.
 #[must_use]
 pub fn set_cookie(name: &str, value: &str, max_age: u64, http_only: bool) -> String {
     let value = if value.bytes().all(is_cookie_byte) {
@@ -296,6 +312,25 @@ mod tests {
         let c = set_cookie("n", "v", 60, false);
         assert!(!c.contains("HttpOnly"));
         assert!(clear_cookie("n", true).contains("Max-Age=0"));
+    }
+
+    #[test]
+    fn every_cookie_meets_the_host_prefix_rules() {
+        let n = crate::CookieNames::for_brand("frg");
+        for name in [&n.session, &n.csrf, &n.oauth, &n.signup] {
+            assert!(name.starts_with("__Host-"), "{name}");
+            for c in [set_cookie(name, "v", 60, true), clear_cookie(name, false)] {
+                let attrs: Vec<&str> = c.split("; ").skip(1).collect();
+                assert!(attrs.contains(&"Secure"), "{c}");
+                assert!(attrs.contains(&"Path=/"), "{c}");
+                assert!(
+                    !attrs
+                        .iter()
+                        .any(|a| a.to_ascii_lowercase().starts_with("domain")),
+                    "{c}"
+                );
+            }
+        }
     }
 
     #[test]

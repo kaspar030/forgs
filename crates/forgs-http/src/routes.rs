@@ -129,16 +129,20 @@ fn is_json(headers: &HeaderMap) -> bool {
 /// `Origin: null` (an opaque origin, e.g. from a document with a
 /// `no-referrer` policy or a privacy setting) is accepted only when the
 /// browser's own fetch metadata says `Sec-Fetch-Site: same-origin`; pages
-/// cannot forge that header. A missing `Origin` passes (non-browser clients).
-fn same_origin(ctx: &AuthContext, headers: &HeaderMap) -> bool {
+/// cannot forge that header. A missing `Origin` is held to the same rule
+/// unless `allow_missing` — for a request that carries no ambient
+/// credential (its secret is in the body, not a cookie), where a missing
+/// `Origin` is just a non-browser client.
+fn same_origin(ctx: &AuthContext, headers: &HeaderMap, allow_missing: bool) -> bool {
     let site = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok());
     if site.is_some_and(|v| v.eq_ignore_ascii_case("cross-site")) {
         return false;
     }
+    let same_origin_site = site.is_some_and(|s| s.eq_ignore_ascii_case("same-origin"));
     match headers.get(header::ORIGIN) {
-        None => true,
+        None => allow_missing || same_origin_site,
         Some(v) => match v.to_str() {
-            Ok("null") => site.is_some_and(|s| s.eq_ignore_ascii_case("same-origin")),
+            Ok("null") => same_origin_site,
             Ok(o) => o == ctx.public_origin(),
             Err(_) => false,
         },
@@ -287,22 +291,26 @@ async fn login_callback(
     // Cleared first, whatever happens: a `state` is single-use, and a
     // replayed callback finds no cookie.
     let spent = clear_cookie(&ctx.cookies().oauth, true);
-    let current = optional_caller(&ctx, &headers)
-        .await
-        .and_then(|c| c.user_id());
+    let previous = optional_caller(&ctx, &headers).await;
     let outcome = login::complete_login(
         &ctx,
         &provider,
         q.get("code").map_or("", String::as_str),
         q.get("state").map_or("", String::as_str),
         cookie_value(&headers, &ctx.cookies().oauth),
-        current,
+        previous.as_ref().and_then(Caller::user_id),
     )
     .await;
     match outcome {
         Ok(LoginOutcome::Session {
             session, return_to, ..
         }) => {
+            // The browser's previous session is replaced by this one: end it
+            // rather than leave a live credential nobody holds any more.
+            // Best effort — the new login stands either way.
+            if let Some(prev) = previous.filter(|c| c.arrival == Arrival::Cookie) {
+                let _ = ctx.store().delete_session(&prev.auth.hash).await;
+            }
             let mut cookies = vec![spent];
             cookies.extend(session_cookies(&ctx, &session.token, session.expires));
             redirect(&landing(&ctx, return_to.as_deref()), &cookies, false)
@@ -416,28 +424,33 @@ async fn signup_submit(
 ) -> Response {
     // No session exists yet, so there is no CSRF token to check; the ticket
     // cookie is `SameSite=Lax` (not sent on a cross-site POST) and the origin
-    // is checked on top.
-    if !same_origin(&ctx, &headers) {
+    // is checked on top. A foreign origin is refused outright; a missing one
+    // only when the ticket comes from the cookie (an ambient credential).
+    if !same_origin(&ctx, &headers, true) {
         return ApiError::Forbidden.into_response();
     }
     let json = is_json(&headers);
-    let (sealed, username) = if json {
+    let (sealed, username, from_cookie) = if json {
         let Ok(req) = serde_json::from_slice::<SignupRequest>(&body) else {
             return ApiError::BadRequest.into_response();
         };
-        let sealed = if req.ticket.is_empty() {
-            cookie_value(&headers, &ctx.cookies().signup).map(str::to_owned)
+        if req.ticket.is_empty() {
+            let sealed = cookie_value(&headers, &ctx.cookies().signup).map(str::to_owned);
+            (sealed, req.username, true)
         } else {
-            Some(req.ticket)
-        };
-        (sealed, req.username)
+            (Some(req.ticket), req.username, false)
+        }
     } else {
         let form = form_map(&body);
         (
             cookie_value(&headers, &ctx.cookies().signup).map(str::to_owned),
             form.get("username").cloned().unwrap_or_default(),
+            true,
         )
     };
+    if from_cookie && !same_origin(&ctx, &headers, false) {
+        return ApiError::Forbidden.into_response();
+    }
     let Some(ticket) = sealed.and_then(|s| signup::open_ticket(&ctx, &s)) else {
         return if json {
             ApiError::TICKET_EXPIRED.into_response()
@@ -542,7 +555,11 @@ async fn session_logout(
     if let Err(e) = session::logout(&ctx, &caller, &LogoutRequest::default()).await {
         return e.into_response();
     }
-    let cookies = cleared_session_cookies(&ctx);
+    // Also any half-finished login or signup: an abandoned signup ticket
+    // must not stay usable on a shared machine after its user logs out.
+    let mut cookies = cleared_session_cookies(&ctx);
+    cookies.push(clear_cookie(&ctx.cookies().oauth, true));
+    cookies.push(clear_cookie(&ctx.cookies().signup, true));
     if form.contains_key("csrf") {
         redirect(ctx.post_login_redirect(), &cookies, true)
     } else {

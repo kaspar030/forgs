@@ -4,6 +4,17 @@
 
 ### Security
 
+- Browser cookies carry the `__Host-` prefix, so a sibling subdomain or an
+  on-path attacker can no longer toss (plant or shadow) a session, CSRF,
+  login-state or signup-ticket cookie. Deploy with HSTS.
+- `POST /auth/signup` with the ticket in the cookie now requires an `Origin`
+  header (or `Sec-Fetch-Site: same-origin`); a missing `Origin` is no longer
+  waved through. A JSON request with the ticket in the body is unaffected.
+- A completed browser login revokes the session the browser carried before.
+- Logout also clears the in-flight login and pending-signup cookies.
+- JSON error responses carry `X-Content-Type-Options: nosniff`.
+- A `public_url` with an explicit default port (`https://x:443`) is
+  normalised, instead of making every origin check fail closed.
 - Minting an API key with a `subject_name` (a named workload identity) now
   requires the namespace's highest role. Previously any member could mint a
   key for an existing name and speak as that identity, inheriting its grants.
@@ -17,6 +28,10 @@
 
 ### Breaking
 
+- Cookies are renamed from `{brand}_session`/`_csrf`/`_oauth`/`_signup` to
+  `__Host-{brand}_session` etc. Existing browser sessions are logged out
+  once, and app JavaScript reading `{brand}_csrf` must read
+  `__Host-{brand}_csrf`.
 - The workload subject format is now
   `<issuer label>/workload:id:<owner_id>/<repo_id>` (e.g.
   `gha/workload:id:12345/67890`) instead of `gha/workload:<owner>/<repo>`.

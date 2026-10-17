@@ -26,6 +26,10 @@ pub fn reject(status: StatusCode, error: &str) -> Response {
         HeaderValue::from_static("application/json"),
     );
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    h.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
     r
 }
 
@@ -163,6 +167,15 @@ pub(crate) fn store_err(what: &'static str) -> impl Fn(StoreError) -> ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejections_are_nosniff_json() {
+        let r = reject(StatusCode::FORBIDDEN, "forbidden");
+        let h = r.headers();
+        assert_eq!(h[header::CONTENT_TYPE], "application/json");
+        assert_eq!(h[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+        assert_eq!(h[header::CACHE_CONTROL], "no-store");
+    }
 
     #[test]
     fn store_errors_map_without_echoing() {
