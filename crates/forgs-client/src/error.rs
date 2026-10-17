@@ -9,7 +9,9 @@
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ClientError {
     /// The URL could not be parsed, had no host, or used an unsupported
-    /// scheme.
+    /// scheme — or broke the transport policy: plain `http` with a
+    /// certificate pin, or on a non-loopback host without the
+    /// `allow_insecure_http` opt-in.
     #[error("invalid server URL: {0}")]
     Url(String),
     /// The request could not be sent, or the response could not be read
@@ -26,6 +28,8 @@ pub enum ClientError {
         /// The HTTP status.
         status: u16,
         /// The error code, e.g. [`forgs::api::error_code::INVALID_GRANT`].
+        /// Sanitised: always `[a-z0-9_]{1,64}`, or `unknown` when the server's
+        /// code was anything else (it may never carry terminal escapes).
         code: String,
     },
     /// A 2xx response whose body was not what the route promises.

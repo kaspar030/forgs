@@ -28,6 +28,168 @@ pub struct ForgsClient {
     base: String,
     http: HttpClient,
     timeout: Duration,
+    /// The origin of `base`, for checking where a device flow sends the
+    /// human.
+    origin: Origin,
+    /// An extra origin the device verification URL may live on (a split
+    /// internal/public deployment), set with
+    /// [`ForgsClientBuilder::verification_origin`].
+    verification_origin: Option<Origin>,
+}
+
+/// Builder for a [`ForgsClient`] with non-default policy. Start with
+/// [`ForgsClient::builder`].
+#[derive(Clone)]
+pub struct ForgsClientBuilder {
+    base: String,
+    pin: Option<[u8; 32]>,
+    timeout: Duration,
+    allow_insecure_http: bool,
+    verification_origin: Option<String>,
+}
+
+impl std::fmt::Debug for ForgsClientBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ForgsClientBuilder")
+            .field("base", &self.base)
+            .field("pinned", &self.pin.is_some())
+            .field("timeout", &self.timeout)
+            .field("allow_insecure_http", &self.allow_insecure_http)
+            .field("verification_origin", &self.verification_origin)
+            .finish()
+    }
+}
+
+impl ForgsClientBuilder {
+    /// Pin the server's leaf certificate by SHA-256 (see [`crate::tls`]).
+    /// A pinned client only ever speaks `https`.
+    #[must_use]
+    pub fn pin(mut self, pin: [u8; 32]) -> Self {
+        self.pin = Some(pin);
+        self
+    }
+
+    /// The per-request timeout (default 30s).
+    #[must_use]
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// Accept a plain `http://` base on a non-loopback host. Off by default:
+    /// credentials would cross the network in cleartext. Loopback
+    /// (`localhost`, `127.0.0.0/8`, `::1`) is always allowed.
+    #[must_use]
+    pub fn allow_insecure_http(mut self, allow: bool) -> Self {
+        self.allow_insecure_http = allow;
+        self
+    }
+
+    /// An extra origin (`https://login.example`, no path) the device flow's
+    /// verification URL may point at, besides the base URL's own origin —
+    /// for a deployment the client reaches internally while humans use a
+    /// public name. A verification URL on any other origin is refused.
+    #[must_use]
+    pub fn verification_origin(mut self, origin: &str) -> Self {
+        self.verification_origin = Some(origin.to_owned());
+        self
+    }
+
+    /// Build the client.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Url`] if the base is not a usable `http(s)` URL, is
+    /// `http` with a pin, is `http` on a non-loopback host without
+    /// [`ForgsClientBuilder::allow_insecure_http`], or the verification
+    /// origin is not a bare `http(s)` origin.
+    pub fn build(self) -> Result<ForgsClient, ClientError> {
+        let base = normalise_base(&self.base)?;
+        let uri: http::Uri = base
+            .parse()
+            .map_err(|e: http::uri::InvalidUri| ClientError::Url(e.to_string()))?;
+        let origin =
+            Origin::of(&uri).ok_or_else(|| ClientError::Url("URL has no origin".to_owned()))?;
+        if origin.scheme == "http" {
+            if self.pin.is_some() {
+                return Err(ClientError::Url(
+                    "a certificate pin requires an https:// URL".to_owned(),
+                ));
+            }
+            if !self.allow_insecure_http && !is_loopback_host(&origin.host) {
+                return Err(ClientError::Url(
+                    "plain http:// is only allowed for a loopback host; use https:// \
+                     (or opt in with allow_insecure_http)"
+                        .to_owned(),
+                ));
+            }
+        }
+        let verification_origin = self
+            .verification_origin
+            .as_deref()
+            .map(parse_bare_origin)
+            .transpose()?;
+        Ok(ForgsClient {
+            base,
+            http: transport::build(self.pin),
+            timeout: self.timeout,
+            origin,
+            verification_origin,
+        })
+    }
+}
+
+/// A URL origin: scheme, lowercased host, explicit port.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Origin {
+    pub(crate) scheme: String,
+    pub(crate) host: String,
+    pub(crate) port: u16,
+}
+
+impl Origin {
+    /// The origin of an absolute `http(s)` URI; `None` for anything else.
+    pub(crate) fn of(uri: &http::Uri) -> Option<Self> {
+        let scheme = uri.scheme_str()?.to_ascii_lowercase();
+        let default_port = match scheme.as_str() {
+            "https" => 443,
+            "http" => 80,
+            _ => return None,
+        };
+        let authority = uri.authority()?;
+        if authority.as_str().contains('@') || authority.host().is_empty() {
+            return None;
+        }
+        Some(Self {
+            scheme,
+            host: authority.host().to_ascii_lowercase(),
+            port: authority.port_u16().unwrap_or(default_port),
+        })
+    }
+}
+
+/// Parse `https://host[:port]` with nothing after the authority (a single
+/// trailing `/` is tolerated).
+fn parse_bare_origin(raw: &str) -> Result<Origin, ClientError> {
+    let bad = || ClientError::Url("verification origin must be a bare http(s) origin".to_owned());
+    let uri: http::Uri = raw.trim().parse().map_err(|_| bad())?;
+    if !matches!(uri.path(), "" | "/") || uri.query().is_some() {
+        return Err(bad());
+    }
+    Origin::of(&uri).ok_or_else(bad)
+}
+
+/// `localhost` or a loopback IP literal (`127.0.0.0/8`, `::1`).
+fn is_loopback_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    bare.parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
 }
 
 impl std::fmt::Debug for ForgsClient {
@@ -68,13 +230,46 @@ impl ForgsClient {
     ///
     /// # Errors
     ///
-    /// [`ClientError::Url`] if `base_url` is not a usable `http(s)` origin.
+    /// A plain `http://` base is accepted only for a loopback host and
+    /// never with a pin; [`ForgsClient::builder`] can opt in to insecure
+    /// http elsewhere.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Url`] if `base_url` is not a usable `http(s)` origin,
+    /// or breaks the http policy above.
     pub fn new(base_url: &str, pin: Option<[u8; 32]>) -> Result<Self, ClientError> {
-        Ok(Self {
-            base: normalise_base(base_url)?,
-            http: transport::build(pin),
+        let builder = Self::builder(base_url);
+        match pin {
+            Some(pin) => builder.pin(pin),
+            None => builder,
+        }
+        .build()
+    }
+
+    /// A [`ForgsClientBuilder`] for the server at `base_url` (same forms as
+    /// [`ForgsClient::new`]).
+    #[must_use]
+    pub fn builder(base_url: &str) -> ForgsClientBuilder {
+        ForgsClientBuilder {
+            base: base_url.to_owned(),
+            pin: None,
             timeout: transport::DEFAULT_TIMEOUT,
-        })
+            allow_insecure_http: false,
+            verification_origin: None,
+        }
+    }
+
+    /// Whether `uri` is on an origin the device flow may send the human to:
+    /// the base URL's own, or the configured verification origin.
+    pub(crate) fn verification_origin_allowed(&self, uri: &http::Uri) -> bool {
+        Origin::of(uri)
+            .is_some_and(|o| o == self.origin || self.verification_origin.as_ref() == Some(&o))
+    }
+
+    /// Whether the base URL is plain `http`.
+    pub(crate) fn is_plain_http(&self) -> bool {
+        self.origin.scheme == "http"
     }
 
     /// Replace the per-request timeout (default 30s).
@@ -661,6 +856,92 @@ mod tests {
             assert!(
                 matches!(normalise_base(bad), Err(ClientError::Url(_))),
                 "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn http_policy() {
+        // Non-loopback http needs the opt-in.
+        assert!(matches!(
+            ForgsClient::new("http://10.0.0.5:7000", None),
+            Err(ClientError::Url(_))
+        ));
+        assert!(ForgsClient::builder("http://10.0.0.5")
+            .allow_insecure_http(true)
+            .build()
+            .is_ok());
+        for ok in [
+            "http://127.0.0.1:1",
+            "http://127.9.9.9",
+            "http://localhost",
+            "http://LocalHost:8",
+            "http://[::1]:7",
+        ] {
+            assert!(ForgsClient::new(ok, None).is_ok(), "{ok}");
+        }
+        assert!(matches!(
+            ForgsClient::new("http://localhost.evil.example", None),
+            Err(ClientError::Url(_))
+        ));
+        // A pin always requires https.
+        assert!(matches!(
+            ForgsClient::new("http://127.0.0.1", Some([0; 32])),
+            Err(ClientError::Url(_))
+        ));
+        assert!(matches!(
+            ForgsClient::builder("http://10.0.0.5")
+                .allow_insecure_http(true)
+                .pin([0; 32])
+                .build(),
+            Err(ClientError::Url(_))
+        ));
+        assert!(ForgsClient::new("https://auth.example", Some([0; 32])).is_ok());
+        assert!(ForgsClient::new("auth.example", Some([0; 32])).is_ok());
+    }
+
+    #[test]
+    fn origins() {
+        let o = |s: &str| s.parse().ok().and_then(|u| Origin::of(&u));
+        assert_eq!(o("https://A.example/x"), o("https://a.example:443/y?z"));
+        assert_eq!(o("http://a.example"), o("http://a.example:80"));
+        assert_ne!(o("http://a.example"), o("https://a.example"));
+        assert_ne!(o("https://a.example:8443"), o("https://a.example"));
+        assert_eq!(o("file:///etc/passwd"), None);
+        assert_eq!(o("ftp://a.example/"), None);
+        assert_eq!(o("https://u@a.example/"), None);
+
+        let c = ForgsClient::builder("https://internal.example:8443/forgs")
+            .verification_origin("https://login.example/")
+            .build()
+            .unwrap();
+        for (url, ok) in [
+            ("https://internal.example:8443/forgs/auth/device", true),
+            ("https://login.example/forgs/auth/device", true),
+            ("https://internal.example/auth/device", false),
+            ("http://login.example/auth/device", false),
+            ("https://evil.example/auth/device", false),
+        ] {
+            assert_eq!(
+                c.verification_origin_allowed(&url.parse().unwrap()),
+                ok,
+                "{url}"
+            );
+        }
+        for bad in [
+            "login.example",
+            "https://login.example/x",
+            "ftp://x",
+            "https://x/?a",
+        ] {
+            assert!(
+                matches!(
+                    ForgsClient::builder("https://a.example")
+                        .verification_origin(bad)
+                        .build(),
+                    Err(ClientError::Url(_))
+                ),
+                "{bad}"
             );
         }
     }

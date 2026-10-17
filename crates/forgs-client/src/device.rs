@@ -19,6 +19,13 @@ use crate::client::ForgsClient;
 use crate::error::ClientError;
 use crate::secret::Secret;
 
+/// Longest flow lifetime honoured, whatever the server reports.
+pub const MAX_EXPIRES_IN: Duration = Duration::from_hours(1);
+/// Longest poll interval honoured (before [`PollPolicy::min_interval`]).
+pub const MAX_INTERVAL: Duration = Duration::from_mins(1);
+/// Longest user code accepted from the server.
+pub const MAX_USER_CODE_LEN: usize = 32;
+
 /// Timing knobs for [`DeviceLogin::wait_with`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PollPolicy {
@@ -67,9 +74,16 @@ impl DeviceLogin {
     ///
     /// # Errors
     ///
-    /// Any [`ClientError`] from `POST /auth/device/start`.
+    /// Any [`ClientError`] from `POST /auth/device/start`, or
+    /// [`ClientError::Malformed`] if the response is unsafe to show or open:
+    /// a user code that is not short ASCII alphanumerics and `-`, or a
+    /// verification URL that fails [`crate::cli::check_browser_url`], is on
+    /// a foreign origin (see
+    /// [`crate::client::ForgsClientBuilder::verification_origin`]), or is
+    /// plain `http` while the client's base is `https`.
     pub async fn start(client: &ForgsClient) -> Result<Self, ClientError> {
         let start = client.device_start().await?;
+        validate_start(client, &start)?;
         Ok(Self {
             start,
             started_at: Instant::now(),
@@ -102,10 +116,11 @@ impl DeviceLogin {
             .unwrap_or_else(|| self.verification_uri())
     }
 
-    /// How long the flow lives, as the server reported it.
+    /// How long the flow lives, as the server reported it, capped at
+    /// [`MAX_EXPIRES_IN`].
     #[must_use]
     pub fn expires_in(&self) -> Duration {
-        Duration::from_secs(self.start.expires_in)
+        Duration::from_secs(self.start.expires_in).min(MAX_EXPIRES_IN)
     }
 
     /// [`DeviceLogin::wait_with`] under the default [`PollPolicy`].
@@ -127,19 +142,23 @@ impl DeviceLogin {
         client: &ForgsClient,
         policy: PollPolicy,
     ) -> Result<LoginSession, DeviceLoginError> {
-        let lifetime = match self.start.expires_in {
-            0 => policy.default_expires_in,
-            s => Duration::from_secs(s),
-        };
-        let deadline = self.started_at + lifetime;
-        let mut interval = Duration::from_secs(self.start.interval).max(policy.min_interval);
+        let (deadline, mut interval) = timing(
+            self.started_at,
+            self.start.expires_in,
+            self.start.interval,
+            &policy,
+        );
+        let max_interval = MAX_INTERVAL.max(policy.min_interval);
         let mut transport_failures = 0_u32;
 
         loop {
-            if Instant::now() >= deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
                 return Err(DeviceLoginError::Expired);
             }
-            tokio::time::sleep(interval).await;
+            // Never sleep past the deadline; the poll after it still runs,
+            // since an approval may have landed in the meantime.
+            tokio::time::sleep(interval.min(remaining)).await;
 
             match client.device_poll(&self.start.device_secret).await {
                 Ok(outcome) => {
@@ -147,7 +166,9 @@ impl DeviceLogin {
                     match outcome {
                         DevicePollResponse::Pending => {}
                         DevicePollResponse::SlowDown => {
-                            interval = interval.saturating_add(policy.slow_down_step);
+                            interval = interval
+                                .saturating_add(policy.slow_down_step)
+                                .min(max_interval);
                         }
                         DevicePollResponse::Denied => return Err(DeviceLoginError::Denied),
                         DevicePollResponse::Expired => return Err(DeviceLoginError::Expired),
@@ -167,6 +188,57 @@ impl DeviceLogin {
             }
         }
     }
+}
+
+/// The flow's deadline and first poll interval, clamped so no server value
+/// can overflow an `Instant` or stall the poll loop.
+fn timing(
+    started_at: Instant,
+    expires_in: u64,
+    interval: u64,
+    policy: &PollPolicy,
+) -> (Instant, Duration) {
+    let lifetime = match expires_in {
+        0 => policy.default_expires_in,
+        s => Duration::from_secs(s),
+    }
+    .min(MAX_EXPIRES_IN);
+    let deadline = started_at.checked_add(lifetime).unwrap_or(started_at);
+    let interval = Duration::from_secs(interval)
+        .min(MAX_INTERVAL)
+        .max(policy.min_interval);
+    (deadline, interval)
+}
+
+/// Refuse a device-start response whose user-facing strings could smuggle
+/// terminal escapes or point the human (and their browser) somewhere else.
+/// The messages never quote the offending value.
+fn validate_start(client: &ForgsClient, start: &DeviceStartResponse) -> Result<(), ClientError> {
+    let code = &start.user_code;
+    if code.is_empty()
+        || code.len() > MAX_USER_CODE_LEN
+        || !code.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        return Err(ClientError::Malformed(
+            "device start: unusable user_code".to_owned(),
+        ));
+    }
+    let check = |field: &str, url: &str| {
+        let bad = || ClientError::Malformed(format!("device start: unsafe {field}"));
+        let uri = crate::cli::check_browser_url(url).map_err(|_| bad())?;
+        if uri.scheme_str() == Some("http") && !client.is_plain_http() {
+            return Err(bad());
+        }
+        if !client.verification_origin_allowed(&uri) {
+            return Err(bad());
+        }
+        Ok(())
+    };
+    check("verification_uri", &start.verification_uri)?;
+    if let Some(complete) = &start.verification_uri_complete {
+        check("verification_uri_complete", complete)?;
+    }
+    Ok(())
 }
 
 /// Why a device login did not produce a session. The messages are
@@ -263,5 +335,75 @@ mod tests {
         assert!(!s.contains("SEKRIT"), "{s}");
         assert!(s.contains("ABCD-1234"));
         assert_eq!(d.browser_uri(), "https://x/device");
+    }
+
+    #[test]
+    fn timing_is_clamped() {
+        let p = PollPolicy::default();
+        let now = Instant::now();
+        let (deadline, interval) = timing(now, u64::MAX, u64::MAX, &p);
+        assert_eq!(deadline - now, MAX_EXPIRES_IN);
+        assert_eq!(interval, MAX_INTERVAL);
+        let (deadline, interval) = timing(now, 0, 0, &p);
+        assert_eq!(deadline - now, p.default_expires_in);
+        assert_eq!(interval, p.min_interval);
+        let (deadline, interval) = timing(now, 900, 7, &p);
+        assert_eq!(deadline - now, Duration::from_mins(15));
+        assert_eq!(interval, Duration::from_secs(7));
+    }
+
+    fn start_with(code: &str, uri: &str, complete: Option<&str>) -> DeviceStartResponse {
+        DeviceStartResponse {
+            device_secret: "s".into(),
+            user_code: code.into(),
+            verification_uri: uri.into(),
+            verification_uri_complete: complete.map(Into::into),
+            interval: 5,
+            expires_in: 900,
+        }
+    }
+
+    #[test]
+    fn start_responses_are_validated() {
+        let c = ForgsClient::new("https://auth.example/forgs", None).unwrap();
+        let good = "https://auth.example/forgs/auth/device";
+        let good_c = "https://auth.example/forgs/auth/device?code=ABCD-1234";
+        assert!(validate_start(&c, &start_with("ABCD-1234", good, Some(good_c))).is_ok());
+        assert!(validate_start(&c, &start_with("ABCD1234", good, None)).is_ok());
+
+        let long = "A".repeat(MAX_USER_CODE_LEN + 1);
+        for code in ["", "\u{1b}[2J", "AB CD", "ABCD\n", long.as_str()] {
+            assert!(
+                matches!(
+                    validate_start(&c, &start_with(code, good, None)),
+                    Err(ClientError::Malformed(_))
+                ),
+                "{code:?}"
+            );
+        }
+        for uri in [
+            "https://evil.example/x",
+            "file:///etc/passwd",
+            "http://auth.example/forgs/auth/device",
+            "https://auth.example:8443/auth/device",
+            "https://auth.example/a&b c",
+            "https://auth.example/\u{1b}]8;;x",
+            "-https://auth.example/",
+        ] {
+            for (u, comp) in [(uri, None), (good, Some(uri))] {
+                let r = validate_start(&c, &start_with("ABCD-1234", u, comp));
+                assert!(matches!(r, Err(ClientError::Malformed(_))), "{u} {comp:?}");
+                let msg = r.unwrap_err().to_string();
+                assert!(!msg.contains('\u{1b}') && !msg.contains("evil"), "{msg}");
+            }
+        }
+
+        // An http base may get an http verification URL on its own origin.
+        let c = ForgsClient::new("http://127.0.0.1:7000", None).unwrap();
+        assert!(validate_start(
+            &c,
+            &start_with("ABCD-1234", "http://127.0.0.1:7000/auth/device", None)
+        )
+        .is_ok());
     }
 }

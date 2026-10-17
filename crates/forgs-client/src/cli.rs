@@ -21,18 +21,77 @@ pub fn should_try_browser() -> bool {
     }
 }
 
+/// Longest URL [`check_browser_url`] accepts.
+pub const MAX_BROWSER_URL_LEN: usize = 2048;
+
+/// Check that `url` is safe to hand to an OS URL launcher and to print:
+/// an absolute `http(s)` URL with a host, no userinfo, at most
+/// [`MAX_BROWSER_URL_LEN`] bytes, not starting with `-` (an option to
+/// `open`/`xdg-open`), and free of control characters, spaces and the
+/// shell/`cmd` metacharacters (double and single quote, backtick, `<`,
+/// `>`, backslash, `^`, `|`).
+///
+/// This is syntax only: it does not say *which* host is acceptable.
+/// [`crate::device::DeviceLogin::start`] also requires the server's origin.
+///
+/// # Errors
+///
+/// [`ClientError::Url`] naming the rule broken (never quoting the URL,
+/// which may carry terminal escapes).
+pub fn check_browser_url(url: &str) -> Result<http::Uri, ClientError> {
+    let bad = |why: &str| Err(ClientError::Url(format!("unsafe browser URL: {why}")));
+    if url.is_empty() || url.len() > MAX_BROWSER_URL_LEN {
+        return bad("empty or too long");
+    }
+    if url.starts_with('-') {
+        return bad("starts with `-`");
+    }
+    if url.bytes().any(|b| {
+        !b.is_ascii_graphic()
+            || matches!(b, b'"' | b'\'' | b'`' | b'<' | b'>' | b'\\' | b'^' | b'|')
+    }) {
+        return bad("contains a control, space, non-ASCII or metacharacter");
+    }
+    let Ok(uri) = url.parse::<http::Uri>() else {
+        return bad("not a URL");
+    };
+    if !matches!(uri.scheme_str(), Some("http" | "https")) {
+        return bad("scheme is not http(s)");
+    }
+    match uri.authority() {
+        Some(a) if !a.host().is_empty() && !a.as_str().contains('@') => Ok(uri),
+        _ => bad("no host, or carries userinfo"),
+    }
+}
+
+/// The launcher for this OS: program and leading arguments; the URL is
+/// appended as one more argument.
+///
+/// Windows uses `rundll32 url.dll,FileProtocolHandler`, never
+/// `cmd /C start`: `cmd` re-parses its command line, so a `&` in a
+/// server-supplied URL (`?code=A&calc.exe`) would run a command.
+fn launcher() -> (&'static str, &'static [&'static str]) {
+    if cfg!(target_os = "macos") {
+        ("open", &[])
+    } else if cfg!(target_os = "windows") {
+        ("rundll32", &["url.dll,FileProtocolHandler"])
+    } else {
+        ("xdg-open", &[])
+    }
+}
+
 /// Best-effort browser launch, detached and silenced (a browser's chatter on
 /// our stderr would bury the code the user needs to read). Returns whether a
 /// launcher was spawned; the caller has already printed the URL either way.
+///
+/// Refuses (returns `false` without spawning anything) a URL that fails
+/// [`check_browser_url`].
 #[must_use = "a false return means no browser was opened"]
 pub fn try_open_browser(url: &str) -> bool {
-    let (program, args): (&str, &[&str]) = if cfg!(target_os = "macos") {
-        ("open", &[])
-    } else if cfg!(target_os = "windows") {
-        ("cmd", &["/C", "start", ""])
-    } else {
-        ("xdg-open", &[])
-    };
+    if check_browser_url(url).is_err() {
+        return false;
+    }
+    let (program, args) = launcher();
     std::process::Command::new(program)
         .args(args)
         .arg(url)
@@ -120,7 +179,16 @@ pub fn describe(err: &ClientError, doing: &str) -> String {
             error_code::INVALID_REQUEST => {
                 format!("{doing} failed: the server refused the request as invalid")
             }
-            other => format!("{doing} failed: the server answered {status} ({other})"),
+            other => {
+                // `Rejected` can be built by anyone; never echo a code that
+                // could carry terminal escapes.
+                let other = if crate::transport::sane_code(other) {
+                    other
+                } else {
+                    "unknown"
+                };
+                format!("{doing} failed: the server answered {status} ({other})")
+            }
         },
         ClientError::Transport(e) => format!("{doing} failed: could not reach the server: {e}"),
         ClientError::Url(e) => format!("{doing} failed: {e}"),
@@ -165,5 +233,59 @@ mod tests {
         assert!(describe(&rej("not_found"), "x").contains("no such"));
         assert!(describe(&rej("weird"), "x").contains("400 (weird)"));
         assert!(describe(&ClientError::Transport("refused".into()), "x").contains("reach"));
+        let d = describe(&rej("\u{1b}]8;;evil\u{7}x"), "x");
+        assert!(!d.contains('\u{1b}'), "{d:?}");
+        assert!(d.contains("400 (unknown)"), "{d}");
+    }
+
+    #[test]
+    fn browser_urls() {
+        for ok in [
+            "https://auth.example/forgs/auth/device?code=ABCD-1234",
+            "http://127.0.0.1:7000/auth/device",
+            // `&` is harmless once no shell or cmd re-parses the URL.
+            "https://x/device?code=A&calc.exe",
+        ] {
+            assert!(check_browser_url(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "",
+            "https://x/a b",
+            "https://x/a\"b",
+            "https://x/a'b",
+            "https://x/a^b",
+            "https://x/a|b",
+            "https://x/a<b",
+            "https://x/a`b",
+            "https://x/a\\b",
+            "https://x/\u{e9}",
+            "file:///etc/passwd",
+            "ms-msdt:foo",
+            "search-ms:x",
+            "javascript:x",
+            "-psn",
+            "--help",
+            "https://u@x/",
+            "https://x/\u{1b}]8;;",
+            "https://x/\n",
+            "//x/",
+            "https:///x",
+            "/relative",
+        ] {
+            assert!(
+                matches!(check_browser_url(bad), Err(ClientError::Url(_))),
+                "{bad:?}"
+            );
+            assert!(!try_open_browser(bad), "{bad:?}");
+        }
+        let long = format!("https://x/{}", "a".repeat(MAX_BROWSER_URL_LEN));
+        assert!(check_browser_url(&long).is_err());
+    }
+
+    #[test]
+    fn launcher_never_uses_cmd() {
+        let (program, args) = launcher();
+        assert_ne!(program, "cmd");
+        assert!(!args.iter().any(|a| a.eq_ignore_ascii_case("start")));
     }
 }

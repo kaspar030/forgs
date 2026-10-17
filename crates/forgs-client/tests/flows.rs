@@ -47,9 +47,9 @@ fn fast() -> PollPolicy {
     }
 }
 
-fn device_start_json(expires_in: u64) -> serde_json::Value {
+fn device_start_json(stub: &StubServer, expires_in: u64) -> serde_json::Value {
     json!({"device_secret": format!("{MARK}-device"), "user_code": "ABCD-1234",
-           "verification_uri": "https://auth.example/device", "interval": 0,
+           "verification_uri": format!("{}/auth/device", stub.base()), "interval": 0,
            "expires_in": expires_in})
 }
 
@@ -250,7 +250,7 @@ async fn device_login_pending_slow_down_granted() {
     let (stub, c) = setup().await;
     stub.script(
         "/auth/device/start",
-        vec![Reply::json(&device_start_json(900))],
+        vec![Reply::json(&device_start_json(&stub, 900))],
     );
     stub.script(
         "/auth/device/poll",
@@ -267,7 +267,10 @@ async fn device_login_pending_slow_down_granted() {
     );
     let login = DeviceLogin::start(&c).await.unwrap();
     assert_eq!(login.user_code(), "ABCD-1234");
-    assert_eq!(login.verification_uri(), "https://auth.example/device");
+    assert_eq!(
+        login.verification_uri(),
+        format!("{}/auth/device", stub.base())
+    );
     assert_redacted(&login);
 
     let started = std::time::Instant::now();
@@ -298,7 +301,7 @@ async fn device_login_denied_and_expired() {
     let (stub, c) = setup().await;
     stub.script(
         "/auth/device/start",
-        vec![Reply::json(&device_start_json(900))],
+        vec![Reply::json(&device_start_json(&stub, 900))],
     );
     for (status, want) in [("denied", "Denied"), ("expired", "Expired")] {
         stub.script(
@@ -320,7 +323,7 @@ async fn device_login_stops_at_the_deadline() {
     // Expires in 1s; the server keeps saying pending.
     stub.script(
         "/auth/device/start",
-        vec![Reply::json(&device_start_json(1))],
+        vec![Reply::json(&device_start_json(&stub, 1))],
     );
     stub.script(
         "/auth/device/poll",
@@ -341,7 +344,7 @@ async fn device_login_retries_transport_blips() {
     let (stub, c) = setup().await;
     stub.script(
         "/auth/device/start",
-        vec![Reply::json(&device_start_json(900))],
+        vec![Reply::json(&device_start_json(&stub, 900))],
     );
     stub.script(
         "/auth/device/poll",
@@ -731,4 +734,110 @@ async fn members_and_rename() {
             ),
         ]
     );
+}
+
+#[tokio::test]
+async fn device_start_refuses_hostile_responses() {
+    let (stub, c) = setup().await;
+    let good = format!("{}/auth/device", stub.base());
+    for (code, uri, complete) in [
+        ("ABCD-1234", "https://evil.example/x".to_owned(), None),
+        ("ABCD-1234", "file:///x".to_owned(), None),
+        (
+            "ABCD-1234",
+            good.clone(),
+            Some("https://evil.example/x?code=A&calc.exe"),
+        ),
+        ("\u{1b}[2J", good.clone(), None),
+    ] {
+        stub.script(
+            "/auth/device/start",
+            vec![Reply::json(&json!({"device_secret": format!("{MARK}-d"),
+                "user_code": code, "verification_uri": uri,
+                "verification_uri_complete": complete, "interval": 5, "expires_in": 900}))],
+        );
+        let e = DeviceLogin::start(&c).await.unwrap_err();
+        assert!(matches!(e, ClientError::Malformed(_)), "{e:?}");
+        let s = format!("{e} {e:?}");
+        assert!(
+            !s.contains("evil") && !s.contains('\u{1b}') && !s.contains(MARK),
+            "{s}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn device_start_clamps_huge_timings() {
+    let (stub, c) = setup().await;
+    stub.script(
+        "/auth/device/start",
+        vec![Reply::json(&json!({"device_secret": format!("{MARK}-d"),
+            "user_code": "ABCD-1234", "verification_uri": format!("{}/auth/device", stub.base()),
+            "interval": u64::MAX, "expires_in": u64::MAX}))],
+    );
+    stub.script(
+        "/auth/device/poll",
+        vec![Reply::json(&{
+            let mut v = token_json(false);
+            v["status"] = json!("granted");
+            v
+        })],
+    );
+    let login = DeviceLogin::start(&c).await.unwrap();
+    assert_eq!(login.expires_in(), forgs_client::device::MAX_EXPIRES_IN);
+}
+
+#[tokio::test]
+async fn hostile_error_codes_become_unknown() {
+    let (stub, c) = setup().await;
+    stub.script(
+        "/auth/token",
+        vec![Reply::status(401, "{\"error\":\"\\u001b[31mx\"}")],
+    );
+    let e = c.redeem_refresh_token("s").await.unwrap_err();
+    assert_eq!(e.code(), Some("unknown"));
+    assert_eq!(e.status(), Some(401));
+}
+
+#[tokio::test]
+async fn a_verification_origin_admits_a_split_public_name() {
+    let stub = StubServer::start().await;
+    let public = "https://login.example";
+    stub.script(
+        "/auth/device/start",
+        vec![Reply::json(&json!({"device_secret": format!("{MARK}-d"),
+            "user_code": "ABCD-1234", "verification_uri": format!("{public}/auth/device"),
+            "verification_uri_complete": format!("{public}/auth/device?code=ABCD-1234"),
+            "interval": 5, "expires_in": 900}))],
+    );
+    let plain = ForgsClient::new(&stub.base(), None).unwrap();
+    assert!(matches!(
+        DeviceLogin::start(&plain).await,
+        Err(ClientError::Malformed(_))
+    ));
+    let split = ForgsClient::builder(&stub.base())
+        .verification_origin(public)
+        .build()
+        .unwrap();
+    let login = DeviceLogin::start(&split).await.unwrap();
+    assert_eq!(
+        login.browser_uri(),
+        "https://login.example/auth/device?code=ABCD-1234"
+    );
+}
+
+#[test]
+fn http_base_policy() {
+    assert!(matches!(
+        ForgsClient::new("http://auth.example", None),
+        Err(ClientError::Url(_))
+    ));
+    assert!(matches!(
+        ForgsClient::new("http://127.0.0.1:1", Some([0; 32])),
+        Err(ClientError::Url(_))
+    ));
+    assert!(ForgsClient::builder("http://auth.example")
+        .allow_insecure_http(true)
+        .build()
+        .is_ok());
 }
