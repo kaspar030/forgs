@@ -15,7 +15,7 @@ unsafe_code = "forbid"
 pedantic = { level = "warn", priority = -1 }
 
 [workspace.package]
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 # 1.94: sqlx 0.9's MSRV.
 rust-version = "1.94"
@@ -29,11 +29,11 @@ categories = ["authentication", "web-programming"]
 
 [workspace.dependencies]
 # internal
-forgs = { path = "crates/forgs", version = "0.1.1" }
-forgs-client = { path = "crates/forgs-client", version = "0.1.1" }
-forgs-http = { path = "crates/forgs-http", version = "0.1.1" }
-forgs-idp = { path = "crates/forgs-idp", version = "0.1.1" }
-forgs-store = { path = "crates/forgs-store", version = "0.1.1" }
+forgs = { path = "crates/forgs", version = "0.2.0" }
+forgs-client = { path = "crates/forgs-client", version = "0.2.0" }
+forgs-http = { path = "crates/forgs-http", version = "0.2.0" }
+forgs-idp = { path = "crates/forgs-idp", version = "0.2.0" }
+forgs-store = { path = "crates/forgs-store", version = "0.2.0" }
 
 # Dependency discipline:
 #

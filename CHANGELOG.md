@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 — 2026-10-16
 
 ### Security
 
@@ -80,6 +80,17 @@
   github.com repo and a GHES repo can never share a subject.
 
 ### Breaking
+
+- Root namespace names (usernames included) that parse as a node id are
+  refused (`NameError::IdShaped`), so a single-segment reference is never both
+  an id and a name. Child names are unaffected.
+- Child names now compare case-insensitively for sibling uniqueness,
+  tombstones and path lookup, as root names already did (migration 0007). The
+  migration refuses to run if two siblings differ only by case; rename one
+  first. Display case is kept.
+- `SubjectKey::parse` returns the canonical key (ids upper-cased, agent names
+  lowercased) and refuses non-canonical workload ids instead of accepting
+  spellings that would never match a grant.
 
 - Workload JWTs must carry a non-empty `jti` (GitHub Actions and GHES tokens
   do). `WorkloadClaims` gains `jti` and `accept_until`; `SweepCounts` gains
