@@ -290,6 +290,7 @@ pub(crate) struct Inner {
     pub(crate) max_pending_devices_per_source: u64,
     pub(crate) max_api_keys_per_namespace: u64,
     pub(crate) max_api_keys_per_user: u64,
+    pub(crate) max_ssh_keys_per_user: u64,
     pub(crate) client_ip: Arc<dyn ClientIp>,
     /// Poll state per device-secret hash, for `slow_down`.
     pub(crate) poll_log: Mutex<HashMap<String, PollState>>,
@@ -446,6 +447,7 @@ impl AuthContext {
             max_pending_devices_per_source: 32,
             max_api_keys_per_namespace: 1000,
             max_api_keys_per_user: 100,
+            max_ssh_keys_per_user: 100,
             client_ip: Arc::new(NoClientIp),
         }
     }
@@ -622,6 +624,7 @@ pub struct AuthContextBuilder {
     max_pending_devices_per_source: u64,
     max_api_keys_per_namespace: u64,
     max_api_keys_per_user: u64,
+    max_ssh_keys_per_user: u64,
     client_ip: Arc<dyn ClientIp>,
 }
 
@@ -799,6 +802,14 @@ impl AuthContextBuilder {
         self
     }
 
+    /// Ceiling on **live** (unexpired) SSH public keys one user may register
+    /// (default 100; `u64::MAX` disables). Past it an add is `403 key_limit`.
+    #[must_use]
+    pub fn max_ssh_keys_per_user(mut self, n: u64) -> Self {
+        self.max_ssh_keys_per_user = n;
+        self
+    }
+
     /// How the device-start route learns the caller's address (default
     /// [`NoClientIp`]: the [`PeerIp`] extension if present, never a header).
     #[must_use]
@@ -895,6 +906,7 @@ impl AuthContextBuilder {
                 max_pending_devices_per_source: self.max_pending_devices_per_source,
                 max_api_keys_per_namespace: self.max_api_keys_per_namespace,
                 max_api_keys_per_user: self.max_api_keys_per_user,
+                max_ssh_keys_per_user: self.max_ssh_keys_per_user,
                 client_ip: self.client_ip,
                 poll_log: Mutex::new(HashMap::new()),
                 decide_misses: Mutex::new(HashMap::new()),

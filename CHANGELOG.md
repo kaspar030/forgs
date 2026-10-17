@@ -79,7 +79,33 @@
   now required in the token. Subjects are also namespaced per issuer, so a
   github.com repo and a GHES repo can never share a subject.
 
+### Added
+
+- SSH public keys as a user credential, for git-over-SSH consumers.
+  `forgs::ssh` parses and strictly validates OpenSSH keys (`ssh-ed25519`,
+  `ecdsa-sha2-nistp256`/`384`, `ssh-rsa` of 3072 to 16384 bits; DSA,
+  `nistp521`, certificates and FIDO `sk-*` keys are refused) from an
+  `authorized_keys` line or the raw wire blob, and computes the canonical
+  `SHA256:` fingerprint. `authenticate_ssh_key` maps a key to its user's
+  `user:<id>` subject through the new `SshKeyStore` seam (implemented by
+  `Store`); a disabled user's keys are inert. The SSH server must accept only
+  `rsa-sha2-*` RSA signatures (`SshKeyType::accepted_signature_algorithms`).
+- Migration 0009 adds `forgs_ssh_key`; a fingerprint maps to exactly one user
+  (`StoreError::SshKeyTaken`). `Store::add_ssh_key` (capped per user),
+  `ssh_keys_for_user`, `ssh_key_of_user`, `delete_ssh_key`,
+  `delete_ssh_keys_added_after`, `ssh_key_by_fingerprint`, `touch_ssh_key`
+  (throttled to once a minute). The sweep deletes expired keys.
+- Routes `GET`/`POST /auth/keys/ssh` and `POST /auth/keys/ssh/delete`
+  (session bearer, or cookie + CSRF; users only), `409 ssh_key_taken`,
+  `AuthContextBuilder::max_ssh_keys_per_user` (default 100, `403 key_limit`),
+  audit events `ssh_key.add` / `.delete` / `.denied`. `forgs-client` gains
+  `list_ssh_keys`, `add_ssh_key`, `delete_ssh_key`.
+
 ### Breaking
+
+- `SweepCounts` gains `ssh_keys`; `LogoutRequest` gains
+  `ssh_keys_added_after` (with `all`, deletes SSH keys added after that time);
+  `StoreError` gains `SshKeyTaken`.
 
 - Root namespace names (usernames included) that parse as a node id are
   refused (`NameError::IdShaped`), so a single-segment reference is never both

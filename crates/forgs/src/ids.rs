@@ -182,6 +182,10 @@ ulid_id!(
     GrantId
 );
 ulid_id!(
+    /// A registered SSH public key of a user.
+    SshKeyId
+);
+ulid_id!(
     /// A pending approval (device flow / pending registration).
     PendingId
 );

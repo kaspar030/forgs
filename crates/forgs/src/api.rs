@@ -68,6 +68,9 @@ pub mod error_code {
     pub const REAUTH_REQUIRED: &str = "reauth_required";
     /// Too many failed attempts; retry later.
     pub const RATE_LIMITED: &str = "rate_limited";
+    /// The SSH public key is already registered (to this or another user):
+    /// a key maps to exactly one account.
+    pub const SSH_KEY_TAKEN: &str = "ssh_key_taken";
 }
 
 /// A token-exchange request to `POST /auth/token`.
@@ -171,6 +174,11 @@ pub struct LogoutRequest {
     /// then `logout --all`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identities_linked_after: Option<u64>,
+    /// With [`LogoutRequest::all`] only (ignored otherwise): also delete
+    /// every SSH public key added **after** this epoch (seconds) — for
+    /// "someone may have added an SSH key to my account".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_keys_added_after: Option<u64>,
 }
 
 /// One linked login method, in an [`IdentityList`].
@@ -207,6 +215,58 @@ pub struct IdentityList {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnlinkIdentityRequest {
     /// The identity id from [`IdentityInfo::id`].
+    pub id: String,
+}
+
+/// A request to `POST /auth/keys/ssh`: register an SSH public key for the
+/// caller.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshKeyAddRequest {
+    /// The public key as an `authorized_keys`-style line
+    /// (`ssh-ed25519 AAAA… comment`), without options.
+    pub public_key: String,
+    /// A label; defaults to the key's comment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Expiry (epoch seconds); `None` for a key that does not expire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<u64>,
+}
+
+/// One registered SSH public key, in an [`SshKeyList`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshKeyInfo {
+    /// The key id (what [`SshKeyDeleteRequest::id`] names).
+    pub id: String,
+    /// The key type (`ssh-ed25519`, …).
+    pub key_type: String,
+    /// `SHA256:…`, as `ssh-keygen -lf` prints it.
+    pub fingerprint: String,
+    /// The key as `type base64`, without a comment.
+    pub public_key: String,
+    /// The label.
+    pub title: String,
+    /// When it was added (epoch seconds).
+    pub created_at: u64,
+    /// When it last authenticated (epoch seconds, coarse).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<u64>,
+    /// Expiry (epoch seconds).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<u64>,
+}
+
+/// `GET /auth/keys/ssh`: the caller's SSH public keys, oldest first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshKeyList {
+    /// The keys.
+    pub keys: Vec<SshKeyInfo>,
+}
+
+/// A request to `POST /auth/keys/ssh/delete`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshKeyDeleteRequest {
+    /// The key id from [`SshKeyInfo::id`].
     pub id: String,
 }
 
@@ -588,6 +648,7 @@ impl std::fmt::Debug for LogoutRequest {
             .field("refresh_token", &redact_opt(self.refresh_token.as_ref()))
             .field("all", &self.all)
             .field("identities_linked_after", &self.identities_linked_after)
+            .field("ssh_keys_added_after", &self.ssh_keys_added_after)
             .finish()
     }
 }
@@ -717,6 +778,7 @@ mod tests {
                 refresh_token: Some("r".into()),
                 all: true,
                 identities_linked_after: None,
+                ssh_keys_added_after: None,
             },
             &json!({"refresh_token": "r", "all": true}),
         );
@@ -725,9 +787,48 @@ mod tests {
                 refresh_token: None,
                 all: true,
                 identities_linked_after: Some(7),
+                ssh_keys_added_after: Some(8),
             },
-            &json!({"all": true, "identities_linked_after": 7}),
+            &json!({"all": true, "identities_linked_after": 7, "ssh_keys_added_after": 8}),
         );
+    }
+
+    #[test]
+    fn ssh_key_shapes() {
+        round_trip(
+            &SshKeyAddRequest {
+                public_key: "ssh-ed25519 AAAA".into(),
+                title: None,
+                expires_at: None,
+            },
+            &json!({"public_key": "ssh-ed25519 AAAA"}),
+        );
+        round_trip(
+            &SshKeyAddRequest {
+                public_key: "k".into(),
+                title: Some("laptop".into()),
+                expires_at: Some(9),
+            },
+            &json!({"public_key": "k", "title": "laptop", "expires_at": 9}),
+        );
+        round_trip(
+            &SshKeyList {
+                keys: vec![SshKeyInfo {
+                    id: "i".into(),
+                    key_type: "ssh-ed25519".into(),
+                    fingerprint: "SHA256:x".into(),
+                    public_key: "ssh-ed25519 AAAA".into(),
+                    title: "t".into(),
+                    created_at: 1,
+                    last_used_at: Some(2),
+                    expires_at: None,
+                }],
+            },
+            &json!({"keys": [{"id": "i", "key_type": "ssh-ed25519", "fingerprint": "SHA256:x",
+                "public_key": "ssh-ed25519 AAAA", "title": "t", "created_at": 1,
+                "last_used_at": 2}]}),
+        );
+        round_trip(&SshKeyDeleteRequest { id: "i".into() }, &json!({"id": "i"}));
     }
 
     #[test]
@@ -1042,6 +1143,7 @@ mod tests {
                     refresh_token: Some(S.into()),
                     all: true,
                     identities_linked_after: None,
+                    ssh_keys_added_after: None,
                 }
             ),
             format!(

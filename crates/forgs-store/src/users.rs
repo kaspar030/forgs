@@ -655,7 +655,8 @@ impl Store {
     /// Disabling also deletes, in the same transaction, every workload token
     /// minted from the user's API keys. The keys themselves are kept: they
     /// are inert while the user is disabled (see [`Store::consume_api_key`])
-    /// and redeemable again after re-enabling.
+    /// and redeemable again after re-enabling. The user's SSH keys likewise
+    /// stay registered but stop authenticating until re-enabled.
     ///
     /// Disabling is never refused (an operator must be able to lock out an
     /// account), but it can leave namespaces with no active admin: those
@@ -736,7 +737,8 @@ impl Store {
 
     /// Delete a user, in one transaction: tombstone the username, delete the
     /// personal node (which must be a leaf), then the user row, which cascades
-    /// identities, emails, sessions, refresh tokens and memberships, and
+    /// identities, emails, sessions, refresh tokens, SSH keys and
+    /// memberships, and
     /// clears `created_by` on grants. The user's API keys and the workload
     /// tokens minted from them are deleted first, so a NULL `created_by` on
     /// a key keeps meaning "shell-minted" rather than "orphaned but live".

@@ -246,7 +246,8 @@ pub async fn redeem_refresh_token(
 ///   is ignored silently: never an oracle, never a cross-user delete.
 /// * `all` — delete every session and refresh token of the calling user;
 ///   the lost-machine answer. With `identities_linked_after`, also unlink
-///   every identity linked after that time (never the user's oldest one).
+///   every identity linked after that time (never the user's oldest one);
+///   with `ssh_keys_added_after`, delete every SSH key added after that time.
 ///
 /// Success is uniform whether or not rows existed. **A storage failure is an
 /// error, not a success**: "revoked" and "already gone" must be
@@ -284,7 +285,15 @@ pub async fn logout(
                 .map_err(|e| internal("logout --all identities", &e))?,
             None => 0,
         };
-        format!("logout --all: {s} sessions, {r} refresh tokens, {i} identities")
+        let k = match req.ssh_keys_added_after {
+            Some(t) => ctx
+                .store()
+                .delete_ssh_keys_added_after(user, t)
+                .await
+                .map_err(|e| internal("logout --all ssh keys", &e))?,
+            None => 0,
+        };
+        format!("logout --all: {s} sessions, {r} refresh tokens, {i} identities, {k} ssh keys")
     } else {
         ctx.store()
             .delete_session(&caller.auth.hash)

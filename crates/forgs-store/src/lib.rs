@@ -36,6 +36,10 @@
 //! * **Per-user queries** — sessions and refresh tokens (not namespace-bound,
 //!   design §3), [`Store::memberships_of_user`] ("my namespaces"): keyed by
 //!   the authenticated user, which the caller cannot choose.
+//! * **SSH public keys** — per-user listing and deletion keyed by the
+//!   authenticated user, and the lookup by fingerprint
+//!   ([`SshKeyStore`](forgs::SshKeyStore)), which the SSH server asks only
+//!   after the client proved possession of the private key.
 //! * **Users, identities and the namespace tree** — global by nature: names
 //!   share one root name space, and ancestor / role chains are how authz
 //!   decides *which* namespace a request may touch. These return structure,
@@ -64,6 +68,7 @@ mod migrate;
 mod ns;
 mod pending;
 mod scoped;
+mod ssh_keys;
 mod sweep;
 mod tokens;
 mod tombstones;
@@ -85,6 +90,7 @@ pub use pending::{ApprovedDevice, LiveCounts, PendingDevice, PendingSignup};
 pub use scoped::{
     ApiKeyCap, ApiKeyRow, AuditEntry, AuditRow, MemberRow, NewApiKey, NewGrant, NsScope,
 };
+pub use ssh_keys::SshKey;
 pub use sweep::SweepCounts;
 pub use tombstones::{ReleaseCause, ReleaseLimit, Tombstone, DEFAULT_RELEASE_LIMIT};
 pub use users::{Identity, NewIdentity, NewSignup, User, UserState};

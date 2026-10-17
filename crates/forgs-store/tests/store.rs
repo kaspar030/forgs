@@ -2878,6 +2878,7 @@ async fn sweep_removes_exactly_the_dead_rows() {
             workload_tokens: 1,
             workload_jtis: 1,
             api_keys: 2,
+            ssh_keys: 0,
             pending_signups: 1,
             pending_devices: 2,
             audit: 0,
@@ -3194,4 +3195,215 @@ async fn concurrent_mutual_demotions_leave_an_admin() {
             .count();
         assert_eq!(admins, 1);
     }
+}
+
+// ---------------------------------------------------------------------------
+// SSH keys
+// ---------------------------------------------------------------------------
+
+/// A structurally valid ed25519 key whose 32 key bytes are all `n`.
+fn ssh_key(n: u8) -> forgs::SshPublicKey {
+    let mut blob = Vec::new();
+    for field in [b"ssh-ed25519".as_slice(), &[n; 32]] {
+        blob.extend_from_slice(&u32::try_from(field.len()).unwrap().to_be_bytes());
+        blob.extend_from_slice(field);
+    }
+    forgs::SshPublicKey::from_wire(&blob).unwrap()
+}
+
+#[tokio::test]
+async fn ssh_keys_are_added_listed_and_deleted_per_user() {
+    use forgs::SshKeyStore as _;
+    let s = store(fleet()).await;
+    let (alice, _) = s.signup(&signup("alice", "1", None), NOW).await.unwrap();
+    let (bob, _) = s.signup(&signup("bob", "2", None), NOW).await.unwrap();
+    let k1 = s
+        .add_ssh_key(alice, &ssh_key(1), "laptop", None, 10, NOW)
+        .await
+        .unwrap();
+    let k2 = s
+        .add_ssh_key(alice, &ssh_key(2), "desk", Some(NOW + 100), 10, NOW + 1)
+        .await
+        .unwrap();
+    let keys = s.ssh_keys_for_user(alice).await.unwrap();
+    assert_eq!(keys.iter().map(|k| k.id).collect::<Vec<_>>(), vec![k1, k2]);
+    assert_eq!(keys[0].title, "laptop");
+    assert_eq!(keys[0].fingerprint, ssh_key(1).fingerprint());
+    assert_eq!(keys[0].public_key, ssh_key(1).to_openssh());
+    assert_eq!(keys[0].key_type, forgs::SshKeyType::Ed25519);
+    assert_eq!(keys[1].expires, Some(NOW + 100));
+    assert!(s.ssh_keys_for_user(bob).await.unwrap().is_empty());
+
+    // A key maps to exactly one user: taken for bob, and for alice again.
+    for u in [alice, bob] {
+        assert!(matches!(
+            s.add_ssh_key(u, &ssh_key(1), "again", None, 10, NOW).await,
+            Err(StoreError::SshKeyTaken)
+        ));
+    }
+    // The UNIQUE backstop maps the same way.
+    let raw = sqlx::query(
+        "INSERT INTO forgs_ssh_key (id, user_id, key_type, public_key, fingerprint, title, created_at)
+         VALUES ('01ARZ3NDEKTSV4RRFFQ69G5FAV', ?1, 'ssh-ed25519', 'x', ?2, 't', 0)",
+    )
+    .bind(bob.to_string())
+    .bind(ssh_key(1).fingerprint().as_str())
+    .execute(s.pool())
+    .await
+    .unwrap_err();
+    assert!(matches!(StoreError::from(raw), StoreError::SshKeyTaken));
+
+    // Lookup by fingerprint.
+    let r = s
+        .lookup_ssh_key(&ssh_key(2).fingerprint())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((r.id, r.user_id, r.expires), (k2, alice, Some(NOW + 100)));
+    assert!(s
+        .lookup_ssh_key(&ssh_key(9).fingerprint())
+        .await
+        .unwrap()
+        .is_none());
+    let (owner, row) = s
+        .ssh_key_by_fingerprint(&ssh_key(1).fingerprint())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((owner, row.id), (alice, k1));
+    assert_eq!(s.ssh_key_of_user(alice, k1).await.unwrap().unwrap().id, k1);
+    assert!(s.ssh_key_of_user(bob, k1).await.unwrap().is_none());
+
+    // Another user's id is NotFound, and nothing is deleted.
+    assert!(matches!(
+        s.delete_ssh_key(bob, k1).await,
+        Err(StoreError::NotFound)
+    ));
+    s.delete_ssh_key(alice, k1).await.unwrap();
+    assert!(matches!(
+        s.delete_ssh_key(alice, k1).await,
+        Err(StoreError::NotFound)
+    ));
+    assert_eq!(s.ssh_keys_for_user(alice).await.unwrap().len(), 1);
+    // Freed: the fingerprint can be registered again, even by someone else.
+    s.add_ssh_key(bob, &ssh_key(1), "bob's now", None, 10, NOW)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn ssh_key_cap_counts_live_keys() {
+    let s = store(fleet()).await;
+    let (alice, _) = s.signup(&signup("alice", "1", None), NOW).await.unwrap();
+    s.add_ssh_key(alice, &ssh_key(1), "a", Some(NOW + 5), 2, NOW)
+        .await
+        .unwrap();
+    s.add_ssh_key(alice, &ssh_key(2), "b", None, 2, NOW)
+        .await
+        .unwrap();
+    assert!(matches!(
+        s.add_ssh_key(alice, &ssh_key(3), "c", None, 2, NOW).await,
+        Err(StoreError::KeyLimit)
+    ));
+    // Once one expires, there is room again.
+    s.add_ssh_key(alice, &ssh_key(3), "c", None, 2, NOW + 5)
+        .await
+        .unwrap();
+    // Empty titles are refused by the schema.
+    assert!(s
+        .add_ssh_key(alice, &ssh_key(4), "", None, 10, NOW)
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn ssh_keys_follow_their_users_standing() {
+    use forgs::{authenticate_ssh_key, SshAuthError, SshKeyStore as _};
+    let s = store(fleet()).await;
+    let (alice, _) = s.signup(&signup("alice", "1", None), NOW).await.unwrap();
+    let k = s
+        .add_ssh_key(alice, &ssh_key(1), "laptop", Some(NOW + 100), 10, NOW)
+        .await
+        .unwrap();
+    let a = authenticate_ssh_key(&s, &ssh_key(1), NOW + 1)
+        .await
+        .unwrap();
+    assert_eq!(a.key_id, k);
+    assert_eq!(a.subject, SubjectKey::user(alice));
+
+    // Disabled: inert but kept; re-enabled: works again.
+    s.set_user_state(alice, UserState::Disabled).await.unwrap();
+    assert!(s
+        .lookup_ssh_key(&ssh_key(1).fingerprint())
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        authenticate_ssh_key(&s, &ssh_key(1), NOW + 1).await,
+        Err(SshAuthError::Unknown)
+    );
+    assert_eq!(s.ssh_keys_for_user(alice).await.unwrap().len(), 1);
+    s.set_user_state(alice, UserState::Active).await.unwrap();
+    assert!(authenticate_ssh_key(&s, &ssh_key(1), NOW + 1).await.is_ok());
+
+    // Expired: still found, but reported as expired; then swept.
+    assert!(s
+        .lookup_ssh_key(&ssh_key(1).fingerprint())
+        .await
+        .unwrap()
+        .is_some());
+    assert_eq!(
+        authenticate_ssh_key(&s, &ssh_key(1), NOW + 100).await,
+        Err(SshAuthError::Expired)
+    );
+    s.add_ssh_key(alice, &ssh_key(2), "forever", None, 10, NOW)
+        .await
+        .unwrap();
+    assert_eq!(s.sweep(NOW + 100).await.unwrap().ssh_keys, 1);
+    assert_eq!(s.ssh_keys_for_user(alice).await.unwrap().len(), 1);
+
+    // Deleting the user cascades.
+    s.delete_user(alice, None, NOW + 200).await.unwrap();
+    assert_eq!(count(&s, "forgs_ssh_key").await, 0);
+}
+
+#[tokio::test]
+async fn ssh_key_touch_is_throttled() {
+    let s = store(fleet()).await;
+    let (alice, _) = s.signup(&signup("alice", "1", None), NOW).await.unwrap();
+    let k = s
+        .add_ssh_key(alice, &ssh_key(1), "laptop", None, 10, NOW)
+        .await
+        .unwrap();
+    let last = || async { s.ssh_keys_for_user(alice).await.unwrap()[0].last_used_at };
+    assert_eq!(last().await, None);
+    forgs::authenticate_ssh_key(&s, &ssh_key(1), NOW + 10)
+        .await
+        .unwrap();
+    assert_eq!(last().await, Some(NOW + 10));
+    s.touch_ssh_key(k, NOW + 69).await.unwrap();
+    assert_eq!(last().await, Some(NOW + 10));
+    s.touch_ssh_key(k, NOW + 71).await.unwrap();
+    assert_eq!(last().await, Some(NOW + 71));
+}
+
+#[tokio::test]
+async fn ssh_keys_added_after_are_deleted() {
+    let s = store(fleet()).await;
+    let (alice, _) = s.signup(&signup("alice", "1", None), NOW).await.unwrap();
+    let (bob, _) = s.signup(&signup("bob", "2", None), NOW).await.unwrap();
+    let old = s
+        .add_ssh_key(alice, &ssh_key(1), "old", None, 10, NOW)
+        .await
+        .unwrap();
+    s.add_ssh_key(alice, &ssh_key(2), "new", None, 10, NOW + 20)
+        .await
+        .unwrap();
+    s.add_ssh_key(bob, &ssh_key(3), "bob", None, 10, NOW + 20)
+        .await
+        .unwrap();
+    assert_eq!(s.delete_ssh_keys_added_after(alice, NOW).await.unwrap(), 1);
+    let left = s.ssh_keys_for_user(alice).await.unwrap();
+    assert_eq!(left.iter().map(|k| k.id).collect::<Vec<_>>(), vec![old]);
+    assert_eq!(s.ssh_keys_for_user(bob).await.unwrap().len(), 1);
 }

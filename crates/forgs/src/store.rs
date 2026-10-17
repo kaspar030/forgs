@@ -11,7 +11,8 @@
 
 use async_trait::async_trait;
 
-use crate::ids::{ApiKeyId, NsNodeId, PendingId, UserId};
+use crate::ids::{ApiKeyId, NsNodeId, PendingId, SshKeyId, UserId};
+use crate::ssh::SshFingerprint;
 use crate::subject::SubjectKey;
 use crate::token::{AppKind, TokenHash};
 
@@ -158,6 +159,47 @@ pub trait TokenStore: Send + Sync {
     ) -> Result<Option<AppRecord>, String> {
         let _ = (kind, hash);
         Ok(None)
+    }
+}
+
+/// A registered SSH public key, found by fingerprint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshKeyRecord {
+    /// The key's id.
+    pub id: SshKeyId,
+    /// The user who registered it.
+    pub user_id: UserId,
+    /// Expiry, epoch seconds; `None` for a key that does not expire.
+    pub expires: Option<u64>,
+}
+
+/// Lookup of registered SSH public keys, for [`crate::ssh::authenticate_ssh_key`].
+///
+/// Separate from [`TokenStore`] because an SSH key is not a bearer token: it
+/// is found by its public fingerprint, and holding it proves nothing until
+/// the SSH server has checked a signature. Errors fail closed, as there.
+#[async_trait]
+pub trait SshKeyStore: Send + Sync {
+    /// The key with this fingerprint, if registered to a user who may log
+    /// in. Expiry is **not** filtered: the caller reports it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error description.
+    async fn lookup_ssh_key(
+        &self,
+        fingerprint: &SshFingerprint,
+    ) -> Result<Option<SshKeyRecord>, String>;
+
+    /// Record that key `id` was used at `now` (best-effort, may be
+    /// throttled). The default does nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error description; callers ignore it.
+    async fn touch_ssh_key(&self, id: SshKeyId, now: u64) -> Result<(), String> {
+        let _ = (id, now);
+        Ok(())
     }
 }
 

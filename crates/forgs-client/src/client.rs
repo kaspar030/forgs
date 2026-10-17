@@ -12,7 +12,8 @@ use zeroize::Zeroize;
 use forgs::api::{
     ApiKeyCreated, ApiKeyList, ApiKeyRequest, ApiKeyRevoked, DevicePollRequest, DevicePollResponse,
     DeviceStartRequest, DeviceStartResponse, LogoutRequest, MemberList, MembersRequest,
-    RenameRequest, TokenRequest, TokenResponse,
+    RenameRequest, SshKeyAddRequest, SshKeyDeleteRequest, SshKeyInfo, SshKeyList, TokenRequest,
+    TokenResponse,
 };
 
 use crate::error::ClientError;
@@ -530,6 +531,7 @@ impl ForgsClient {
             refresh_token: refresh_token.map(ToOwned::to_owned),
             all,
             identities_linked_after: None,
+            ssh_keys_added_after: None,
         };
         let result = self
             .post("/auth/logout", Some(&Secret::from(session_token)), &request)
@@ -794,6 +796,54 @@ impl ForgsClient {
         self.post("/auth/rename", Some(&Secret::from(session_token)), request)
             .await
             .map(drop)
+    }
+
+    /// The calling user's SSH public keys (`GET /auth/keys/ssh`).
+    ///
+    /// # Errors
+    ///
+    /// As [`ForgsClient::exchange`].
+    pub async fn list_ssh_keys(&self, session_token: &str) -> Result<SshKeyList, ClientError> {
+        self.get_json("/auth/keys/ssh", Some(&Secret::from(session_token)))
+            .await
+    }
+
+    /// Register an SSH public key for the calling user
+    /// (`POST /auth/keys/ssh`).
+    ///
+    /// # Errors
+    ///
+    /// As [`ForgsClient::exchange`]: a key registered already (to anyone) is
+    /// `409 ssh_key_taken`, the per-user cap `403 key_limit`, a refused or
+    /// malformed key `400`.
+    pub async fn add_ssh_key(
+        &self,
+        session_token: &str,
+        request: &SshKeyAddRequest,
+    ) -> Result<SshKeyInfo, ClientError> {
+        self.post_json(
+            "/auth/keys/ssh",
+            Some(&Secret::from(session_token)),
+            request,
+        )
+        .await
+    }
+
+    /// Delete one of the calling user's SSH keys
+    /// (`POST /auth/keys/ssh/delete`). The success response (`204`) has no
+    /// body.
+    ///
+    /// # Errors
+    ///
+    /// As [`ForgsClient::exchange`]: an unknown id is `404`.
+    pub async fn delete_ssh_key(&self, session_token: &str, id: &str) -> Result<(), ClientError> {
+        self.post(
+            "/auth/keys/ssh/delete",
+            Some(&Secret::from(session_token)),
+            &SshKeyDeleteRequest { id: id.to_owned() },
+        )
+        .await
+        .map(drop)
     }
 
     async fn members(

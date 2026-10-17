@@ -15,6 +15,7 @@
 //! * [`role`] — app-defined ordered role ladders.
 //! * [`subject`] — the authenticated caller and its stable key.
 //! * [`authz`] — role inheritance, visibility, grants and the namespace fence.
+//! * [`ssh`] — SSH public keys: parsing, fingerprints, key → subject.
 //! * [`api`] — JSON wire types shared by server and client.
 //!
 //! # What this crate deliberately does not do
@@ -32,6 +33,7 @@ pub mod ids;
 pub mod role;
 pub mod rotation;
 pub mod schema;
+pub mod ssh;
 pub mod store;
 pub mod subject;
 pub mod token;
@@ -40,11 +42,15 @@ pub mod username;
 pub mod verify;
 
 pub use authz::{Access, AuthzError, GrantScope, Visibility};
-pub use ids::{ApiKeyId, GrantId, IdError, IdentityId, NsNodeId, PendingId, UserId};
+pub use ids::{ApiKeyId, GrantId, IdError, IdentityId, NsNodeId, PendingId, SshKeyId, UserId};
 pub use role::{Role, RoleLadder};
 pub use rotation::{should_rotate, RotationPolicy};
 pub use schema::{KindSpec, NameRules, Schema};
-pub use store::TokenStore;
+pub use ssh::{
+    authenticate_ssh_key, SshAuthError, SshAuthenticated, SshFingerprint, SshKeyError, SshKeyType,
+    SshPublicKey,
+};
+pub use store::{SshKeyStore, TokenStore};
 pub use subject::{Subject, SubjectKey, SubjectKind};
 pub use token::{AppKind, OpaqueToken, TokenError, TokenFormat, TokenHash, TokenKind, TokenUse};
 pub use username::{NameError, UsernamePolicy};

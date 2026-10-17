@@ -98,6 +98,8 @@ impl ApiError {
     pub const EMAIL_IN_USE: ApiError = ApiError::Code(StatusCode::CONFLICT, code::EMAIL_IN_USE);
     /// `409 identity_taken`.
     pub const IDENTITY_TAKEN: ApiError = ApiError::Code(StatusCode::CONFLICT, code::IDENTITY_TAKEN);
+    /// `409 ssh_key_taken`.
+    pub const SSH_KEY_TAKEN: ApiError = ApiError::Code(StatusCode::CONFLICT, code::SSH_KEY_TAKEN);
     /// `409 conflict`.
     pub const CONFLICT: ApiError = ApiError::Code(StatusCode::CONFLICT, code::CONFLICT);
     /// `403 namespace_limit`.
@@ -155,6 +157,7 @@ impl From<StoreError> for ApiError {
             StoreError::NotFound => ApiError::NotFound,
             StoreError::EmailTaken => ApiError::EMAIL_IN_USE,
             StoreError::IdentityTaken => ApiError::IDENTITY_TAKEN,
+            StoreError::SshKeyTaken => ApiError::SSH_KEY_TAKEN,
             StoreError::BadRole | StoreError::BadPrefix => ApiError::BadRequest,
             StoreError::PersonalNode | StoreError::HasChildren | StoreError::PersonalOwner => {
                 ApiError::CONFLICT
@@ -232,6 +235,12 @@ mod tests {
             ApiError::NAMESPACE_LIMIT
         );
         assert_eq!(ApiError::from(StoreError::KeyLimit), ApiError::KEY_LIMIT);
+        assert_eq!(
+            ApiError::from(StoreError::SshKeyTaken),
+            ApiError::SSH_KEY_TAKEN
+        );
+        assert_eq!(ApiError::SSH_KEY_TAKEN.status(), StatusCode::CONFLICT);
+        assert_eq!(ApiError::SSH_KEY_TAKEN.code(), "ssh_key_taken");
         assert_eq!(
             ApiError::from(StoreError::LastIdentity),
             ApiError::LAST_IDENTITY

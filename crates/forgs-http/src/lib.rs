@@ -49,6 +49,7 @@ pub mod members;
 mod routes;
 pub mod session;
 pub mod signup;
+pub mod ssh_keys;
 pub mod workload;
 
 pub use audit::{AuditEvent, AuditSink, StoreAuditSink, TracingAuditSink};

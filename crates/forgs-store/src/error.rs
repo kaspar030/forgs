@@ -46,6 +46,9 @@ pub enum StoreError {
     /// The `(provider, subject)` pair is already linked to a user.
     #[error("identity is already linked")]
     IdentityTaken,
+    /// The SSH public key is already registered (to this or another user).
+    #[error("SSH key is already registered")]
+    SshKeyTaken,
     /// The email address belongs to another user.
     #[error("email address is already in use")]
     EmailTaken,
@@ -168,7 +171,9 @@ impl From<sqlx::Error> for StoreError {
         }
         match db.kind() {
             sqlx::error::ErrorKind::UniqueViolation => {
-                if msg.contains("forgs_identity.") {
+                if msg.contains("forgs_ssh_key.fingerprint") {
+                    StoreError::SshKeyTaken
+                } else if msg.contains("forgs_identity.") {
                     StoreError::IdentityTaken
                 } else if msg.contains("forgs_user_email.email") {
                     StoreError::EmailTaken

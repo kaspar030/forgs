@@ -3810,3 +3810,232 @@ async fn api_keys_are_capped_paginated_redacted_and_refusals_audited() {
         before + 1
     );
 }
+
+// ---------------------------------------------------------------------------
+// SSH keys
+// ---------------------------------------------------------------------------
+
+/// Generated with `ssh-keygen`.
+const SSH_ED25519: &str =
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFzQrSHS2mGRUf0spotl8rhHZkNwNpewWO6tG0ySJpCi k1";
+const SSH_ED25519_2: &str =
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMrjg3KoriWXNNgk2c5Cd/uvXX+fDKxoHb4GjDpYUncj k2";
+const SSH_ED25519_3: &str =
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIPemPA2UcghZFupvZ7zJ2JIHWAhmySa8HQH+Ye+9Ta/ k3";
+const SSH_RSA2048: &str = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDVFKnUUhboeqqJig3/uNFZPdbcw41FAzPQeM15eo09suhE6k87YiYx7Qm7jrOb2eUMoiid8KHa90AutlRMojs443rfV3Q1KuO3G7ZwiCki41rjNpcakZpMStI481HFPpw/GM1L2fO7tO0AL5SwH7+hxoBDWRTPKzKmifLiNIZngTtUtfJ9/61yKICY6PztmMOwNvvNDhofl3OhvW/ThHTMhUP4AWNDCiASrmSf2qcctTTdVmsQTccroUVpVwTpbh7GnJNFxl5BYkh11bjg0wvcfUrYTg7Ixmet9hOvUlWhEpIT0EpZdxXw5iMITn3se6EJ73K3AmyyJ5Lv5/hd5PDt r2048";
+
+#[tokio::test]
+async fn ssh_keys_are_managed_per_user_and_map_to_the_user_subject() {
+    let h = harness_cfg(true, &format!("{PUBLIC}/"), |b| b.max_ssh_keys_per_user(2)).await;
+    let alice = h.signup("a", "1", "a@x.example", "alice").await;
+    let bob = h.signup("b", "2", "b@x.example", "bob").await;
+    let tok = H::session(&alice);
+    let add = |token: String, body: Value| {
+        let h = &h;
+        async move {
+            h.post_json("/auth/keys/ssh", Some(&token), None, &[], &body)
+                .await
+        }
+    };
+
+    // Add with a bearer session: the title defaults to the comment.
+    let r = add(tok.clone(), json!({"public_key": SSH_ED25519})).await;
+    r.expect(StatusCode::CREATED);
+    let k1 = r.json();
+    assert_eq!(k1["title"], "k1");
+    assert_eq!(k1["key_type"], "ssh-ed25519");
+    let fp = forgs::SshPublicKey::parse_openssh(SSH_ED25519)
+        .unwrap()
+        .fingerprint();
+    assert_eq!(k1["fingerprint"], fp.as_str());
+    assert!(SSH_ED25519.starts_with(k1["public_key"].as_str().unwrap()));
+    assert!(h.audit.has("ssh_key.add"));
+
+    // The same key for bob, or again for alice: 409.
+    for t in [H::session(&bob), tok.clone()] {
+        let r = add(t, json!({"public_key": SSH_ED25519})).await;
+        r.expect(StatusCode::CONFLICT);
+        assert_eq!(r.error(), "ssh_key_taken");
+    }
+    assert!(h.audit.has("ssh_key.denied"));
+
+    // Refused keys, a bad title and a past expiry: 400.
+    for body in [
+        json!({"public_key": SSH_RSA2048}),
+        json!({"public_key": "ssh-dss AAAAB3NzaC1kc3MAAACBAP"}),
+        json!({"public_key": "garbage"}),
+        json!({"public_key": SSH_ED25519_2, "title": "a\nb"}),
+        json!({"public_key": SSH_ED25519_2, "expires_at": NOW}),
+    ] {
+        add(tok.clone(), body).await.expect(StatusCode::BAD_REQUEST);
+    }
+
+    // A cookie POST needs CSRF.
+    h.clock.advance(1);
+    let body = json!({"public_key": SSH_ED25519_2, "title": "desk", "expires_at": NOW + 1000});
+    h.post_json("/auth/keys/ssh", None, Some(&alice), &[], &body)
+        .await
+        .expect(StatusCode::FORBIDDEN);
+    let csrf = alice.get("__Host-frg_csrf");
+    let r = h
+        .post_json(
+            "/auth/keys/ssh",
+            None,
+            Some(&alice),
+            &[("x-frg-csrf", &csrf)],
+            &body,
+        )
+        .await;
+    r.expect(StatusCode::CREATED);
+    assert_eq!(r.json()["expires_at"], NOW + 1000);
+
+    // The cap.
+    let r = add(tok.clone(), json!({"public_key": SSH_ED25519_3})).await;
+    r.expect(StatusCode::FORBIDDEN);
+    assert_eq!(r.error(), "key_limit");
+
+    // Listing, by cookie and by bearer.
+    let by_cookie = h.get("/auth/keys/ssh", Some(&alice), &[]).await;
+    by_cookie.expect(StatusCode::OK);
+    let list = h
+        .get(
+            "/auth/keys/ssh",
+            None,
+            &[("authorization", &format!("Bearer {tok}"))],
+        )
+        .await
+        .json();
+    assert_eq!(by_cookie.json(), list);
+    let keys = list["keys"].as_array().unwrap();
+    assert_eq!(keys.len(), 2);
+    assert_eq!(keys[0]["id"], k1["id"]);
+    assert_eq!(keys[1]["title"], "desk");
+
+    // The consumer's SSH server: key → user subject.
+    let alice_id = h.user_id("alice").await;
+    let key = forgs::SshPublicKey::parse_openssh(SSH_ED25519).unwrap();
+    let a = forgs::authenticate_ssh_key(h.ctx.store(), &key, NOW)
+        .await
+        .unwrap();
+    assert_eq!(a.subject, SubjectKey::user(alice_id));
+    assert_eq!(a.key_id.to_string(), k1["id"].as_str().unwrap());
+
+    // Bob cannot delete alice's key, nor can garbage: 404 alike.
+    for id in [k1["id"].as_str().unwrap(), "nope"] {
+        h.post_json(
+            "/auth/keys/ssh/delete",
+            Some(&H::session(&bob)),
+            None,
+            &[],
+            &json!({ "id": id }),
+        )
+        .await
+        .expect(StatusCode::NOT_FOUND);
+    }
+    // Cookie delete needs CSRF too.
+    h.post_json(
+        "/auth/keys/ssh/delete",
+        None,
+        Some(&alice),
+        &[],
+        &json!({ "id": k1["id"] }),
+    )
+    .await
+    .expect(StatusCode::FORBIDDEN);
+    h.post_json(
+        "/auth/keys/ssh/delete",
+        Some(&tok),
+        None,
+        &[],
+        &json!({ "id": k1["id"] }),
+    )
+    .await
+    .expect(StatusCode::NO_CONTENT);
+    assert!(h.audit.has("ssh_key.delete"));
+    assert_eq!(
+        forgs::authenticate_ssh_key(h.ctx.store(), &key, NOW).await,
+        Err(forgs::SshAuthError::Unknown)
+    );
+    // Freed for someone else.
+    add(H::session(&bob), json!({"public_key": SSH_ED25519}))
+        .await
+        .expect(StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn ssh_keys_refuse_non_user_callers() {
+    let h = harness().await;
+    let workload = h.ctx.format().mint(TokenKind::Workload);
+    let subject = forgs::subject::workload_subject_key("github", "1", "2").unwrap();
+    h.ctx
+        .store()
+        .insert_workload_token(&workload.hash(), &subject, "test", None, NOW, NOW + 600)
+        .await
+        .unwrap();
+    let w = workload.to_secret_string();
+    let r = h
+        .get(
+            "/auth/keys/ssh",
+            None,
+            &[("authorization", &format!("Bearer {w}"))],
+        )
+        .await;
+    assert!(r.status == StatusCode::FORBIDDEN, "{:?}", r.status);
+    let r = h
+        .post_json(
+            "/auth/keys/ssh",
+            Some(&w),
+            None,
+            &[],
+            &json!({"public_key": SSH_ED25519}),
+        )
+        .await;
+    assert!(r.status == StatusCode::FORBIDDEN, "{:?}", r.status);
+    // Unauthenticated: 401.
+    h.get("/auth/keys/ssh", None, &[])
+        .await
+        .expect(StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn logout_all_can_delete_late_ssh_keys() {
+    let h = harness().await;
+    let alice = h.signup("a", "1", "a@x.example", "alice").await;
+    let tok = H::session(&alice);
+    h.post_json(
+        "/auth/keys/ssh",
+        Some(&tok),
+        None,
+        &[],
+        &json!({"public_key": SSH_ED25519}),
+    )
+    .await
+    .expect(StatusCode::CREATED);
+    h.clock.advance(100);
+    h.post_json(
+        "/auth/keys/ssh",
+        Some(&tok),
+        None,
+        &[],
+        &json!({"public_key": SSH_ED25519_2}),
+    )
+    .await
+    .expect(StatusCode::CREATED);
+    h.post_json(
+        "/auth/logout",
+        Some(&tok),
+        None,
+        &[],
+        &json!({"all": true, "ssh_keys_added_after": NOW + 50}),
+    )
+    .await
+    .expect(StatusCode::NO_CONTENT);
+    let left = h
+        .ctx
+        .store()
+        .ssh_keys_for_user(h.user_id("alice").await)
+        .await
+        .unwrap();
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].title, "k1");
+}

@@ -18,6 +18,8 @@
 //! | `POST /auth/identities/link/{provider}` | cookie + CSRF only (no bearer) | add a login method, after step-up re-auth |
 //! | `GET /auth/identities` | header or cookie | the caller's login methods |
 //! | `POST /auth/identities/unlink` | header, or cookie + CSRF | remove one (never the last) |
+//! | `GET /auth/keys/ssh` | header or cookie | the caller's SSH public keys |
+//! | `POST /auth/keys/ssh`, `/auth/keys/ssh/delete` | header, or cookie + CSRF | add / remove one |
 //! | `POST /auth/members`, `/auth/rename` | **header** | membership, renames |
 //!
 //! The JSON surface the CLI uses (`/auth/token`, `/auth/keys`,
@@ -35,7 +37,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use forgs::api::{
     ApiKeyRequest, DevicePollRequest, DeviceStartRequest, LogoutRequest, MembersRequest,
-    RenameRequest, SessionInfo, SignupRequest, TokenRequest, UnlinkIdentityRequest,
+    RenameRequest, SessionInfo, SignupRequest, SshKeyAddRequest, SshKeyDeleteRequest, TokenRequest,
+    UnlinkIdentityRequest,
 };
 use forgs::TokenKind;
 use serde::de::DeserializeOwned;
@@ -51,7 +54,7 @@ use crate::cookies::{
 };
 use crate::error::{reject, ApiError};
 use crate::login::{safe_return_to, FlowIntent, LoginOutcome};
-use crate::{device, html, identities, keys, login, members, session, signup, workload};
+use crate::{device, html, identities, keys, login, members, session, signup, ssh_keys, workload};
 
 /// The auth routes, to be merged or nested into the app's router. Tell the
 /// context where it is nested with [`crate::AuthContextBuilder::mount`].
@@ -72,6 +75,8 @@ where
         .route("/auth/device/poll", post(device_poll))
         .route("/auth/device", get(device_page).post(device_submit))
         .route("/auth/keys", post(api_keys))
+        .route("/auth/keys/ssh", get(ssh_keys_list).post(ssh_keys_add))
+        .route("/auth/keys/ssh/delete", post(ssh_keys_delete))
         .route("/auth/identities", get(identities_list))
         .route("/auth/identities/unlink", post(identities_unlink))
         .route("/auth/identities/link/{provider}", post(link_start))
@@ -451,6 +456,41 @@ async fn identities_unlink(
     JsonBody(req): JsonBody<UnlinkIdentityRequest>,
 ) -> Response {
     match identities::unlink(&ctx, &auth, &req).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// `GET /auth/keys/ssh` — the caller's SSH public keys.
+async fn ssh_keys_list(
+    State(ctx): State<AuthContext>,
+    auth: Authenticated<SessionOnly, CookieOk>,
+) -> Response {
+    match ssh_keys::list(&ctx, &auth).await {
+        Ok(l) => Json(l).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// `POST /auth/keys/ssh` — register one (CSRF-checked for a cookie).
+async fn ssh_keys_add(
+    State(ctx): State<AuthContext>,
+    auth: Authenticated<SessionOnly, CookieOk>,
+    JsonBody(req): JsonBody<SshKeyAddRequest>,
+) -> Response {
+    match ssh_keys::add(&ctx, &auth, &req).await {
+        Ok(k) => (StatusCode::CREATED, Json(k)).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// `POST /auth/keys/ssh/delete` — remove one (CSRF-checked for a cookie).
+async fn ssh_keys_delete(
+    State(ctx): State<AuthContext>,
+    auth: Authenticated<SessionOnly, CookieOk>,
+    JsonBody(req): JsonBody<SshKeyDeleteRequest>,
+) -> Response {
+    match ssh_keys::delete(&ctx, &auth, &req).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => e.into_response(),
     }

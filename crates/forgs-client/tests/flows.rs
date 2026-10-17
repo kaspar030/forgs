@@ -257,6 +257,58 @@ async fn api_keys_create_list_revoke() {
 }
 
 #[tokio::test]
+async fn ssh_keys_list_add_delete() {
+    let (stub, c) = setup().await;
+    let key = json!({"id": "01JSSH", "key_type": "ssh-ed25519", "fingerprint": "SHA256:x",
+        "public_key": "ssh-ed25519 AAAA", "title": "laptop", "created_at": 1});
+    stub.script(
+        "/auth/keys/ssh",
+        vec![Reply::json(&key), Reply::json(&json!({"keys": [key]}))],
+    );
+    stub.script("/auth/keys/ssh/delete", vec![Reply::no_content()]);
+    let added = c
+        .add_ssh_key(
+            "SEKRIT-s",
+            &forgs_client::api::SshKeyAddRequest {
+                public_key: "ssh-ed25519 AAAA laptop".into(),
+                title: None,
+                expires_at: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(added.title, "laptop");
+    let list = c.list_ssh_keys("SEKRIT-s").await.unwrap();
+    assert_eq!(list.keys, vec![added]);
+    c.delete_ssh_key("SEKRIT-s", "01JSSH").await.unwrap();
+    let reqs = stub.requests();
+    assert!(reqs
+        .iter()
+        .all(|r| r.header("authorization") == Some("Bearer SEKRIT-s")));
+    assert_eq!(
+        reqs[0].json(),
+        json!({"public_key": "ssh-ed25519 AAAA laptop"})
+    );
+    assert_eq!(reqs[1].path(), "/auth/keys/ssh");
+    assert_eq!(reqs[2].path(), "/auth/keys/ssh/delete");
+    assert_eq!(reqs[2].json(), json!({"id": "01JSSH"}));
+
+    stub.script("/auth/keys/ssh", vec![Reply::error(409, "ssh_key_taken")]);
+    let e = c
+        .add_ssh_key(
+            "s",
+            &forgs_client::api::SshKeyAddRequest {
+                public_key: "k".into(),
+                title: None,
+                expires_at: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(e.code(), Some("ssh_key_taken"));
+}
+
+#[tokio::test]
 async fn device_login_pending_slow_down_granted() {
     let (stub, c) = setup().await;
     stub.script(

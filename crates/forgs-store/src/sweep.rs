@@ -28,6 +28,8 @@ pub struct SweepCounts {
     pub workload_jtis: u64,
     /// Expired or consumed API keys.
     pub api_keys: u64,
+    /// Expired SSH public keys.
+    pub ssh_keys: u64,
     /// Expired pending signups.
     pub pending_signups: u64,
     /// Expired or consumed (redeemed or denied) device approvals.
@@ -90,6 +92,7 @@ impl Store {
                          SELECT 1 FROM forgs_workload_token w
                           WHERE w.api_key_id = forgs_api_key.id))")
             .await?,
+            ssh_keys: run("DELETE FROM forgs_ssh_key WHERE expires <= ?1").await?,
             pending_signups: run("DELETE FROM forgs_pending_signup WHERE expires <= ?1").await?,
             pending_devices: run(
                 "DELETE FROM forgs_pending_device WHERE expires <= ?1 OR consumed_at IS NOT NULL",

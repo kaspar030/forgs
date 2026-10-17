@@ -329,6 +329,28 @@ forgs_membership { ns_node_id, subject (SubjectKey), user_id NULL, role }
   Every refused mint (bad TTL, purpose, name, payload, cap) is audited as
   `api_key.denied`, and a non-member's member/namespace writes as
   `<action>.denied` (authenticated, so no unauthenticated amplification).
+- SSH public keys are a user credential for consumers serving git (or
+  anything else) over SSH; forgs stores them and maps a key to its user, the
+  SSH server itself lives in the consumer. Accepted: `ssh-ed25519`,
+  `ecdsa-sha2-nistp256`/`384`, and `ssh-rsa` with a 3072 to 16384-bit
+  modulus; DSA, `nistp521`, certificates and FIDO `sk-*` keys are refused.
+  Validation is structural (exact lengths, no trailing bytes, canonical RSA
+  integers); the server proves possession with a signature before asking
+  forgs, and must accept only `rsa-sha2-256`/`-512` RSA signatures, never
+  SHA-1 `ssh-rsa` (`SshKeyType::accepted_signature_algorithms`). The
+  canonical fingerprint (`SHA256:…`, as `ssh-keygen -lf`) is globally unique:
+  a key maps to exactly one user (`409 ssh_key_taken`). Users manage their
+  own keys (`GET`/`POST /auth/keys/ssh`, `POST /auth/keys/ssh/delete`;
+  session bearer, or cookie + CSRF; JSON only, there is no settings page),
+  capped by live keys per user (`max_ssh_keys_per_user`, default 100). Keys
+  may expire (swept), and `logout --all` with `ssh_keys_added_after` deletes
+  keys added after a time. A disabled user's keys are kept but inert, and
+  deleting the user deletes them. The seam: the server builds an
+  `SshPublicKey` from the wire blob (`SshPublicKey::from_wire`) and calls
+  `forgs::authenticate_ssh_key(&store, &key, now)` (`SshKeyStore`,
+  implemented by `Store`), which yields the same `user:<id>` subject as a
+  session, so membership and roles are evaluated exactly as for bearer
+  tokens. Deploy keys (namespace-scoped, workload subject) are a follow-up.
 
 - Browser: an HttpOnly session cookie that is the same credential as the bearer
   token, a double-submit HMAC CSRF token, a cookie accepted only on the
@@ -458,6 +480,7 @@ not security boundaries.
 ```
 forgs            core: ids, namespace schema, roles, Subject, tokens + verify,
                  user codes, rotation, username policy, authz evaluation,
+                 SSH public key parsing + fingerprints,
                  /auth/* wire types (`forgs::api`). Pure: no IO, no clock.
 forgs-store      sqlx/SQLite: schema + migrator, Store, NsScope handles,
                  expiry + audit-retention sweep.
@@ -467,7 +490,7 @@ forgs-idp        IdentityProvider and WorkloadIssuer traits, ExternalIdentity.
                  `client`, OidcProvider, JwksCache and GithubActionsIssuer.
 forgs-http       axum: /auth/* routes (providers, login, {provider}/start +
                  callback, signup, token, logout, session + session/logout,
-                 device start/poll + page, keys, identities (list, unlink,
+                 device start/poll + page, keys, keys/ssh, identities (list, unlink,
                  link with step-up), members,
                  rename), Authenticated extractor with per-route allowed
                  kinds, AuthContext, cookies + CSRF, app hooks, audit.
