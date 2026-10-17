@@ -241,6 +241,34 @@ impl ApiKeyPurposes for TestPurposes {
     }
 }
 
+/// App approvals: anyone may approve; `redeem` is counted.
+#[derive(Default)]
+struct CountingApprovals(AtomicUsize);
+
+#[async_trait]
+impl forgs_http::PendingApprovalHook for CountingApprovals {
+    async fn authorize(
+        &self,
+        _ctx: &AuthContext,
+        _row: &forgs_store::PendingDevice,
+        _approver: forgs::UserId,
+        _ns: Option<forgs::NsNodeId>,
+    ) -> Result<(), ApiError> {
+        Ok(())
+    }
+
+    async fn redeem(
+        &self,
+        _ctx: &AuthContext,
+        _approved_by: forgs::UserId,
+        _ns: Option<forgs::NsNodeId>,
+        _payload: &str,
+    ) -> Result<Value, ApiError> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(json!({"ok": true}))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------
@@ -255,6 +283,7 @@ struct H {
     nodes: Arc<NodeTokens>,
     node: AppKind,
     node_device: AppKind,
+    approvals: Arc<CountingApprovals>,
 }
 
 struct Resp {
@@ -371,6 +400,7 @@ async fn harness_at(issuer: bool, public_url: &str) -> H {
     let idp2 = StubIdp::new("stub2");
     let audit = Arc::new(Collect::default());
     let nodes = Arc::new(NodeTokens::default());
+    let approvals = Arc::new(CountingApprovals::default());
     let (format, node, node_device) = test_format();
     let mut b = AuthContext::builder(store, public_url, &[42; 32])
         .app_label("test")
@@ -380,6 +410,7 @@ async fn harness_at(issuer: bool, public_url: &str) -> H {
         .provider(idp.clone())
         .provider(idp2.clone())
         .audit(audit.clone())
+        .pending_approvals(approvals.clone())
         .api_key_purposes(Arc::new(TestPurposes(
             StaticPurposes::new()
                 .with("ci", PurposeKind::Workload)
@@ -411,6 +442,7 @@ async fn harness_at(issuer: bool, public_url: &str) -> H {
         nodes,
         node,
         node_device,
+        approvals,
     }
 }
 
@@ -1938,6 +1970,173 @@ async fn disabled_users_are_locked_out_uniformly() {
         .await
         .expect(StatusCode::FORBIDDEN);
     assert!(!j.0.contains_key("frg_session"));
+}
+
+/// Audit HTTP-03 / HTTP-10: a key and the workload tokens it minted are only
+/// as alive as the key itself and its creator's active membership.
+#[tokio::test]
+async fn keys_and_their_tokens_die_with_creator_standing_and_revocation() {
+    let h = harness().await;
+    let alice = H::session(&h.signup("a", "1", "a@x.example", "alice").await);
+    let bob = H::session(&h.signup("b", "2", "b@x.example", "bob").await);
+    let member = |action: &str| {
+        let h = &h;
+        let alice = alice.clone();
+        let body =
+            json!({"action": action, "namespace": "alice", "username": "bob", "role": "member"});
+        async move {
+            h.post_json("/auth/members", Some(&alice), None, &[], &body)
+                .await
+                .expect(StatusCode::NO_CONTENT);
+        }
+    };
+    let mint = || {
+        let h = &h;
+        let bob = bob.clone();
+        async move {
+            h.post_json(
+                "/auth/keys",
+                Some(&bob),
+                None,
+                &[],
+                &json!({"action": "create", "namespace": "alice", "ttl_secs": 3600,
+                        "purpose": "ci", "multi_use": true}),
+            )
+            .await
+            .json()
+        }
+    };
+    let redeem = |key: String| {
+        let h = &h;
+        async move {
+            h.post_json(
+                "/auth/token",
+                None,
+                None,
+                &[],
+                &json!({"grant_type": "api_key", "api_key": key}),
+            )
+            .await
+        }
+    };
+    let bob_id = h
+        .ctx
+        .store()
+        .user_by_username("bob")
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+
+    member("set").await;
+    let created = mint().await;
+    assert_eq!(created["single_use"], false);
+    let key = created["key"].as_str().unwrap().to_owned();
+    let r = redeem(key.clone()).await;
+    r.expect(StatusCode::OK);
+    let wt = r.json()["token"].as_str().unwrap().to_owned();
+    h.whoami(&wt).await.expect(StatusCode::OK);
+
+    // Removed: the token dies, the key stops redeeming (audited).
+    h.post_json(
+        "/auth/members",
+        Some(&alice),
+        None,
+        &[],
+        &json!({"action": "remove", "namespace": "alice", "username": "bob"}),
+    )
+    .await
+    .expect(StatusCode::NO_CONTENT);
+    h.whoami(&wt).await.expect(StatusCode::UNAUTHORIZED);
+    let r = redeem(key.clone()).await;
+    r.expect(StatusCode::UNAUTHORIZED);
+    assert_eq!(r.error(), "invalid_grant");
+    assert!(h.audit.has("api_key.redeem.creator_inactive"));
+
+    // Re-added: redeemable again.
+    member("set").await;
+    let r = redeem(key.clone()).await;
+    r.expect(StatusCode::OK);
+    let wt = r.json()["token"].as_str().unwrap().to_owned();
+    h.whoami(&wt).await.expect(StatusCode::OK);
+
+    // Disabled: same.
+    h.ctx
+        .store()
+        .set_user_state(bob_id, forgs_store::UserState::Disabled)
+        .await
+        .unwrap();
+    h.whoami(&wt).await.expect(StatusCode::UNAUTHORIZED);
+    redeem(key.clone()).await.expect(StatusCode::UNAUTHORIZED);
+    h.ctx
+        .store()
+        .set_user_state(bob_id, forgs_store::UserState::Active)
+        .await
+        .unwrap();
+
+    // Revoked: the token minted from it dies with it.
+    let r = redeem(key.clone()).await;
+    r.expect(StatusCode::OK);
+    let wt = r.json()["token"].as_str().unwrap().to_owned();
+    h.post_json(
+        "/auth/keys",
+        Some(&alice),
+        None,
+        &[],
+        &json!({"action": "revoke", "namespace": "alice",
+                "prefix": created["key_hash"].as_str().unwrap()}),
+    )
+    .await
+    .expect(StatusCode::OK);
+    h.whoami(&wt).await.expect(StatusCode::UNAUTHORIZED);
+    redeem(key).await.expect(StatusCode::UNAUTHORIZED);
+}
+
+/// Audit TC-4: an app approval is not redeemed once its approver is disabled.
+#[tokio::test]
+async fn app_approvals_of_a_disabled_approver_are_not_redeemed() {
+    let h = harness().await;
+    h.signup("a", "1", "a@x.example", "alice").await;
+    let alice = h
+        .ctx
+        .store()
+        .user_by_username("alice")
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    let started = forgs_http::device::start_pending_approval(&h.ctx, r#"{"node":"n1"}"#, None)
+        .await
+        .unwrap();
+    forgs_http::device::decide(&h.ctx, alice, &started.user_code, None, true)
+        .await
+        .unwrap();
+    h.ctx
+        .store()
+        .set_user_state(alice, forgs_store::UserState::Disabled)
+        .await
+        .unwrap();
+    let r = forgs_http::device::poll(&h.ctx, &started.device_secret).await;
+    assert!(matches!(r, Err(ApiError::InvalidGrant)), "{r:?}");
+    assert_eq!(h.approvals.0.load(Ordering::SeqCst), 0);
+
+    // An active approver's approval is redeemed.
+    h.ctx
+        .store()
+        .set_user_state(alice, forgs_store::UserState::Active)
+        .await
+        .unwrap();
+    let started = forgs_http::device::start_pending_approval(&h.ctx, r#"{"node":"n2"}"#, None)
+        .await
+        .unwrap();
+    forgs_http::device::decide(&h.ctx, alice, &started.user_code, None, true)
+        .await
+        .unwrap();
+    assert!(matches!(
+        forgs_http::device::poll(&h.ctx, &started.device_secret).await,
+        Ok(forgs_http::device::PollOutcome::App(_))
+    ));
+    assert_eq!(h.approvals.0.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

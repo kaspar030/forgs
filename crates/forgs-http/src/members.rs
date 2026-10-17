@@ -163,6 +163,10 @@ pub async fn set(
 
 /// Remove `username`'s direct membership in `namespace`.
 ///
+/// If that leaves them no membership on a namespace chain where they minted
+/// API keys, those keys stop redeeming and the workload tokens minted from
+/// them are deleted (the store does this in the same transaction).
+///
 /// # Errors
 ///
 /// As [`set`]; `404` when they were not a direct member.

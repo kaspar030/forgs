@@ -539,26 +539,39 @@ impl Store {
 
     /// Set a user's state.
     ///
+    /// Disabling also deletes, in the same transaction, every workload token
+    /// minted from the user's API keys. The keys themselves are kept: they
+    /// are inert while the user is disabled (see [`Store::consume_api_key`])
+    /// and redeemable again after re-enabling.
+    ///
     /// # Errors
     ///
     /// [`StoreError::NotFound`] or a database error.
     pub async fn set_user_state(&self, user: UserId, state: UserState) -> Result<()> {
+        let user_s = user.to_string();
+        let mut tx = self.begin().await?;
         let n = sqlx::query("UPDATE forgs_user SET state = ?2 WHERE id = ?1")
-            .bind(user.to_string())
+            .bind(&user_s)
             .bind(state.as_str())
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?
             .rows_affected();
         if n == 0 {
             return Err(StoreError::NotFound);
         }
+        if state == UserState::Disabled {
+            crate::credentials::purge_dead_key_tokens_for_user_tx(&mut tx, &user_s).await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
     /// Delete a user, in one transaction: tombstone the username, delete the
     /// personal node (which must be a leaf), then the user row, which cascades
     /// identities, emails, sessions, refresh tokens and memberships, and
-    /// clears `created_by` on keys and grants.
+    /// clears `created_by` on grants. The user's API keys and the workload
+    /// tokens minted from them are deleted first, so a NULL `created_by` on
+    /// a key keeps meaning "shell-minted" rather than "orphaned but live".
     ///
     /// # Errors
     ///
@@ -584,6 +597,17 @@ impl Store {
         if let Some(node) = &personal {
             crate::ns::delete_leaf_tx(&mut tx, node).await?;
         }
+        sqlx::query(
+            "DELETE FROM forgs_workload_token WHERE api_key_id IN (
+                 SELECT id FROM forgs_api_key WHERE created_by = ?1)",
+        )
+        .bind(&user_s)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM forgs_api_key WHERE created_by = ?1")
+            .bind(&user_s)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query("DELETE FROM forgs_user WHERE id = ?1")
             .bind(&user_s)
             .execute(&mut *tx)

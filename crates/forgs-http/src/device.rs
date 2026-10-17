@@ -260,16 +260,18 @@ pub async fn poll(ctx: &AuthContext, device_secret: &str) -> Result<PollOutcome,
     if let Ok(mut log) = ctx.inner.poll_log.lock() {
         log.remove(hash.as_str());
     }
-    if let Some(payload) = approved.payload.as_deref() {
-        let v = ctx
-            .approvals()
-            .redeem(ctx, approved.approved_by, approved.ns, payload)
-            .await?;
-        return Ok(PollOutcome::App(v));
-    }
+    // The approver must still be active for both outcomes: a login mints
+    // their session, and an app payload is redeemed on their authority.
     let user = approved.approved_by;
     if !crate::session::user_is_active(ctx, user).await? {
         return Err(ApiError::InvalidGrant);
+    }
+    if let Some(payload) = approved.payload.as_deref() {
+        let v = ctx
+            .approvals()
+            .redeem(ctx, user, approved.ns, payload)
+            .await?;
+        return Ok(PollOutcome::App(v));
     }
     let session = mint_session(ctx, user, "device flow").await?;
     // A failed refresh mint must not fail the login: the session is usable

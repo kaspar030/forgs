@@ -232,6 +232,17 @@ forgs_membership { ns_node_id, subject (SubjectKey), user_id NULL, role }
   `<ns>/workload:key:<ApiKeyId>`. The purpose is app-defined, with a mint hook
   (`check_payload`, which receives the caller's role and must cap the
   payload's authority by it) and a redemption hook.
+  A key is only as alive as its creator: redemption (`Store::consume_api_key`,
+  so every path, HTTP or app) requires the creator to be an `active` user with
+  a membership somewhere on the key namespace's ancestor chain. A disabled or
+  removed creator's keys are inert and live again on re-enable or re-add. A
+  NULL creator means shell-minted (operator CLI) and is exempt; deleting a
+  user deletes their keys, so NULL never means "orphaned" (keys orphaned
+  before schema version 3 cannot be told apart; review them with `keys list`).
+  Workload tokens minted from a key record its id, and revoking the key,
+  disabling its creator, removing the creator's last membership on the chain
+  or deleting the creator deletes them immediately rather than at expiry.
+
 - Browser: an HttpOnly session cookie that is the same credential as the bearer
   token, a double-submit HMAC CSRF token, a cookie accepted only on the
   explicitly marked browser routes and under a configurable API prefix, and

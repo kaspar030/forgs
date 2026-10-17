@@ -123,6 +123,44 @@ fn consumed_from_row(r: ApiKeyRecordRow) -> Result<ConsumedApiKey> {
 const API_KEY_COLS: &str =
     "id, ns_node_id, purpose, subject_name, payload, single_use, expires, created_by";
 
+/// SQL predicate over an API key row aliased `k`: the key's creator is still
+/// entitled to it.
+///
+/// A key is only as alive as its creator: it is live when `created_by` is
+/// NULL (shell-minted by the operator, by design), or when the creator is an
+/// `active` user holding a membership (any role) somewhere on the ancestor
+/// chain of the key's namespace — the same "effective role is `Some`" rule
+/// as [`Store::effective_role`]. A disabled or removed creator's keys are
+/// inert, and live again on re-enable or re-add.
+pub(crate) const KEY_CREATOR_LIVE: &str = "(k.created_by IS NULL OR (
+    EXISTS (SELECT 1 FROM forgs_user u WHERE u.id = k.created_by AND u.state = 'active')
+    AND EXISTS (
+        WITH RECURSIVE chain(id, depth) AS (
+            SELECT k.ns_node_id, 0
+            UNION ALL
+            SELECT n.parent_id, chain.depth + 1 FROM forgs_ns_node n
+              JOIN chain ON n.id = chain.id
+             WHERE n.parent_id IS NOT NULL AND chain.depth < 1000
+        )
+        SELECT 1 FROM chain
+          JOIN forgs_membership m ON m.ns_node_id = chain.id AND m.user_id = k.created_by)))";
+
+/// Delete the workload tokens minted from `user`'s keys that are no longer
+/// live (see [`KEY_CREATOR_LIVE`]), inside `conn`'s transaction.
+pub(crate) async fn purge_dead_key_tokens_for_user_tx(
+    conn: &mut sqlx::SqliteConnection,
+    user: &str,
+) -> Result<u64> {
+    Ok(sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DELETE FROM forgs_workload_token WHERE api_key_id IN (
+             SELECT k.id FROM forgs_api_key k WHERE k.created_by = ?1 AND NOT {KEY_CREATOR_LIVE})"
+    )))
+    .bind(user)
+    .execute(&mut *conn)
+    .await?
+    .rows_affected())
+}
+
 impl Store {
     /// Insert a user session (by token hash).
     ///
@@ -306,14 +344,54 @@ impl Store {
         issued_at: u64,
         expires: u64,
     ) -> Result<()> {
+        self.insert_workload_token_row(hash, subject, issuer, claims, None, issued_at, expires)
+            .await
+    }
+
+    /// Record a workload token minted from API key `key`.
+    ///
+    /// As [`Store::insert_workload_token`], plus the link to the source key:
+    /// revoking the key, disabling or removing its creator, or deleting the
+    /// creator deletes the token too, instead of leaving it valid until
+    /// expiry.
+    ///
+    /// # Errors
+    ///
+    /// A database error.
+    pub async fn insert_key_workload_token(
+        &self,
+        hash: &TokenHash,
+        subject: &SubjectKey,
+        issuer: &str,
+        key: ApiKeyId,
+        issued_at: u64,
+        expires: u64,
+    ) -> Result<()> {
+        self.insert_workload_token_row(hash, subject, issuer, None, Some(key), issued_at, expires)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_workload_token_row(
+        &self,
+        hash: &TokenHash,
+        subject: &SubjectKey,
+        issuer: &str,
+        claims: Option<&str>,
+        key: Option<ApiKeyId>,
+        issued_at: u64,
+        expires: u64,
+    ) -> Result<()> {
         sqlx::query(
-            "INSERT INTO forgs_workload_token (token_hash, subject, issuer, claims, issued_at, expires)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO forgs_workload_token
+                 (token_hash, subject, issuer, claims, api_key_id, issued_at, expires)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )
         .bind(hash.as_str())
         .bind(subject.to_string())
         .bind(issuer)
         .bind(claims)
+        .bind(key.map(|k| k.to_string()))
         .bind(ts(issued_at)?)
         .bind(ts(expires)?)
         .execute(&self.pool)
@@ -347,7 +425,14 @@ impl Store {
     /// a check followed by a racy write. Expiry is exclusive: `now ==
     /// expires` is expired.
     ///
-    /// Returns `None` when the key is unknown, already consumed, or expired.
+    /// The same statement also requires the key's creator to still be
+    /// entitled to it: an `active` user with a membership on the key
+    /// namespace's ancestor chain, or NULL for a shell-minted key. Checking
+    /// it inside the `UPDATE` makes it race-free against a concurrent
+    /// disable or removal, and covers every caller (HTTP and app paths).
+    ///
+    /// Returns `None` when the key is unknown, already consumed, expired, or
+    /// its creator is no longer an active member.
     ///
     /// # Errors
     ///
@@ -358,11 +443,12 @@ impl Store {
         now: u64,
     ) -> Result<Option<ConsumedApiKey>> {
         let row: Option<ApiKeyRecordRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-            "UPDATE forgs_api_key
+            "UPDATE forgs_api_key AS k
                 SET consumed_at = CASE WHEN single_use != 0 THEN ?2 ELSE consumed_at END
               WHERE key_hash = ?1
                 AND consumed_at IS NULL
                 AND (expires IS NULL OR expires > ?2)
+                AND {KEY_CREATOR_LIVE}
              RETURNING {API_KEY_COLS}"
         )))
         .bind(hash.as_str())
@@ -370,6 +456,26 @@ impl Store {
         .fetch_optional(&self.pool)
         .await?;
         row.map(consumed_from_row).transpose()
+    }
+
+    /// Whether `key`'s creator is still entitled to it (see
+    /// [`Store::consume_api_key`]): NULL creator (shell-minted), or an
+    /// `active` user with a membership on the key namespace's ancestor
+    /// chain. Lets a caller audit the precise reason before the consume,
+    /// which enforces the same rule atomically anyway. An unknown key is not
+    /// live.
+    ///
+    /// # Errors
+    ///
+    /// A database error.
+    pub async fn api_key_creator_live(&self, key: &ConsumedApiKey) -> Result<bool> {
+        let row: Option<(i64,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT 1 FROM forgs_api_key k WHERE k.id = ?1 AND {KEY_CREATOR_LIVE}"
+        )))
+        .bind(key.id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.is_some())
     }
 
     /// Every live grant issued **to** `subject`, across all namespaces.

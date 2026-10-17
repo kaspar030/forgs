@@ -244,6 +244,8 @@ pub async fn list(
 
 /// Revoke the key in `namespace` whose hash starts with `prefix`.
 ///
+/// The workload tokens already minted from the key die with it.
+///
 /// # Errors
 ///
 /// `403` for a non-member or a caller who is neither the creator nor an

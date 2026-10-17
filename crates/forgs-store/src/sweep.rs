@@ -28,7 +28,13 @@ pub struct SweepCounts {
 impl Store {
     /// Delete every credential row that expired at or before `now`
     /// (`expires <= now`, matching verification's exclusive expiry), consumed
-    /// single-use API keys, and decided device approvals.
+    /// single-use API keys no live workload token still references, and
+    /// decided device approvals.
+    ///
+    /// Workload tokens are swept before API keys, so a consumed key whose
+    /// tokens all just expired goes in the same pass. A consumed key is kept
+    /// while one of its tokens lives: it is how disabling or removing its
+    /// creator finds that token.
     ///
     /// # Errors
     ///
@@ -51,9 +57,10 @@ impl Store {
             sessions: run("DELETE FROM forgs_session WHERE expires <= ?1").await?,
             refresh_tokens: run("DELETE FROM forgs_refresh_token WHERE expires <= ?1").await?,
             workload_tokens: run("DELETE FROM forgs_workload_token WHERE expires <= ?1").await?,
-            api_keys: run(
-                "DELETE FROM forgs_api_key WHERE expires <= ?1 OR consumed_at IS NOT NULL",
-            )
+            api_keys: run("DELETE FROM forgs_api_key WHERE expires <= ?1
+                     OR (consumed_at IS NOT NULL AND NOT EXISTS (
+                         SELECT 1 FROM forgs_workload_token w
+                          WHERE w.api_key_id = forgs_api_key.id))")
             .await?,
             pending_signups: run("DELETE FROM forgs_pending_signup WHERE expires <= ?1").await?,
             pending_devices: run(

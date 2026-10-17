@@ -243,16 +243,30 @@ impl<'a> NsScope<'a> {
 
     /// Remove `subject`'s direct membership. Returns whether a row existed.
     ///
+    /// For a user subject, in the same transaction, the workload tokens
+    /// minted from that user's API keys that are no longer live (the user
+    /// has no remaining membership on the key namespace's chain) are
+    /// deleted. The keys themselves stay, inert, and work again if the user
+    /// is re-added (see [`Store::consume_api_key`]).
+    ///
     /// # Errors
     ///
     /// A database error.
     pub async fn remove_member(&self, subject: &SubjectKey) -> Result<bool> {
+        let mut tx = self.store.begin().await?;
         let n = sqlx::query("DELETE FROM forgs_membership WHERE ns_node_id = ?1 AND subject = ?2")
             .bind(self.ns_s())
             .bind(subject.to_string())
-            .execute(self.store.pool())
+            .execute(&mut *tx)
             .await?
             .rows_affected();
+        if n > 0 && subject.kind() == SubjectKind::User {
+            if let Some(user) = subject.user_id() {
+                crate::credentials::purge_dead_key_tokens_for_user_tx(&mut tx, &user.to_string())
+                    .await?;
+            }
+        }
+        tx.commit().await?;
         Ok(n > 0)
     }
 
@@ -388,7 +402,8 @@ impl<'a> NsScope<'a> {
     /// The caller should refuse an ambiguous prefix (more than one match)
     /// *before* revoking; [`NsScope::list_api_keys`] gives it what it needs.
     /// Revocation is a `DELETE`: trivially auditable, and there is no
-    /// tombstone to forget to check.
+    /// tombstone to forget to check. The workload tokens minted from the
+    /// deleted keys are deleted with them, in the same transaction.
     ///
     /// # Errors
     ///
@@ -401,14 +416,25 @@ impl<'a> NsScope<'a> {
         {
             return Err(StoreError::BadPrefix);
         }
+        let mut tx = self.store.begin().await?;
+        sqlx::query(
+            "DELETE FROM forgs_workload_token WHERE api_key_id IN (
+                 SELECT id FROM forgs_api_key
+                  WHERE ns_node_id = ?1 AND substr(key_hash, 1, length(?2)) = ?2)",
+        )
+        .bind(self.ns_s())
+        .bind(prefix)
+        .execute(&mut *tx)
+        .await?;
         let rows: Vec<(String,)> = sqlx::query_as(
             "DELETE FROM forgs_api_key WHERE ns_node_id = ?1 AND substr(key_hash, 1, length(?2)) = ?2
              RETURNING key_hash",
         )
         .bind(self.ns_s())
         .bind(prefix)
-        .fetch_all(self.store.pool())
+        .fetch_all(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(rows
             .into_iter()
             .map(|(h,)| TokenHash::from_hex(h))
@@ -416,18 +442,26 @@ impl<'a> NsScope<'a> {
     }
 
     /// Revoke one of this namespace's keys by id. Returns whether it existed
-    /// here.
+    /// here. The workload tokens minted from it are deleted with it.
     ///
     /// # Errors
     ///
     /// A database error.
     pub async fn delete_api_key(&self, id: ApiKeyId) -> Result<bool> {
+        let mut tx = self.store.begin().await?;
         let n = sqlx::query("DELETE FROM forgs_api_key WHERE ns_node_id = ?1 AND id = ?2")
             .bind(self.ns_s())
             .bind(id.to_string())
-            .execute(self.store.pool())
+            .execute(&mut *tx)
             .await?
             .rows_affected();
+        if n > 0 {
+            sqlx::query("DELETE FROM forgs_workload_token WHERE api_key_id = ?1")
+                .bind(id.to_string())
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
         Ok(n > 0)
     }
 

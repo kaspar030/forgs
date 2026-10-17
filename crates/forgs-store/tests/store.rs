@@ -1035,6 +1035,205 @@ async fn api_key_consumption() {
 }
 
 // ---------------------------------------------------------------------------
+// API keys die with their creator's standing (audit HTTP-03 / HTTP-10)
+// ---------------------------------------------------------------------------
+
+/// alice's personal `org` (forge schema) with a `project` child; bob is a
+/// member of the org (inherited at the project) and mints `n` multi-use keys
+/// in the project.
+async fn creator_fixture() -> (Store, UserId, NsNodeId, NsNodeId) {
+    let s = store(forge()).await;
+    let (_, org) = s.create_local_user("alice", None, NOW).await.unwrap();
+    let org = org.unwrap();
+    let (bob, _) = s.create_local_user("bob", None, NOW).await.unwrap();
+    let project = s
+        .create_node(Some(org), "project", "p", NameOrigin::User, None, NOW)
+        .await
+        .unwrap();
+    s.scoped(org)
+        .set_member(&SubjectKey::user(bob), s.roles().lowest(), NOW)
+        .await
+        .unwrap();
+    (s, bob, org, project)
+}
+
+fn bobs_key(h: TokenHash, bob: UserId, single_use: bool) -> NewApiKey {
+    let mut k = key(h, single_use, None);
+    k.created_by = Some(bob);
+    k
+}
+
+async fn mint_from(
+    s: &Store,
+    key_hash: &TokenHash,
+    token: &TokenHash,
+) -> forgs_store::ConsumedApiKey {
+    let k = s.consume_api_key(key_hash, NOW).await.unwrap().unwrap();
+    let w = forgs::subject::workload_subject_key("gha", "1", "2").unwrap();
+    s.insert_key_workload_token(token, &w, "api_key", k.id, NOW, NOW + 100)
+        .await
+        .unwrap();
+    k
+}
+
+#[tokio::test]
+async fn a_disabled_creators_keys_stop_redeeming_and_their_tokens_die() {
+    let (s, bob, _, project) = creator_fixture().await;
+    s.scoped(project)
+        .insert_api_key(&bobs_key(hash(1), bob, false), NOW)
+        .await
+        .unwrap();
+    // Membership inherited from the org is enough.
+    let k = mint_from(&s, &hash(1), &hash(0x51)).await;
+    assert!(s.api_key_creator_live(&k).await.unwrap());
+    // An unrelated OIDC token is untouched by everything below.
+    let w = forgs::subject::workload_subject_key("gha", "3", "4").unwrap();
+    s.insert_workload_token(&hash(0x52), &w, "github_oidc", None, NOW, NOW + 100)
+        .await
+        .unwrap();
+
+    s.set_user_state(bob, UserState::Disabled).await.unwrap();
+    assert!(s.lookup_workload(&hash(0x51)).await.unwrap().is_none());
+    assert!(s.lookup_workload(&hash(0x52)).await.unwrap().is_some());
+    assert!(!s.api_key_creator_live(&k).await.unwrap());
+    assert!(s.consume_api_key(&hash(1), NOW).await.unwrap().is_none());
+    // The key is kept, inert, and works again after re-enabling.
+    assert!(s.api_key_by_hash(&hash(1)).await.unwrap().is_some());
+    s.set_user_state(bob, UserState::Active).await.unwrap();
+    assert!(s.consume_api_key(&hash(1), NOW).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn a_removed_creators_keys_stop_redeeming_and_their_tokens_die() {
+    let (s, bob, org, project) = creator_fixture().await;
+    let kb = SubjectKey::user(bob);
+    s.scoped(project)
+        .insert_api_key(&bobs_key(hash(1), bob, false), NOW)
+        .await
+        .unwrap();
+    // A direct membership at the project as well as the inherited one.
+    s.scoped(project)
+        .set_member(&kb, s.roles().lowest(), NOW)
+        .await
+        .unwrap();
+    mint_from(&s, &hash(1), &hash(0x51)).await;
+
+    // Removing one of two memberships leaves the key (and token) live.
+    assert!(s.scoped(org).remove_member(&kb).await.unwrap());
+    assert!(s.lookup_workload(&hash(0x51)).await.unwrap().is_some());
+    mint_from(&s, &hash(1), &hash(0x52)).await;
+
+    // Removing the last one kills both tokens and the key.
+    assert!(s.scoped(project).remove_member(&kb).await.unwrap());
+    assert!(s.lookup_workload(&hash(0x51)).await.unwrap().is_none());
+    assert!(s.lookup_workload(&hash(0x52)).await.unwrap().is_none());
+    assert!(s.consume_api_key(&hash(1), NOW).await.unwrap().is_none());
+
+    // Re-added: redeemable again.
+    s.scoped(org)
+        .set_member(&kb, s.roles().lowest(), NOW)
+        .await
+        .unwrap();
+    assert!(s.consume_api_key(&hash(1), NOW).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn shell_minted_keys_have_no_creator_to_lose() {
+    let (s, _, _, project) = creator_fixture().await;
+    s.scoped(project)
+        .insert_api_key(&key(hash(1), false, None), NOW)
+        .await
+        .unwrap();
+    let k = s.consume_api_key(&hash(1), NOW).await.unwrap().unwrap();
+    assert_eq!(k.created_by, None);
+    assert!(s.api_key_creator_live(&k).await.unwrap());
+}
+
+#[tokio::test]
+async fn deleting_a_user_deletes_their_keys_and_tokens() {
+    let (s, bob, _, project) = creator_fixture().await;
+    s.scoped(project)
+        .insert_api_key(&bobs_key(hash(1), bob, false), NOW)
+        .await
+        .unwrap();
+    s.scoped(project)
+        .insert_api_key(&key(hash(2), false, None), NOW)
+        .await
+        .unwrap();
+    mint_from(&s, &hash(1), &hash(0x51)).await;
+    s.delete_user(bob, NOW).await.unwrap();
+    assert!(s.lookup_workload(&hash(0x51)).await.unwrap().is_none());
+    assert!(s.api_key_by_hash(&hash(1)).await.unwrap().is_none());
+    // Not an orphaned live key: only the shell-minted one remains.
+    let left = s.scoped(project).list_api_keys().await.unwrap();
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].key_hash, hash(2));
+}
+
+#[tokio::test]
+async fn revoking_a_key_deletes_its_workload_tokens() {
+    let (s, bob, _, project) = creator_fixture().await;
+    let scope = s.scoped(project);
+    scope
+        .insert_api_key(&bobs_key(hash(0xaa), bob, false), NOW)
+        .await
+        .unwrap();
+    let id_b = scope
+        .insert_api_key(&bobs_key(hash(0xbb), bob, false), NOW)
+        .await
+        .unwrap();
+    scope
+        .insert_api_key(&bobs_key(hash(0xcc), bob, false), NOW)
+        .await
+        .unwrap();
+    mint_from(&s, &hash(0xaa), &hash(0x51)).await;
+    mint_from(&s, &hash(0xbb), &hash(0x52)).await;
+    mint_from(&s, &hash(0xcc), &hash(0x53)).await;
+    let w = forgs::subject::workload_subject_key("gha", "3", "4").unwrap();
+    s.insert_workload_token(&hash(0x54), &w, "github_oidc", None, NOW, NOW + 100)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        scope.delete_api_keys_by_prefix("aaaaaaaa").await.unwrap(),
+        vec![hash(0xaa)]
+    );
+    assert!(s.lookup_workload(&hash(0x51)).await.unwrap().is_none());
+    assert!(s.lookup_workload(&hash(0x52)).await.unwrap().is_some());
+    assert!(scope.delete_api_key(id_b).await.unwrap());
+    assert!(s.lookup_workload(&hash(0x52)).await.unwrap().is_none());
+    // Other keys' tokens and OIDC tokens survive.
+    assert!(s.lookup_workload(&hash(0x53)).await.unwrap().is_some());
+    assert!(s.lookup_workload(&hash(0x54)).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn the_sweep_keeps_a_consumed_key_while_its_token_lives() {
+    let (s, bob, _, project) = creator_fixture().await;
+    s.scoped(project)
+        .insert_api_key(&bobs_key(hash(1), bob, true), NOW)
+        .await
+        .unwrap();
+    mint_from(&s, &hash(1), &hash(0x51)).await; // token expires NOW + 100
+    assert_eq!(s.sweep(NOW + 1).await.unwrap().api_keys, 0);
+    // Still reachable through its creator.
+    s.set_user_state(bob, UserState::Disabled).await.unwrap();
+    assert!(s.lookup_workload(&hash(0x51)).await.unwrap().is_none());
+    let got = s.sweep(NOW + 1).await.unwrap();
+    assert_eq!(got.api_keys, 1);
+
+    // And with the token expiring instead, both go in one pass.
+    s.set_user_state(bob, UserState::Active).await.unwrap();
+    s.scoped(project)
+        .insert_api_key(&bobs_key(hash(2), bob, true), NOW)
+        .await
+        .unwrap();
+    mint_from(&s, &hash(2), &hash(0x52)).await;
+    let got = s.sweep(NOW + 100).await.unwrap();
+    assert_eq!((got.workload_tokens, got.api_keys), (1, 1));
+}
+
+// ---------------------------------------------------------------------------
 // TokenStore
 // ---------------------------------------------------------------------------
 
@@ -1319,10 +1518,10 @@ async fn deleting_a_user_cascades_their_rows() {
     }
     assert!(s.node(a.unwrap()).await.unwrap().is_none());
     assert_eq!(s.scoped(b).list_members().await.unwrap().len(), 1);
-    assert_eq!(
-        s.scoped(b).list_api_keys().await.unwrap()[0].created_by,
-        None
-    );
+    // Their keys are deleted, not orphaned with a NULL creator (which would
+    // make them indistinguishable from shell-minted keys, and live).
+    assert!(s.scoped(b).list_api_keys().await.unwrap().is_empty());
+
     let g = s.scoped(b).list_grants().await.unwrap();
     assert_eq!((g[0].id, g[0].created_by), (gid, None));
     // Their name is released forever.

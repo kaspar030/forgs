@@ -15,6 +15,10 @@ use crate::error::{Result, StoreError};
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("../migrations/0001_init.sql")),
     (2, include_str!("../migrations/0002_session_auth_time.sql")),
+    (
+        3,
+        include_str!("../migrations/0003_workload_token_source_key.sql"),
+    ),
 ];
 
 /// The newest schema version this build knows.

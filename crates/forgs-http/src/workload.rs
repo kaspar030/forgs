@@ -12,13 +12,18 @@
 //!   namespace-scoped, expiring and revocable; the workload token it mints
 //!   never outlives the key. The purpose must be a
 //!   [`crate::PurposeKind::Workload`] purpose, checked **before** the consume
-//!   so a mis-aimed redemption does not burn a single-use key.
+//!   so a mis-aimed redemption does not burn a single-use key. A key is only
+//!   as alive as its creator's active membership: a disabled creator, or one
+//!   with no membership left on the key namespace's chain, makes the key
+//!   unredeemable (shell-minted keys have no creator and are exempt), and the
+//!   workload tokens it minted are linked to it, so revoking the key or
+//!   disabling/removing its creator ends them immediately.
 //!
 //! Every verification failure is a flat `401 invalid_grant`; the reason is
 //! audited, never returned.
 
 use forgs::api::TokenResponse;
-use forgs::{SubjectKey, SubjectKind, TokenKind};
+use forgs::{ApiKeyId, SubjectKey, SubjectKind, TokenKind};
 
 use crate::audit::AuditEvent;
 use crate::context::AuthContext;
@@ -31,6 +36,7 @@ async fn mint_workload(
     issuer: &str,
     claims: Option<&str>,
     not_after: Option<u64>,
+    source_key: Option<ApiKeyId>,
     detail: Option<&str>,
 ) -> Result<TokenResponse, ApiError> {
     let now = ctx.now();
@@ -40,10 +46,18 @@ async fn mint_workload(
         expires = expires.min(cap);
     }
     let token = ctx.format().mint(TokenKind::Workload);
-    ctx.store()
-        .insert_workload_token(&token.hash(), subject, issuer, claims, now, expires)
-        .await
-        .map_err(store_err("insert_workload_token"))?;
+    match source_key {
+        Some(key) => ctx
+            .store()
+            .insert_key_workload_token(&token.hash(), subject, issuer, key, now, expires)
+            .await
+            .map_err(store_err("insert_key_workload_token"))?,
+        None => ctx
+            .store()
+            .insert_workload_token(&token.hash(), subject, issuer, claims, now, expires)
+            .await
+            .map_err(store_err("insert_workload_token"))?,
+    }
     ctx.audit()
         .record(
             AuditEvent::new(now, "workload.token.mint")
@@ -153,6 +167,7 @@ pub async fn exchange_oidc(ctx: &AuthContext, jwt: &str) -> Result<TokenResponse
         &issuer,
         Some(&claims),
         None,
+        None,
         Some(&detail),
     )
     .await
@@ -162,7 +177,8 @@ pub async fn exchange_oidc(ctx: &AuthContext, jwt: &str) -> Result<TokenResponse
 ///
 /// # Errors
 ///
-/// `401 invalid_grant` for an unknown/expired/consumed/malformed key, `403`
+/// `401 invalid_grant` for an unknown/expired/consumed/malformed key or one
+/// whose creator is disabled or no longer a member, `403`
 /// for a key whose purpose is not a workload purpose, the purpose hook's
 /// error, `500` on storage failure.
 pub async fn exchange_api_key(ctx: &AuthContext, key: &str) -> Result<TokenResponse, ApiError> {
@@ -192,6 +208,28 @@ pub async fn exchange_api_key(ctx: &AuthContext, key: &str) -> Result<TokenRespo
             )
             .await;
         return Err(ApiError::Forbidden);
+    }
+    // Audited pre-check of the creator's standing; the consume below
+    // enforces the same rule atomically, closing the race.
+    if !ctx
+        .store()
+        .api_key_creator_live(&meta)
+        .await
+        .map_err(store_err("api_key_creator_live"))?
+    {
+        ctx.audit()
+            .record(
+                AuditEvent::new(now, "api_key.redeem.creator_inactive")
+                    .ns(meta.ns)
+                    .target(hash.short())
+                    .detail(format!(
+                        "created_by={}",
+                        meta.created_by
+                            .map_or_else(|| "-".to_owned(), |u| u.to_string())
+                    )),
+            )
+            .await;
+        return Err(ApiError::InvalidGrant);
     }
     // The single atomic consume.
     let consumed = ctx
@@ -229,5 +267,14 @@ pub async fn exchange_api_key(ctx: &AuthContext, key: &str) -> Result<TokenRespo
                 .target(hash.short()),
         )
         .await;
-    mint_workload(ctx, &subject, "api_key", None, consumed.expires, None).await
+    mint_workload(
+        ctx,
+        &subject,
+        "api_key",
+        None,
+        consumed.expires,
+        Some(consumed.id),
+        None,
+    )
+    .await
 }
