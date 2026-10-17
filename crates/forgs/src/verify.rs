@@ -120,6 +120,11 @@ fn parse(format: &TokenFormat, s: &str) -> Result<OpaqueToken, AuthError> {
 /// [`AuthError::WrongKind`], decided **from the prefix alone, before any store
 /// access**.
 ///
+/// `allowed` is the set of kinds the caller (route) accepts. A kind outside
+/// it is likewise [`AuthError::WrongKind`] from the prefix alone, so a
+/// wrong-kind token gets the same answer whether it is live, expired or
+/// forged: no liveness oracle, and no wasted lookup.
+///
 /// # Errors
 ///
 /// Returns [`AuthError`] on any rejection. Every variant maps to the same
@@ -128,11 +133,12 @@ pub async fn authenticate(
     format: &TokenFormat,
     store: &impl TokenStore,
     bearer: &str,
+    allowed: &[TokenKind],
     now: u64,
 ) -> Result<Authenticated, AuthError> {
     let token = parse(format, bearer)?;
     let kind = token.kind();
-    if format.token_use(kind) == TokenUse::RedeemOnly {
+    if format.token_use(kind) == TokenUse::RedeemOnly || !allowed.contains(&kind) {
         // No store lookup at all: the prefix decides.
         return Err(AuthError::WrongKind { got: kind });
     }
@@ -312,6 +318,15 @@ mod tests {
         (b.build().unwrap(), node, node_device)
     }
 
+    /// Every core kind: these tests are about verification, not route policy.
+    const ANY: &[TokenKind] = &[
+        TokenKind::Session,
+        TokenKind::Workload,
+        TokenKind::Refresh,
+        TokenKind::ApiKey,
+        TokenKind::DeviceSecret,
+    ];
+
     fn alice() -> UserId {
         UserId::from_parts(1, 1)
     }
@@ -328,18 +343,18 @@ mod tests {
             },
         );
         let s = token.to_secret_string();
-        let auth = authenticate(&f, &store, &s, 999).await.unwrap();
+        let auth = authenticate(&f, &store, &s, ANY, 999).await.unwrap();
         assert_eq!(auth.kind, TokenKind::Session);
         assert_eq!(auth.subject, SubjectKey::user(alice()));
         assert_eq!(auth.expires, Some(1_000));
         assert_eq!(auth.hash, token.hash());
         // Boundary: expiry is exclusive — `now == expires` is already expired.
         assert_eq!(
-            authenticate(&f, &store, &s, 1_000).await.unwrap_err(),
+            authenticate(&f, &store, &s, ANY, 1_000).await.unwrap_err(),
             AuthError::Expired(TokenKind::Session)
         );
         assert_eq!(
-            authenticate(&f, &store, &s, 1_001).await.unwrap_err(),
+            authenticate(&f, &store, &s, ANY, 1_001).await.unwrap_err(),
             AuthError::Expired(TokenKind::Session)
         );
     }
@@ -359,17 +374,17 @@ mod tests {
             },
         );
         let s = token.to_secret_string();
-        let auth = authenticate(&f, &store, &s, 999).await.unwrap();
+        let auth = authenticate(&f, &store, &s, ANY, 999).await.unwrap();
         assert_eq!(auth.kind, TokenKind::Workload);
         assert_eq!(auth.subject, subject);
         assert_eq!(
-            authenticate(&f, &store, &s, 1_000).await.unwrap_err(),
+            authenticate(&f, &store, &s, ANY, 1_000).await.unwrap_err(),
             AuthError::Expired(TokenKind::Workload)
         );
         // An unknown workload token (the exchange row swept, or forged).
         let other = f.mint(TokenKind::Workload).to_secret_string();
         assert_eq!(
-            authenticate(&f, &store, &other, 0).await.unwrap_err(),
+            authenticate(&f, &store, &other, ANY, 0).await.unwrap_err(),
             AuthError::Unknown(TokenKind::Workload)
         );
     }
@@ -389,9 +404,15 @@ mod tests {
                 issued_at: Some(100),
             },
         );
-        let auth = authenticate(&f, &store, &token.to_secret_string(), 1_000)
-            .await
-            .unwrap();
+        let auth = authenticate(
+            &f,
+            &store,
+            &token.to_secret_string(),
+            &[TokenKind::App(node)],
+            1_000,
+        )
+        .await
+        .unwrap();
         assert_eq!(auth.kind, TokenKind::App(node));
         assert_eq!(auth.subject, subject);
         assert_eq!(auth.token_issued_at, Some(100));
@@ -404,9 +425,15 @@ mod tests {
     async fn revoked_app_token_is_unknown_with_its_kind() {
         let (f, node, _) = fleet();
         let token = f.mint(TokenKind::App(node));
-        let err = authenticate(&f, &FakeStore::default(), &token.to_secret_string(), 10)
-            .await
-            .unwrap_err();
+        let err = authenticate(
+            &f,
+            &FakeStore::default(),
+            &token.to_secret_string(),
+            &[TokenKind::App(node)],
+            10,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err, AuthError::Unknown(TokenKind::App(node)));
         assert_eq!(err.label(), "auth.reject.unknown");
         assert_eq!(err.kind().map(TokenKind::as_str), Some("node"));
@@ -416,10 +443,12 @@ mod tests {
     async fn missing_and_malformed_are_distinguished_for_audit_only() {
         let f = TokenFormat::default();
         let store = FakeStore::default();
-        let err = authenticate(&f, &store, "   ", 0).await.unwrap_err();
+        let err = authenticate(&f, &store, "   ", ANY, 0).await.unwrap_err();
         assert_eq!(err, AuthError::Missing);
         assert_eq!(err.label(), "auth.reject.missing");
-        let err = authenticate(&f, &store, "garbage", 0).await.unwrap_err();
+        let err = authenticate(&f, &store, "garbage", ANY, 0)
+            .await
+            .unwrap_err();
         assert!(matches!(err, AuthError::Malformed(_)));
         assert_eq!(err.label(), "auth.reject.malformed");
         assert_eq!(err.kind(), None);
@@ -429,7 +458,9 @@ mod tests {
     async fn store_errors_fail_closed() {
         let f = TokenFormat::default();
         let s = f.mint(TokenKind::Session).to_secret_string();
-        let err = authenticate(&f, &BrokenStore, &s, 0).await.unwrap_err();
+        let err = authenticate(&f, &BrokenStore, &s, ANY, 0)
+            .await
+            .unwrap_err();
         assert_eq!(err, AuthError::Store("disk on fire".into()));
         assert_eq!(err.label(), "auth.reject.store_error");
     }
@@ -447,10 +478,43 @@ mod tests {
             TokenKind::App(node_device),
         ] {
             let s = f.mint(kind).to_secret_string();
-            let err = authenticate(&f, &PanicStore, &s, 0).await.unwrap_err();
+            let err = authenticate(&f, &PanicStore, &s, ANY, 0).await.unwrap_err();
             assert_eq!(err, AuthError::WrongKind { got: kind });
             assert_eq!(err.label(), "auth.wrong_kind");
         }
+    }
+
+    /// A connection kind the route does not accept is `WrongKind` from the
+    /// prefix alone: live, expired and forged tokens get the same answer
+    /// (no liveness oracle), and the store is never consulted.
+    #[tokio::test]
+    async fn kinds_outside_allowed_are_rejected_before_any_store_access() {
+        let (f, node, _) = fleet();
+        for kind in [TokenKind::Workload, TokenKind::App(node)] {
+            let s = f.mint(kind).to_secret_string();
+            let err = authenticate(&f, &PanicStore, &s, &[TokenKind::Session], 0)
+                .await
+                .unwrap_err();
+            assert_eq!(err, AuthError::WrongKind { got: kind });
+        }
+        let s = f.mint(TokenKind::Session).to_secret_string();
+        let err = authenticate(&f, &PanicStore, &s, &[TokenKind::Workload], 0)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            AuthError::WrongKind {
+                got: TokenKind::Session
+            }
+        );
+        // Nothing allowed: nothing reaches the store.
+        let err = authenticate(&f, &PanicStore, &s, &[], 0).await.unwrap_err();
+        assert_eq!(
+            err,
+            AuthError::WrongKind {
+                got: TokenKind::Session
+            }
+        );
     }
 
     /// Even with a matching row in the store, a refresh token is `WrongKind`
@@ -467,7 +531,7 @@ mod tests {
             },
         );
         assert_eq!(
-            authenticate(&f, &store, &refresh.to_secret_string(), 0)
+            authenticate(&f, &store, &refresh.to_secret_string(), ANY, 0)
                 .await
                 .unwrap_err(),
             AuthError::WrongKind {

@@ -34,6 +34,12 @@ pub trait Clock: Send + Sync {
 }
 
 /// The wall clock.
+///
+/// # Panics
+///
+/// [`Clock::now`] panics if the system clock reads before the Unix epoch.
+/// Returning any fixed value instead would fail open (with `0`, every expiry
+/// check passes), so a clock that broken stops the request instead.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemClock;
 
@@ -41,7 +47,8 @@ impl Clock for SystemClock {
     fn now(&self) -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs())
+            .expect("system clock is before the Unix epoch; refusing to check expiries")
+            .as_secs()
     }
 }
 
@@ -239,7 +246,7 @@ pub enum ConfigError {
     #[error("invalid mount prefix {0:?}")]
     Mount(String),
     /// A path setting (`post_login_redirect`, `cookie_api_prefix`) must be an
-    /// absolute same-origin path.
+    /// absolute same-origin path; `cookie_api_prefix` must also end with `/`.
     #[error("invalid path setting {0:?}")]
     Path(String),
 }
@@ -667,6 +674,13 @@ impl AuthContextBuilder {
     /// The path prefix under which an app route marked
     /// [`crate::ApiCookie`] accepts the session cookie (default `/api/`), or
     /// `None` for nowhere.
+    ///
+    /// The prefix must end with `/` ([`Self::build`] refuses `/api`, which
+    /// would also match `/apix` and `/api-admin`).
+    ///
+    /// **`GET`/`HEAD` handlers under this prefix must be side-effect free**:
+    /// the session cookie is `SameSite=Lax`, so it rides cross-site top-level
+    /// `GET` navigations, and the CSRF check is skipped for safe methods.
     #[must_use]
     pub fn cookie_api_prefix(mut self, prefix: Option<&str>) -> Self {
         self.cookie_api_prefix = prefix.map(str::to_owned);
@@ -793,7 +807,7 @@ impl AuthContextBuilder {
             return Err(ConfigError::Path(self.post_login_redirect));
         }
         if let Some(p) = &self.cookie_api_prefix {
-            if !p.starts_with('/') || !safe_path(p) {
+            if !p.starts_with('/') || !p.ends_with('/') || !safe_path(p) {
                 return Err(ConfigError::Path(p.clone()));
             }
         }

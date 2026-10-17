@@ -178,22 +178,13 @@ pub async fn authenticate_request(
         None => ("", Arrival::Header),
     };
 
-    let auth = match forgs::authenticate(ctx.format(), &ctx.token_store(), bearer, now).await {
-        Ok(a) => a,
-        Err(e) => return Err(reject_authentication(ctx, &e).await),
-    };
-    if !allowed.contains(&auth.kind) {
-        let e = AuthError::WrongKind { got: auth.kind };
-        ctx.audit()
-            .record(
-                AuditEvent::new(now, e.label())
-                    .subject(&auth.subject)
-                    .target(auth.hash.short())
-                    .detail(e.to_string()),
-            )
-            .await;
-        return Err(forbidden());
-    }
+    // `allowed` is checked from the prefix inside `authenticate`, before any
+    // store access: a wrong-kind token is a 403 whether it is live or not.
+    let auth =
+        match forgs::authenticate(ctx.format(), &ctx.token_store(), bearer, allowed, now).await {
+            Ok(a) => a,
+            Err(e) => return Err(reject_authentication(ctx, &e).await),
+        };
     // A disabled (or deleted) user's sessions stop working at once, with the
     // same body as an unknown token.
     if auth.subject.kind() == SubjectKind::User {

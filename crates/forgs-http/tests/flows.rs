@@ -2156,6 +2156,22 @@ async fn workload_exchange() {
     )
     .await
     .expect(StatusCode::FORBIDDEN);
+    // ... decided from the prefix alone: a forged (unknown) workload token
+    // gets the same 403, so the status is no liveness oracle.
+    let forged = h
+        .ctx
+        .format()
+        .mint(forgs::TokenKind::Workload)
+        .to_secret_string();
+    h.post_json(
+        "/auth/keys",
+        Some(&forged),
+        None,
+        &[],
+        &json!({"action": "list", "namespace": "alice"}),
+    )
+    .await
+    .expect(StatusCode::FORBIDDEN);
 
     // An app-purpose key is refused without being burned.
     let node = h
@@ -2755,6 +2771,25 @@ async fn config_is_validated() {
         .workload_issuer(issuer("ghes", "ghes-corp"))
         .build()
         .is_ok());
+    // `cookie_api_prefix` must end with `/`: `/api` would also match
+    // `/apix` and `/api-admin`.
+    for bad in ["/api", "api/", "/a pi/"] {
+        assert!(
+            matches!(
+                b(PUBLIC, &[1; 32])
+                    .cookie_api_prefix(Some(bad))
+                    .build()
+                    .err(),
+                Some(ConfigError::Path(_))
+            ),
+            "{bad}"
+        );
+    }
+    assert!(b(PUBLIC, &[1; 32])
+        .cookie_api_prefix(Some("/app/api/"))
+        .build()
+        .is_ok());
+    assert!(b(PUBLIC, &[1; 32]).cookie_api_prefix(None).build().is_ok());
     let ctx = b(PUBLIC, &[1; 32]).mount("/sso").build().unwrap();
     assert_eq!(
         ctx.redirect_uri("github"),

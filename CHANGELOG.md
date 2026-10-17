@@ -4,6 +4,18 @@
 
 ### Security
 
+- A connection token of a kind the route does not accept is refused from
+  its prefix alone, before any store lookup: a live and a forged workload or
+  app token now both get `403` on a session-only route (previously a live one
+  got `403` and an unknown one `401`, a liveness oracle). **API change:**
+  `forgs::authenticate` takes the route's `allowed: &[TokenKind]`.
+- `SystemClock` panics if the system clock reads before the Unix epoch
+  instead of returning `0` (which made every expiry check pass).
+- `AuthContextBuilder::cookie_api_prefix` must end with `/` (`/api` would
+  also have matched `/apix…`); `build` returns `ConfigError::Path`
+  otherwise. App `ApiCookie` `GET`/`HEAD` handlers must be side-effect free
+  (`SameSite=Lax` cookies ride cross-site top-level `GET`s, and CSRF is not
+  checked for safe methods).
 - A GitHub Actions id token can be exchanged for a workload token only once
   (per issuer and `jti`, remembered until the JWT's `exp` + leeway). A leaked
   id token can no longer be replayed for fresh workload tokens until it

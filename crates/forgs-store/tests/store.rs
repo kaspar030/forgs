@@ -1570,12 +1570,25 @@ async fn token_store_lookups_round_trip() {
         .unwrap();
     let r = s.lookup_session(&session.hash()).await.unwrap().unwrap();
     assert_eq!((r.user_id, r.expires), (alice, NOW + 100));
-    let auth = authenticate(&f, &s, &session.to_secret_string(), NOW + 1)
-        .await
-        .unwrap();
+    let auth = authenticate(
+        &f,
+        &s,
+        &session.to_secret_string(),
+        &[TokenKind::Session],
+        NOW + 1,
+    )
+    .await
+    .unwrap();
     assert_eq!(auth.subject, SubjectKey::user(alice));
     assert_eq!(
-        authenticate(&f, &s, &session.to_secret_string(), NOW + 100).await,
+        authenticate(
+            &f,
+            &s,
+            &session.to_secret_string(),
+            &[TokenKind::Session],
+            NOW + 100
+        )
+        .await,
         Err(AuthError::Expired(TokenKind::Session))
     );
 
@@ -1625,7 +1638,7 @@ async fn token_store_lookups_round_trip() {
     )
     .await
     .unwrap();
-    let auth = authenticate(&f, &s, &wl.to_secret_string(), NOW)
+    let auth = authenticate(&f, &s, &wl.to_secret_string(), &[TokenKind::Workload], NOW)
         .await
         .unwrap();
     assert_eq!(auth.subject, subject);

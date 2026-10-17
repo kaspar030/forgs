@@ -141,19 +141,17 @@ pub async fn refresh_session(
     session_token: &str,
 ) -> Result<TokenResponse, ApiError> {
     let now = ctx.now();
-    let auth = match forgs::authenticate(ctx.format(), &ctx.token_store(), session_token, now).await
+    let auth = match forgs::authenticate(
+        ctx.format(),
+        &ctx.token_store(),
+        session_token,
+        &[TokenKind::Session],
+        now,
+    )
+    .await
     {
-        Ok(a) if a.kind == TokenKind::Session => a,
-        Ok(a) => {
-            ctx.audit()
-                .record(
-                    AuditEvent::new(now, "auth.wrong_kind")
-                        .subject(&a.subject)
-                        .detail("session refresh with a non-session token"),
-                )
-                .await;
-            return Err(ApiError::InvalidGrant);
-        }
+        // A non-session token is `WrongKind` from its prefix, below.
+        Ok(a) => a,
         Err(e) => {
             ctx.audit()
                 .record(AuditEvent::new(now, e.label()).detail("session refresh"))
