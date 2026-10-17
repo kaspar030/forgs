@@ -154,10 +154,14 @@ impl From<StoreError> for ApiError {
             StoreError::EmailTaken => ApiError::EMAIL_IN_USE,
             StoreError::IdentityTaken => ApiError::IDENTITY_TAKEN,
             StoreError::BadRole | StoreError::BadPrefix => ApiError::BadRequest,
-            StoreError::PersonalNode | StoreError::HasChildren => ApiError::CONFLICT,
+            StoreError::PersonalNode | StoreError::HasChildren | StoreError::PersonalOwner => {
+                ApiError::CONFLICT
+            }
             StoreError::OwnedLimit => ApiError::NAMESPACE_LIMIT,
             StoreError::LastIdentity => ApiError::LAST_IDENTITY,
             StoreError::ReleaseLimited => ApiError::RATE_LIMITED,
+            StoreError::LastAdmin | StoreError::SoleAdmin(_) => ApiError::LAST_ADMIN,
+            StoreError::NotAdmin => ApiError::Forbidden,
             other => {
                 tracing::warn!(error = %other, "store operation failed");
                 ApiError::Internal
@@ -202,6 +206,16 @@ mod tests {
             ApiError::USERNAME_INVALID
         );
         assert_eq!(ApiError::from(StoreError::NotFound), ApiError::NotFound);
+        assert_eq!(ApiError::from(StoreError::LastAdmin), ApiError::LAST_ADMIN);
+        assert_eq!(
+            ApiError::from(StoreError::SoleAdmin(Vec::new())),
+            ApiError::LAST_ADMIN
+        );
+        assert_eq!(ApiError::from(StoreError::NotAdmin), ApiError::Forbidden);
+        assert_eq!(
+            ApiError::from(StoreError::PersonalOwner),
+            ApiError::CONFLICT
+        );
         assert_eq!(
             ApiError::from(StoreError::EmailTaken),
             ApiError::EMAIL_IN_USE

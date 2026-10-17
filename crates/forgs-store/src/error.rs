@@ -69,6 +69,22 @@ pub enum StoreError {
     /// A personal node is renamed and deleted only together with its user.
     #[error("a personal namespace node follows its user")]
     PersonalNode,
+    /// The change would leave the namespace with no direct admin that is an
+    /// active user (see [`crate::NsScope::set_member_guarded`]).
+    #[error("the namespace would be left without an active admin")]
+    LastAdmin,
+    /// The user is the only active direct admin of a (non-personal)
+    /// namespace; add another admin there first (see
+    /// [`crate::Store::sole_admin_of`]).
+    #[error("the user is the sole active admin of a namespace")]
+    SoleAdmin(Vec<forgs::NsNodeId>),
+    /// The acting subject lacks the ladder's highest effective role on the
+    /// node (re-checked inside the write's transaction).
+    #[error("the actor is not an admin of this namespace")]
+    NotAdmin,
+    /// A personal node's own user cannot be removed from it or demoted there.
+    #[error("a personal namespace's owner keeps the highest role there")]
+    PersonalOwner,
     /// A role not on the store's ladder.
     #[error("role is not on this ladder")]
     BadRole,

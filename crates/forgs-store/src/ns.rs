@@ -561,6 +561,20 @@ impl Store {
         node: NsNodeId,
         subject: &SubjectKey,
     ) -> Result<Vec<(NsNodeId, Option<Role>)>> {
+        self.role_chain_on(&self.pool, node, subject).await
+    }
+
+    /// [`Store::role_chain`] on a given executor (a transaction, so a
+    /// guarded write re-checks the actor's role under its own lock).
+    pub(crate) async fn role_chain_on<'e, E>(
+        &self,
+        ex: E,
+        node: NsNodeId,
+        subject: &SubjectKey,
+    ) -> Result<Vec<(NsNodeId, Option<Role>)>>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+    {
         let rows: Vec<(String, Option<String>)> = sqlx::query_as(
             "WITH RECURSIVE chain(depth, id) AS (
                  SELECT 0, ?1
@@ -577,7 +591,7 @@ impl Store {
         )
         .bind(node.to_string())
         .bind(subject.to_string())
-        .fetch_all(&self.pool)
+        .fetch_all(ex)
         .await?;
         rows.into_iter()
             .map(|(id, role)| {

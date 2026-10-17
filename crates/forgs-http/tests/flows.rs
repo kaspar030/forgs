@@ -2362,26 +2362,89 @@ async fn members_are_admin_gated_and_keep_an_admin() {
     )
     .await
     .expect(StatusCode::CONFLICT);
-    // With a second admin, it is fine.
+    // A co-admin cannot evict or demote a personal namespace's owner.
     m(
         &alice,
         json!({"action": "set", "namespace": "alice", "username": "bob", "role": "admin"}),
     )
     .await
     .expect(StatusCode::NO_CONTENT);
-    m(
+    let r = m(
         &bob,
         json!({"action": "remove", "namespace": "alice", "username": "alice"}),
     )
+    .await;
+    r.expect(StatusCode::CONFLICT);
+    assert_eq!(r.error(), "conflict");
+    m(
+        &bob,
+        json!({"action": "set", "namespace": "alice", "username": "alice", "role": "member"}),
+    )
+    .await
+    .expect(StatusCode::CONFLICT);
+    // The owner can remove the co-admin; then bob is out.
+    m(
+        &alice,
+        json!({"action": "remove", "namespace": "alice", "username": "bob"}),
+    )
     .await
     .expect(StatusCode::NO_CONTENT);
-    m(&alice, json!({"action": "list", "namespace": "alice"}))
+    m(&bob, json!({"action": "list", "namespace": "alice"}))
         .await
         .expect(StatusCode::FORBIDDEN);
+    // In a shared namespace, a disabled co-admin does not count.
+    let alice_id = h
+        .ctx
+        .store()
+        .user_by_username("alice")
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    let bob_id = h
+        .ctx
+        .store()
+        .user_by_username("bob")
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    forgs_http::members::create_namespace(&h.ctx, alice_id, None, "org", "team", None)
+        .await
+        .unwrap();
+    m(
+        &alice,
+        json!({"action": "set", "namespace": "team", "username": "bob", "role": "admin"}),
+    )
+    .await
+    .expect(StatusCode::NO_CONTENT);
+    h.ctx
+        .store()
+        .set_user_state(bob_id, forgs_store::UserState::Disabled)
+        .await
+        .unwrap();
+    let r = m(
+        &alice,
+        json!({"action": "remove", "namespace": "team", "username": "alice"}),
+    )
+    .await;
+    r.expect(StatusCode::CONFLICT);
+    assert_eq!(r.error(), "last_admin");
+    h.ctx
+        .store()
+        .set_user_state(bob_id, forgs_store::UserState::Active)
+        .await
+        .unwrap();
+    m(
+        &alice,
+        json!({"action": "remove", "namespace": "team", "username": "alice"}),
+    )
+    .await
+    .expect(StatusCode::NO_CONTENT);
     // A personal namespace is renamed with its user, not directly.
     h.post_json(
         "/auth/rename",
-        Some(&bob),
+        Some(&alice),
         None,
         &[],
         &json!({"action": "namespace", "namespace": "alice", "new_name": "x"}),

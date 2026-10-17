@@ -668,7 +668,8 @@ impl ForgsClient {
     /// # Errors
     ///
     /// As [`ForgsClient::exchange`]: a non-admin is `403 forbidden`, demoting
-    /// the last admin `409 last_admin`.
+    /// the last active admin `409 last_admin`, demoting a personal
+    /// namespace's own user `409 conflict`.
     pub async fn set_member(
         &self,
         session_token: &str,

@@ -2,8 +2,11 @@
 //!
 //! Listing a namespace's members needs membership there; changing them needs
 //! the ladder's highest role (inherited roles count). A change that would
-//! leave a namespace with no direct admin is refused (`409 last_admin`) —
-//! otherwise one click orphans a tenant. Renames tombstone the old name
+//! leave a namespace with no direct admin who is an active user is refused
+//! (`409 last_admin`) — otherwise one click orphans a tenant — and a personal
+//! namespace's own user cannot be removed or demoted there (`409 conflict`).
+//! Both checks and the caller's role are re-read in the write's transaction,
+//! so concurrent changes cannot race past them. Renames tombstone the old name
 //! forever, so releasing root names is rate-limited per user and per renamed
 //! user / node (`429 rate_limited`; `forgs_store::Store::with_release_limit`).
 //!
@@ -93,21 +96,15 @@ pub async fn list(
     })
 }
 
-/// Would removing/demoting `target` leave `ns` with no direct admin?
-async fn is_last_admin(
-    ctx: &AuthContext,
-    ns: NsNodeId,
-    target: &SubjectKey,
-) -> Result<bool, ApiError> {
-    let highest = ctx.store().roles().highest();
-    let members = ctx
-        .store()
-        .scoped(ns)
-        .list_members()
-        .await
-        .map_err(store_err("list_members"))?;
-    let admins: Vec<_> = members.iter().filter(|m| m.role == highest).collect();
-    Ok(admins.len() == 1 && &admins[0].subject == target)
+/// How a refused guarded membership write is reported. `NotAdmin` means the
+/// caller lost the admin role between the pre-check and the write.
+fn member_err(what: &'static str) -> impl Fn(StoreError) -> ApiError {
+    move |e| match e {
+        StoreError::NotAdmin => ApiError::Forbidden,
+        StoreError::LastAdmin => ApiError::LAST_ADMIN,
+        StoreError::PersonalOwner => ApiError::CONFLICT,
+        other => store_err(what)(other),
+    }
 }
 
 async fn target_user(ctx: &AuthContext, username: &str) -> Result<UserId, ApiError> {
@@ -126,7 +123,9 @@ async fn target_user(ctx: &AuthContext, username: &str) -> Result<UserId, ApiErr
 /// # Errors
 ///
 /// `403` for a non-admin, `400` for an unknown role, `404` for an unknown
-/// user, `409 last_admin`, `500` on storage failure.
+/// user, `409 last_admin` when no other active user would remain a direct
+/// admin, `409 conflict` for demoting a personal namespace's own user,
+/// `500` on storage failure.
 pub async fn set(
     ctx: &AuthContext,
     user: UserId,
@@ -141,15 +140,14 @@ pub async fn set(
         .parse(role)
         .ok_or(ApiError::BadRequest)?;
     let target = SubjectKey::user(target_user(ctx, username).await?);
-    if role != ctx.store().roles().highest() && is_last_admin(ctx, ns, &target).await? {
-        return Err(ApiError::LAST_ADMIN);
-    }
     let now = ctx.now();
+    // The store re-checks the caller's role and the last-admin guard inside
+    // the write's transaction: the pre-check above only orders the errors.
     ctx.store()
         .scoped(ns)
-        .set_member(&target, role, now)
+        .set_member_guarded(&SubjectKey::user(user), &target, role, now)
         .await
-        .map_err(store_err("set_member"))?;
+        .map_err(member_err("set_member_guarded"))?;
     ctx.audit()
         .record(
             AuditEvent::new(now, "member.set")
@@ -179,15 +177,12 @@ pub async fn remove(
 ) -> Result<(), ApiError> {
     let ns = require_admin(ctx, user, namespace, "member.remove").await?;
     let target = SubjectKey::user(target_user(ctx, username).await?);
-    if is_last_admin(ctx, ns, &target).await? {
-        return Err(ApiError::LAST_ADMIN);
-    }
     let existed = ctx
         .store()
         .scoped(ns)
-        .remove_member(&target)
+        .remove_member_guarded(&SubjectKey::user(user), &target)
         .await
-        .map_err(store_err("remove_member"))?;
+        .map_err(member_err("remove_member_guarded"))?;
     if !existed {
         return Err(ApiError::NotFound);
     }

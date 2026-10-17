@@ -657,12 +657,22 @@ impl Store {
     /// are inert while the user is disabled (see [`Store::consume_api_key`])
     /// and redeemable again after re-enabling.
     ///
+    /// Disabling is never refused (an operator must be able to lock out an
+    /// account), but it can leave namespaces with no active admin: those
+    /// (other than the user's personal node) are returned so the caller can
+    /// report them. Re-enabling, or adding another admin, recovers them.
+    ///
     /// # Errors
     ///
     /// [`StoreError::NotFound`] or a database error.
-    pub async fn set_user_state(&self, user: UserId, state: UserState) -> Result<()> {
+    pub async fn set_user_state(&self, user: UserId, state: UserState) -> Result<Vec<NsNodeId>> {
         let user_s = user.to_string();
         let mut tx = self.begin().await?;
+        let orphaned = if state == UserState::Disabled {
+            self.sole_admin_of_tx(&mut tx, &user_s).await?
+        } else {
+            Vec::new()
+        };
         let n = sqlx::query("UPDATE forgs_user SET state = ?2 WHERE id = ?1")
             .bind(&user_s)
             .bind(state.as_str())
@@ -676,7 +686,52 @@ impl Store {
             crate::credentials::purge_dead_key_tokens_for_user_tx(&mut tx, &user_s).await?;
         }
         tx.commit().await?;
-        Ok(())
+        Ok(orphaned)
+    }
+
+    /// The non-personal namespaces where `user` is the only direct admin
+    /// that is an active user: disabling or deleting `user` would leave them
+    /// administrable by nobody (short of an inherited admin).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::BadRole`] or a database error.
+    pub async fn sole_admin_of(&self, user: UserId) -> Result<Vec<NsNodeId>> {
+        let mut conn = self.pool.acquire().await?;
+        self.sole_admin_of_tx(&mut conn, &user.to_string()).await
+    }
+
+    pub(crate) async fn sole_admin_of_tx(
+        &self,
+        conn: &mut SqliteConnection,
+        user: &str,
+    ) -> Result<Vec<NsNodeId>> {
+        let highest = self
+            .roles
+            .label(self.roles.highest())
+            .ok_or(StoreError::BadRole)?;
+        let active = UserState::Active.as_str();
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT m.ns_node_id FROM forgs_membership m
+               JOIN forgs_user u ON u.id = m.user_id
+               JOIN forgs_ns_node n ON n.id = m.ns_node_id
+              WHERE m.user_id = ?1 AND m.role = ?2 AND u.state = ?3
+                AND n.personal_of_user_id IS NOT ?1
+                AND NOT EXISTS (
+                    SELECT 1 FROM forgs_membership o
+                      JOIN forgs_user ou ON ou.id = o.user_id
+                     WHERE o.ns_node_id = m.ns_node_id AND o.role = ?2
+                       AND ou.state = ?3 AND o.user_id <> ?1)
+              ORDER BY m.ns_node_id",
+        )
+        .bind(user)
+        .bind(highest)
+        .bind(active)
+        .fetch_all(&mut *conn)
+        .await?;
+        rows.into_iter()
+            .map(|(id,)| parse_id!(NsNodeId, id))
+            .collect()
     }
 
     /// Delete a user, in one transaction: tombstone the username, delete the
@@ -688,7 +743,9 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// [`StoreError::NotFound`], [`StoreError::HasChildren`] if the personal
+    /// [`StoreError::NotFound`], [`StoreError::SoleAdmin`] if the user is the
+    /// only active direct admin of a non-personal namespace (add another
+    /// admin there first), [`StoreError::HasChildren`] if the personal
     /// node has children, [`StoreError::Dangling`] if the user still owns
     /// other (non-personal) nodes (`owner_user_id` is `ON DELETE RESTRICT`:
     /// transfer or delete them first) or an app table still references the
@@ -712,6 +769,10 @@ impl Store {
         let Some((username, personal)) = row else {
             return Err(StoreError::NotFound);
         };
+        let sole = self.sole_admin_of_tx(&mut tx, &user_s).await?;
+        if !sole.is_empty() {
+            return Err(StoreError::SoleAdmin(sole));
+        }
         sqlx::query(
             "DELETE FROM forgs_workload_token WHERE api_key_id IN (
                  SELECT id FROM forgs_api_key WHERE created_by = ?1)",

@@ -2493,3 +2493,188 @@ async fn create_node_with_admin_is_atomic_and_capped() {
     let r = s.delete_node(team, None, NOW).await;
     assert!(matches!(r, Err(StoreError::HasChildren)), "{r:?}");
 }
+
+/// A team node `t` with alice and bob as direct admins (fleet schema).
+async fn two_admin_team(s: &Store) -> (UserId, UserId, NsNodeId) {
+    let (alice, _) = s.create_local_user("alice", None, NOW).await.unwrap();
+    let (bob, _) = s.create_local_user("bob", None, NOW).await.unwrap();
+    let t = s
+        .create_node_with_admin(None, "org", "team", NameOrigin::User, alice, None, NOW)
+        .await
+        .unwrap();
+    s.scoped(t)
+        .set_member_guarded(
+            &SubjectKey::user(alice),
+            &SubjectKey::user(bob),
+            s.roles().highest(),
+            NOW,
+        )
+        .await
+        .unwrap();
+    (alice, bob, t)
+}
+
+#[tokio::test]
+async fn guarded_membership_writes_keep_an_active_admin() {
+    let s = store(fleet()).await;
+    let (alice, bob, t) = two_admin_team(&s).await;
+    let (ka, kb) = (SubjectKey::user(alice), SubjectKey::user(bob));
+    let (low, high) = (s.roles().lowest(), s.roles().highest());
+    let (carol, _) = s.create_local_user("carol", None, NOW).await.unwrap();
+    let kc = SubjectKey::user(carol);
+    // A non-admin actor is refused, even for a harmless change.
+    s.scoped(t).set_member(&kc, low, NOW).await.unwrap();
+    assert!(matches!(
+        s.scoped(t).set_member_guarded(&kc, &kc, low, NOW).await,
+        Err(StoreError::NotAdmin)
+    ));
+    assert!(matches!(
+        s.scoped(t).remove_member_guarded(&kc, &kb).await,
+        Err(StoreError::NotAdmin)
+    ));
+    // Bob demotes alice; then bob is the last admin and cannot leave.
+    s.scoped(t)
+        .set_member_guarded(&kb, &ka, low, NOW)
+        .await
+        .unwrap();
+    assert!(matches!(
+        s.scoped(t).set_member_guarded(&kb, &kb, low, NOW).await,
+        Err(StoreError::LastAdmin)
+    ));
+    assert!(matches!(
+        s.scoped(t).remove_member_guarded(&kb, &kb).await,
+        Err(StoreError::LastAdmin)
+    ));
+    // Demoted alice lost the actor check.
+    assert!(matches!(
+        s.scoped(t).remove_member_guarded(&ka, &kb).await,
+        Err(StoreError::NotAdmin)
+    ));
+    // Re-promote alice and disable her: a disabled admin does not count.
+    s.scoped(t)
+        .set_member_guarded(&kb, &ka, high, NOW)
+        .await
+        .unwrap();
+    let orphaned = s.set_user_state(alice, UserState::Disabled).await.unwrap();
+    assert!(orphaned.is_empty(), "bob is still active");
+    assert!(matches!(
+        s.scoped(t).remove_member_guarded(&kb, &kb).await,
+        Err(StoreError::LastAdmin)
+    ));
+    // ...but she can be removed (she is not an active admin).
+    assert!(s.scoped(t).remove_member_guarded(&kb, &ka).await.unwrap());
+    // Removing a non-member is a no-op, not an error.
+    assert!(!s.scoped(t).remove_member_guarded(&kb, &ka).await.unwrap());
+    // Non-admin targets are unaffected by the count.
+    assert!(s.scoped(t).remove_member_guarded(&kb, &kc).await.unwrap());
+}
+
+#[tokio::test]
+async fn a_personal_nodes_owner_cannot_be_evicted_or_demoted() {
+    let s = store(fleet()).await;
+    let (alice, a) = s.create_local_user("alice", None, NOW).await.unwrap();
+    let (bob, _) = s.create_local_user("bob", None, NOW).await.unwrap();
+    let a = a.unwrap();
+    let (ka, kb) = (SubjectKey::user(alice), SubjectKey::user(bob));
+    let high = s.roles().highest();
+    s.scoped(a)
+        .set_member_guarded(&ka, &kb, high, NOW)
+        .await
+        .unwrap();
+    assert!(matches!(
+        s.scoped(a).remove_member_guarded(&kb, &ka).await,
+        Err(StoreError::PersonalOwner)
+    ));
+    assert!(matches!(
+        s.scoped(a)
+            .set_member_guarded(&kb, &ka, s.roles().lowest(), NOW)
+            .await,
+        Err(StoreError::PersonalOwner)
+    ));
+    // Alice can still remove her co-admin.
+    assert!(s.scoped(a).remove_member_guarded(&ka, &kb).await.unwrap());
+}
+
+#[tokio::test]
+async fn deleting_or_disabling_a_sole_admin_is_refused_or_reported() {
+    let s = store(fleet()).await;
+    let (alice, _) = s.create_local_user("alice", None, NOW).await.unwrap();
+    let (bob, _) = s.create_local_user("bob", None, NOW).await.unwrap();
+    let t = s
+        .create_node_with_admin(None, "org", "team", NameOrigin::User, bob, None, NOW)
+        .await
+        .unwrap();
+    // Alice is sole admin of nothing but her personal node: deletable.
+    assert!(s.sole_admin_of(alice).await.unwrap().is_empty());
+    // Alice becomes sole admin of t (bob demoted).
+    let high = s.roles().highest();
+    let (ka, kb) = (SubjectKey::user(alice), SubjectKey::user(bob));
+    s.scoped(t)
+        .set_member_guarded(&kb, &ka, high, NOW)
+        .await
+        .unwrap();
+    s.scoped(t)
+        .set_member_guarded(&ka, &kb, s.roles().lowest(), NOW)
+        .await
+        .unwrap();
+    assert_eq!(s.sole_admin_of(alice).await.unwrap(), vec![t]);
+    let r = s.delete_user(alice, None, NOW).await;
+    assert!(
+        matches!(&r, Err(StoreError::SoleAdmin(v)) if v == &vec![t]),
+        "{r:?}"
+    );
+    assert!(s.user_by_id(alice).await.unwrap().is_some());
+    // Disabling is allowed but reports the namespace.
+    assert_eq!(
+        s.set_user_state(alice, UserState::Disabled).await.unwrap(),
+        vec![t]
+    );
+    // A disabled user is not counted, so it is no longer "sole admin of t".
+    assert!(s.sole_admin_of(alice).await.unwrap().is_empty());
+    s.set_user_state(alice, UserState::Active).await.unwrap();
+    // With a second active admin, deleting works.
+    s.scoped(t)
+        .set_member_guarded(&ka, &kb, high, NOW)
+        .await
+        .unwrap();
+    s.delete_user(alice, None, NOW).await.unwrap();
+}
+
+#[tokio::test]
+async fn concurrent_mutual_demotions_leave_an_admin() {
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("forgs-last-admin");
+    std::fs::create_dir_all(&dir).unwrap();
+    for round in 0..20 {
+        let path = dir.join(format!("r{round}.db"));
+        for ext in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{ext}", path.display()));
+        }
+        let s = Store::connect(path.to_str().unwrap(), fleet(), RoleLadder::default())
+            .await
+            .unwrap();
+        let (alice, bob, t) = two_admin_team(&s).await;
+        let (ka, kb) = (SubjectKey::user(alice), SubjectKey::user(bob));
+        let low = s.roles().lowest();
+        let (s1, s2) = (s.clone(), s.clone());
+        let (ka1, kb1, ka2, kb2) = (ka.clone(), kb.clone(), ka.clone(), kb.clone());
+        let (r1, r2) = tokio::join!(
+            async move { s1.scoped(t).set_member_guarded(&ka1, &kb1, low, NOW).await },
+            async move {
+                s2.scoped(t)
+                    .remove_member_guarded(&kb2, &ka2)
+                    .await
+                    .map(|_| ())
+            },
+        );
+        assert!(r1.is_ok() != r2.is_ok(), "exactly one wins: {r1:?} {r2:?}");
+        let admins = s
+            .scoped(t)
+            .list_members()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|m| m.role == s.roles().highest())
+            .count();
+        assert_eq!(admins, 1);
+    }
+}

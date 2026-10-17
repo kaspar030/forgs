@@ -6,6 +6,7 @@ use forgs::{ApiKeyId, GrantId, NsNodeId, Role, SubjectKey, SubjectKind, TokenHas
 
 use crate::credentials::{grant_from_row, GrantDbRow, GrantRow, GRANT_COLS};
 use crate::error::{from_ts, parse_id, ts, ts_opt, Result, StoreError};
+use crate::users::UserState;
 use crate::{now_ms, Store};
 
 /// A [`Store`] handle scoped to exactly one namespace node.
@@ -268,6 +269,160 @@ impl<'a> NsScope<'a> {
         }
         tx.commit().await?;
         Ok(n > 0)
+    }
+
+    /// [`NsScope::set_member`] as `actor`, with the last-admin guard, in one
+    /// `BEGIN IMMEDIATE` transaction (so concurrent demotions cannot both
+    /// pass the check):
+    ///
+    /// * `actor` must hold the ladder's highest **effective** role here;
+    /// * a personal node's own user cannot be demoted there;
+    /// * demoting a direct admin who is an active user is refused when no
+    ///   other active user is a direct admin. Disabled users do not count:
+    ///   they keep their memberships but administer nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotAdmin`], [`StoreError::PersonalOwner`],
+    /// [`StoreError::LastAdmin`], or those of [`NsScope::set_member`].
+    pub async fn set_member_guarded(
+        &self,
+        actor: &SubjectKey,
+        subject: &SubjectKey,
+        role: Role,
+        now: u64,
+    ) -> Result<()> {
+        let label = self.role_label(role)?;
+        let user = match subject.kind() {
+            SubjectKind::User => Some(subject.user_id().ok_or(StoreError::BadSubject)?),
+            _ => None,
+        };
+        let mut tx = self.store.begin().await?;
+        self.check_admin_tx(&mut tx, actor).await?;
+        if role != self.store.roles().highest() {
+            self.check_demotable_tx(&mut tx, subject).await?;
+        }
+        sqlx::query(
+            "INSERT INTO forgs_membership (ns_node_id, subject, user_id, role, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT (ns_node_id, subject) DO UPDATE SET role = excluded.role",
+        )
+        .bind(self.ns_s())
+        .bind(subject.to_string())
+        .bind(user.map(|u| u.to_string()))
+        .bind(label)
+        .bind(ts(now)?)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// [`NsScope::remove_member`] as `actor`, with the guard of
+    /// [`NsScope::set_member_guarded`], in one transaction. Returns whether
+    /// a row existed (a missing row is not an error, as there).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotAdmin`], [`StoreError::PersonalOwner`],
+    /// [`StoreError::LastAdmin`], or a database error.
+    pub async fn remove_member_guarded(
+        &self,
+        actor: &SubjectKey,
+        subject: &SubjectKey,
+    ) -> Result<bool> {
+        let mut tx = self.store.begin().await?;
+        self.check_admin_tx(&mut tx, actor).await?;
+        self.check_demotable_tx(&mut tx, subject).await?;
+        let n = sqlx::query("DELETE FROM forgs_membership WHERE ns_node_id = ?1 AND subject = ?2")
+            .bind(self.ns_s())
+            .bind(subject.to_string())
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        if n > 0 && subject.kind() == SubjectKind::User {
+            if let Some(user) = subject.user_id() {
+                crate::credentials::purge_dead_key_tokens_for_user_tx(&mut tx, &user.to_string())
+                    .await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(n > 0)
+    }
+
+    /// `actor` holds the highest effective role here, read inside `tx`.
+    async fn check_admin_tx(
+        &self,
+        tx: &mut sqlx::SqliteConnection,
+        actor: &SubjectKey,
+    ) -> Result<()> {
+        let chain = self.store.role_chain_on(&mut *tx, self.ns, actor).await?;
+        match forgs::authz::effective_role(&chain) {
+            Some(r) if r.satisfies(self.store.roles().highest()) => Ok(()),
+            _ => Err(StoreError::NotAdmin),
+        }
+    }
+
+    /// Removing or demoting `subject` here keeps an active direct admin and
+    /// does not evict a personal node's owner.
+    async fn check_demotable_tx(
+        &self,
+        tx: &mut sqlx::SqliteConnection,
+        subject: &SubjectKey,
+    ) -> Result<()> {
+        let ns = self.ns_s();
+        let subject_s = subject.to_string();
+        let row: Option<(String, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT m.role, u.state, n.personal_of_user_id
+               FROM forgs_membership m
+               JOIN forgs_ns_node n ON n.id = m.ns_node_id
+               LEFT JOIN forgs_user u ON u.id = m.user_id
+              WHERE m.ns_node_id = ?1 AND m.subject = ?2",
+        )
+        .bind(&ns)
+        .bind(&subject_s)
+        .fetch_optional(&mut *tx)
+        .await?;
+        // Not a direct member: nothing to guard.
+        let Some((role, state, personal_of)) = row else {
+            return Ok(());
+        };
+        let highest = self.role_label(self.store.roles().highest())?;
+        if role == highest && state.as_deref() == Some(UserState::Active.as_str()) {
+            self.check_other_active_admin_tx(tx, &ns, highest, &subject_s)
+                .await?;
+        }
+        if let (Some(owner), Some(user)) = (personal_of, subject.user_id()) {
+            if owner == user.to_string() {
+                return Err(StoreError::PersonalOwner);
+            }
+        }
+        Ok(())
+    }
+
+    /// Some active user other than `subject` is a direct admin here.
+    async fn check_other_active_admin_tx(
+        &self,
+        tx: &mut sqlx::SqliteConnection,
+        ns: &str,
+        highest: &str,
+        subject_s: &str,
+    ) -> Result<()> {
+        let (others,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM forgs_membership m
+               JOIN forgs_user u ON u.id = m.user_id
+              WHERE m.ns_node_id = ?1 AND m.role = ?2 AND u.state = ?3 AND m.subject <> ?4",
+        )
+        .bind(ns)
+        .bind(highest)
+        .bind(UserState::Active.as_str())
+        .bind(subject_s)
+        .fetch_one(&mut *tx)
+        .await?;
+        if others == 0 {
+            return Err(StoreError::LastAdmin);
+        }
+        Ok(())
     }
 
     /// `subject`'s **direct** role on this node (no inheritance; for that see
