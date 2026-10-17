@@ -14,13 +14,22 @@
 //!   silently capped: quietly giving a 30-day key would be discovered a
 //!   month later.
 //!
+//! Minting is capped by live keys per namespace and per minting user
+//! ([`crate::AuthContextBuilder::max_api_keys_per_namespace`],
+//! [`crate::AuthContextBuilder::max_api_keys_per_user`]; `403 key_limit`).
+//! Every refused mint is audited as `api_key.denied`.
+//!
+//! Listings are paginated and show a 16-hex hash prefix, never the full
+//! hash; a key's payload and creator are shown only to the namespace's
+//! admins and to the key's creator.
+//!
 //! Revocation is by hash prefix (≥ 8 hex), by the key's **creator or an
 //! admin** of the namespace; an ambiguous prefix is a `409` and names no
 //! candidates.
 
-use forgs::api::{ApiKeyCreated, ApiKeyInfo, ApiKeyList, ApiKeyRevoked};
-use forgs::{NsNodeId, TokenKind, UserId};
-use forgs_store::NewApiKey;
+use forgs::api::{ApiKeyCreated, ApiKeyInfo, ApiKeyList, ApiKeyRevoked, MAX_PAGE};
+use forgs::{ApiKeyId, NsNodeId, TokenKind, UserId};
+use forgs_store::{ApiKeyCap, NewApiKey, StoreError};
 
 use crate::audit::AuditEvent;
 use crate::auth::resolve_ns;
@@ -30,6 +39,86 @@ use crate::hooks::{KeyMint, PurposeKind};
 
 /// The shortest revocation prefix, in hex characters.
 pub const MIN_PREFIX_LEN: usize = 8;
+
+/// How much of a key's hash a listing shows, in hex characters.
+pub const LISTED_PREFIX_LEN: usize = 16;
+
+/// A requested page size, capped at [`MAX_PAGE`]; zero is a `400`.
+pub(crate) fn page_size(limit: Option<u32>) -> Result<u32, ApiError> {
+    match limit {
+        None => Ok(MAX_PAGE),
+        Some(0) => Err(ApiError::BadRequest),
+        Some(n) => Ok(n.min(MAX_PAGE)),
+    }
+}
+
+/// Record a refused mint (the caller is an authenticated member: no
+/// unauthenticated amplification).
+async fn deny_mint(ctx: &AuthContext, ns: NsNodeId, user: UserId, why: &str) {
+    ctx.audit()
+        .record(
+            AuditEvent::new(ctx.now(), "api_key.denied")
+                .ns(ns)
+                .subject(&forgs::SubjectKey::user(user))
+                .detail(why),
+        )
+        .await;
+}
+
+/// Check a mint request's TTL, purpose and `subject_name`, returning the
+/// normalised name or why it is refused (for the audit log; never echoes
+/// raw caller input).
+fn mint_shape(
+    ctx: &AuthContext,
+    ttl_secs: u64,
+    purpose: &str,
+    subject_name: Option<&str>,
+) -> Result<Option<String>, String> {
+    if ttl_secs == 0 || ttl_secs > ctx.ttl().api_key_max {
+        return Err(format!("bad ttl={ttl_secs}"));
+    }
+    let kind = ctx
+        .purposes()
+        .kind(purpose)
+        .ok_or_else(|| "unknown purpose".to_owned())?;
+    // A name on a purpose that confers no subject would be a stored no-op
+    // that looks effective; an invalid name is refused rather than repaired
+    // (a repaired name is a different identity).
+    match subject_name {
+        None => Ok(None),
+        Some(_) if kind != PurposeKind::Workload => {
+            Err(format!("purpose={purpose} takes no subject_name"))
+        }
+        Some(raw) => forgs::subject::normalise_service_name(raw)
+            .map(Some)
+            .ok_or_else(|| "invalid subject_name".to_owned()),
+    }
+}
+
+/// The stored payload as JSON for the response. A hook that returned
+/// non-JSON is the app's bug, not the caller's: mint nothing.
+fn echo_payload(
+    stored: Option<&str>,
+    purpose: &str,
+) -> Result<Option<serde_json::Value>, ApiError> {
+    stored
+        .map(|p| {
+            serde_json::from_str(p).map_err(|e| {
+                tracing::warn!(error = %e, purpose, "check_payload returned non-JSON");
+                ApiError::Internal
+            })
+        })
+        .transpose()
+}
+
+/// The configured live-key ceilings (`u64::MAX` disables one).
+fn key_caps(ctx: &AuthContext) -> ApiKeyCap {
+    let cap = |n: u64| (n != u64::MAX).then_some(n);
+    ApiKeyCap {
+        per_namespace: cap(ctx.inner.max_api_keys_per_namespace),
+        per_creator: cap(ctx.inner.max_api_keys_per_user),
+    }
+}
 
 /// Resolve `namespace` and require `user` to be a member (any role) there.
 /// Refusals are audited and indistinguishable from "no such namespace".
@@ -84,7 +173,9 @@ async fn require_member(
 /// role passing a `subject_name` (audited); `400` for a zero or over-cap TTL, an unknown
 /// purpose, a `subject_name` that is invalid or on a non-workload
 /// purpose, or a payload the purpose policy refuses
-/// ([`crate::ApiKeyPurposes::check_payload`]); `500` on storage failure.
+/// ([`crate::ApiKeyPurposes::check_payload`]); `403 key_limit` at a live-key
+/// ceiling; `500` on storage failure. Every refusal past the membership
+/// check is audited as `api_key.denied`.
 #[allow(clippy::too_many_arguments)]
 pub async fn create(
     ctx: &AuthContext,
@@ -98,33 +189,28 @@ pub async fn create(
 ) -> Result<ApiKeyCreated, ApiError> {
     let now = ctx.now();
     let (ns, role) = require_member(ctx, user, namespace, "api_key").await?;
-    if ttl_secs == 0 || ttl_secs > ctx.ttl().api_key_max {
-        return Err(ApiError::BadRequest);
-    }
-    let kind = ctx.purposes().kind(purpose).ok_or(ApiError::BadRequest)?;
-    // A name on a purpose that confers no subject would be a stored no-op
-    // that looks effective; an invalid name is refused rather than repaired
-    // (a repaired name is a different identity).
-    let subject_name = match subject_name {
-        None => None,
-        Some(_) if kind != PurposeKind::Workload => return Err(ApiError::BadRequest),
-        Some(raw) => Some(forgs::subject::normalise_service_name(raw).ok_or(ApiError::BadRequest)?),
+    let subject_name = match mint_shape(ctx, ttl_secs, purpose, subject_name) {
+        Ok(n) => n,
+        Err(why) => {
+            deny_mint(ctx, ns, user, &why).await;
+            return Err(ApiError::BadRequest);
+        }
     };
+
     // A named identity is derived from (ns, name) alone: a key for an
     // existing name inherits that identity's grants. Only the highest role
     // may name (or rotate) one.
     if subject_name.is_some() && !role.satisfies(ctx.store().roles().highest()) {
-        ctx.audit()
-            .record(
-                AuditEvent::new(now, "api_key.denied")
-                    .ns(ns)
-                    .subject(&forgs::SubjectKey::user(user))
-                    .detail("naming an identity requires the highest role"),
-            )
-            .await;
+        deny_mint(
+            ctx,
+            ns,
+            user,
+            "naming an identity requires the highest role",
+        )
+        .await;
         return Err(ApiError::Forbidden);
     }
-    let stored = ctx
+    let stored = match ctx
         .purposes()
         .check_payload(
             ctx,
@@ -137,26 +223,21 @@ pub async fn create(
                 payload,
             },
         )
-        .await?;
-    let echoed = match stored
-        .as_deref()
-        .map(serde_json::from_str::<serde_json::Value>)
+        .await
     {
-        None => None,
-        Some(Ok(v)) => Some(v),
-        Some(Err(e)) => {
-            // The app's hook returned something that is not JSON: its bug,
-            // not the caller's. Mint nothing.
-            tracing::warn!(error = %e, purpose, "check_payload returned non-JSON");
-            return Err(ApiError::Internal);
+        Ok(v) => v,
+        Err(e) => {
+            deny_mint(ctx, ns, user, &format!("purpose={purpose} payload refused")).await;
+            return Err(e);
         }
     };
+    let echoed = echo_payload(stored.as_deref(), purpose)?;
     let expires = now.saturating_add(ttl_secs);
     let token = ctx.format().mint(TokenKind::ApiKey);
-    let id = ctx
+    let id = match ctx
         .store()
         .scoped(ns)
-        .insert_api_key(
+        .insert_api_key_capped(
             &NewApiKey {
                 hash: token.hash(),
                 purpose: purpose.to_owned(),
@@ -167,9 +248,17 @@ pub async fn create(
                 created_by: Some(user),
             },
             now,
+            key_caps(ctx),
         )
         .await
-        .map_err(store_err("insert_api_key"))?;
+    {
+        Ok(id) => id,
+        Err(StoreError::KeyLimit) => {
+            deny_mint(ctx, ns, user, "live key limit").await;
+            return Err(ApiError::KEY_LIMIT);
+        }
+        Err(e) => return Err(store_err("insert_api_key")(e)),
+    };
     ctx.audit()
         .record(
             AuditEvent::new(now, "api_key.mint")
@@ -197,48 +286,71 @@ pub async fn create(
     })
 }
 
-/// List `namespace`'s keys (hashes only). Membership required.
+/// List one page of `namespace`'s keys, newest first. Membership required.
+///
+/// `before` is the previous page's [`ApiKeyList::next`]; `limit` is capped at
+/// [`MAX_PAGE`]. Hashes are cut to [`LISTED_PREFIX_LEN`]; a key's payload and
+/// creator are listed only for the namespace's admins and the key's creator.
 ///
 /// # Errors
 ///
-/// `403` for a non-member, `500` on storage failure.
+/// `403` for a non-member, `400` for a malformed `before` or a zero `limit`,
+/// `500` on storage failure.
 pub async fn list(
     ctx: &AuthContext,
     user: UserId,
     namespace: &str,
+    before: Option<&str>,
+    limit: Option<u32>,
 ) -> Result<ApiKeyList, ApiError> {
-    let (ns, _) = require_member(ctx, user, namespace, "api_key").await?;
-    let keys = ctx
+    let (ns, role) = require_member(ctx, user, namespace, "api_key").await?;
+    let limit = page_size(limit)?;
+    let before = before
+        .map(|b| ApiKeyId::parse(b.trim()).map_err(|_| ApiError::BadRequest))
+        .transpose()?;
+    let mut keys = ctx
         .store()
         .scoped(ns)
-        .list_api_keys()
+        .list_api_keys_page(before, limit.saturating_add(1))
         .await
-        .map_err(store_err("list_api_keys"))?;
+        .map_err(store_err("list_api_keys_page"))?;
+    let more = keys.len() > limit as usize;
+    keys.truncate(limit as usize);
+    let next = more
+        .then(|| keys.last().map(|k| k.id.to_string()))
+        .flatten();
+    let admin = role.satisfies(ctx.store().roles().highest());
     Ok(ApiKeyList {
         namespace: ns.to_string(),
         keys: keys
             .into_iter()
-            .map(|k| ApiKeyInfo {
-                id: k.id.to_string(),
-                key_hash: k.key_hash.as_str().to_owned(),
-                single_use: k.single_use,
-                purpose: k.purpose,
-                subject_name: k.subject_name,
-                payload: k.payload.as_deref().and_then(|p| {
-                    serde_json::from_str(p)
-                        .inspect_err(|e| {
-                            // A shell-minted key may carry a non-JSON payload.
-                            tracing::warn!(error = %e, key = %k.key_hash.short(),
-                                "API key payload is not JSON; not listed");
-                        })
-                        .ok()
-                }),
-                expires: k.expires,
-                consumed_at: k.consumed_at,
-                created_at: k.created_at,
-                created_by: k.created_by.map(|u| u.to_string()),
+            .map(|k| {
+                let detail = admin || k.created_by == Some(user);
+                ApiKeyInfo {
+                    id: k.id.to_string(),
+                    hash_prefix: k.key_hash.as_str()
+                        [..LISTED_PREFIX_LEN.min(k.key_hash.as_str().len())]
+                        .to_owned(),
+                    single_use: k.single_use,
+                    purpose: k.purpose,
+                    subject_name: k.subject_name,
+                    payload: k.payload.as_deref().filter(|_| detail).and_then(|p| {
+                        serde_json::from_str(p)
+                            .inspect_err(|e| {
+                                // A shell-minted key may carry a non-JSON payload.
+                                tracing::warn!(error = %e, key = %k.key_hash.short(),
+                                    "API key payload is not JSON; not listed");
+                            })
+                            .ok()
+                    }),
+                    expires: k.expires,
+                    consumed_at: k.consumed_at,
+                    created_at: k.created_at,
+                    created_by: k.created_by.filter(|_| detail).map(|u| u.to_string()),
+                }
             })
             .collect(),
+        next,
     })
 }
 
@@ -265,17 +377,14 @@ pub async fn revoke(
         return Err(ApiError::BadRequest);
     }
     let scope = ctx.store().scoped(ns);
-    let keys = scope
-        .list_api_keys()
+    // Two rows are enough to tell "one" from "ambiguous".
+    let matches = scope
+        .api_keys_by_prefix(&prefix, 2)
         .await
-        .map_err(store_err("list_api_keys"))?;
-    let matches: Vec<_> = keys
-        .iter()
-        .filter(|k| k.key_hash.as_str().starts_with(&prefix))
-        .collect();
+        .map_err(store_err("api_keys_by_prefix"))?;
     let target = match matches.as_slice() {
         [] => return Err(ApiError::NotFound),
-        [one] => *one,
+        [one] => one,
         _ => return Err(ApiError::AMBIGUOUS_PREFIX),
     };
     let subject = forgs::SubjectKey::user(user);

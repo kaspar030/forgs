@@ -149,6 +149,45 @@ type ApiKeyDbRow = (
     Option<i64>,
 );
 
+fn api_key_from_row(
+    (
+        id,
+        hash,
+        purpose,
+        subject_name,
+        payload,
+        single_use,
+        expires,
+        created_by,
+        created_at,
+        consumed_at,
+    ): ApiKeyDbRow,
+) -> Result<ApiKeyRow> {
+    Ok(ApiKeyRow {
+        id: parse_id!(ApiKeyId, id)?,
+        key_hash: TokenHash::from_hex(hash),
+        purpose,
+        subject_name,
+        payload,
+        single_use,
+        expires: expires.map(from_ts),
+        created_by: created_by.map(|u| parse_id!(UserId, u)).transpose()?,
+        created_at: from_ts(created_at),
+        consumed_at: consumed_at.map(from_ts),
+    })
+}
+
+/// Ceilings on **live** (unexpired, unconsumed) API keys for
+/// [`NsScope::insert_api_key_capped`]. `None` is no ceiling.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ApiKeyCap {
+    /// Live keys in the namespace, whoever minted them.
+    pub per_namespace: Option<u64>,
+    /// Live keys in the namespace minted by the new key's creator (ignored
+    /// for a shell-minted key).
+    pub per_creator: Option<u64>,
+}
+
 type MemberDbRow = (String, Option<String>, Option<String>, String, i64);
 
 type AuditDbRow = (
@@ -445,6 +484,8 @@ impl<'a> NsScope<'a> {
 
     /// Every direct member of this node, by subject.
     ///
+    /// Unbounded: prefer [`NsScope::list_members_page`] on a request path.
+    ///
     /// # Errors
     ///
     /// [`StoreError::CorruptRow`] if a stored subject or role no longer
@@ -458,6 +499,36 @@ impl<'a> NsScope<'a> {
         .bind(self.ns_s())
         .fetch_all(self.store.pool())
         .await?;
+        self.members_from_rows(rows)
+    }
+
+    /// One page of this node's direct members, by subject: at most `limit`
+    /// members whose rendered subject sorts after `after` (the last subject
+    /// of the previous page; `None` for the first page).
+    ///
+    /// # Errors
+    ///
+    /// As [`NsScope::list_members`].
+    pub async fn list_members_page(
+        &self,
+        after: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<MemberRow>> {
+        let rows: Vec<MemberDbRow> = sqlx::query_as(
+            "SELECT m.subject, m.user_id, u.username, m.role, m.created_at
+               FROM forgs_membership m LEFT JOIN forgs_user u ON u.id = m.user_id
+              WHERE m.ns_node_id = ?1 AND (?2 IS NULL OR m.subject > ?2)
+              ORDER BY m.subject LIMIT ?3",
+        )
+        .bind(self.ns_s())
+        .bind(after)
+        .bind(i64::from(limit))
+        .fetch_all(self.store.pool())
+        .await?;
+        self.members_from_rows(rows)
+    }
+
+    fn members_from_rows(&self, rows: Vec<MemberDbRow>) -> Result<Vec<MemberRow>> {
         rows.into_iter()
             .map(|(subject, user, username, role, created_at)| {
                 Ok(MemberRow {
@@ -484,7 +555,30 @@ impl<'a> NsScope<'a> {
     /// (empty purpose or `subject_name`) as [`StoreError::Db`], or a database
     /// error.
     pub async fn insert_api_key(&self, key: &NewApiKey, now: u64) -> Result<ApiKeyId> {
+        self.insert_api_key_capped(key, now, ApiKeyCap::default())
+            .await
+    }
+
+    /// Mint an API key unless that would exceed `cap`, counting only **live**
+    /// keys (not expired, not consumed). The count and the insert share one
+    /// `BEGIN IMMEDIATE` transaction, so concurrent mints cannot overshoot.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::KeyLimit`] at a cap, otherwise as
+    /// [`NsScope::insert_api_key`].
+    pub async fn insert_api_key_capped(
+        &self,
+        key: &NewApiKey,
+        now: u64,
+        cap: ApiKeyCap,
+    ) -> Result<ApiKeyId> {
         let id = ApiKeyId::generate(now_ms(now));
+        let now_s = ts(now)?;
+        let mut tx = self.store.begin().await?;
+        if cap != ApiKeyCap::default() {
+            self.check_key_cap(&mut tx, key, now_s, cap).await?;
+        }
         sqlx::query(
             "INSERT INTO forgs_api_key
                  (id, key_hash, ns_node_id, purpose, subject_name, payload, single_use, expires,
@@ -500,13 +594,100 @@ impl<'a> NsScope<'a> {
         .bind(key.single_use)
         .bind(ts_opt(key.expires)?)
         .bind(key.created_by.map(|u| u.to_string()))
-        .bind(ts(now)?)
-        .execute(self.store.pool())
+        .bind(now_s)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(id)
     }
 
+    async fn check_key_cap(
+        &self,
+        tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+        key: &NewApiKey,
+        now_s: i64,
+        cap: ApiKeyCap,
+    ) -> Result<()> {
+        // Both counts in one statement: live keys in the namespace, and
+        // those of them minted by this key's creator.
+        let (total, mine): (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*), COALESCE(SUM(created_by IS ?3), 0) FROM forgs_api_key
+              WHERE ns_node_id = ?1 AND consumed_at IS NULL
+                AND (expires IS NULL OR expires > ?2)",
+        )
+        .bind(self.ns_s())
+        .bind(now_s)
+        .bind(key.created_by.map(|u| u.to_string()))
+        .fetch_one(&mut **tx)
+        .await?;
+        let at = |n: i64, max: Option<u64>| max.is_some_and(|m| u64::try_from(n).unwrap_or(0) >= m);
+        if at(total, cap.per_namespace) || (key.created_by.is_some() && at(mine, cap.per_creator)) {
+            return Err(StoreError::KeyLimit);
+        }
+        Ok(())
+    }
+
+    /// One page of this namespace's API keys, newest first: at most `limit`
+    /// keys with an id below `before` (the last id of the previous page;
+    /// `None` for the first page). Ids embed the mint time, so id order is
+    /// mint order.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::CorruptRow`] or a database error.
+    pub async fn list_api_keys_page(
+        &self,
+        before: Option<ApiKeyId>,
+        limit: u32,
+    ) -> Result<Vec<ApiKeyRow>> {
+        let rows: Vec<ApiKeyDbRow> = sqlx::query_as(
+            "SELECT id, key_hash, purpose, subject_name, payload, single_use, expires, created_by,
+                    created_at, consumed_at
+               FROM forgs_api_key WHERE ns_node_id = ?1 AND (?2 IS NULL OR id < ?2)
+              ORDER BY id DESC LIMIT ?3",
+        )
+        .bind(self.ns_s())
+        .bind(before.map(|b| b.to_string()))
+        .bind(i64::from(limit))
+        .fetch_all(self.store.pool())
+        .await?;
+        rows.into_iter().map(api_key_from_row).collect()
+    }
+
+    /// At most `limit` of this namespace's keys whose hash starts with
+    /// `prefix` — enough to tell "none", "one" and "ambiguous" apart without
+    /// loading the namespace. A malformed prefix matches nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::BadPrefix`], [`StoreError::CorruptRow`] or a database
+    /// error.
+    pub async fn api_keys_by_prefix(&self, prefix: &str, limit: u32) -> Result<Vec<ApiKeyRow>> {
+        if prefix.len() < MIN_PREFIX
+            || !prefix
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            return Err(StoreError::BadPrefix);
+        }
+        let rows: Vec<ApiKeyDbRow> = sqlx::query_as(
+            "SELECT id, key_hash, purpose, subject_name, payload, single_use, expires, created_by,
+                    created_at, consumed_at
+               FROM forgs_api_key
+              WHERE ns_node_id = ?1 AND substr(key_hash, 1, length(?2)) = ?2
+              ORDER BY id DESC LIMIT ?3",
+        )
+        .bind(self.ns_s())
+        .bind(prefix)
+        .bind(i64::from(limit))
+        .fetch_all(self.store.pool())
+        .await?;
+        rows.into_iter().map(api_key_from_row).collect()
+    }
+
     /// Every API key of this namespace, newest first.
+    ///
+    /// Unbounded: prefer [`NsScope::list_api_keys_page`] on a request path.
     ///
     /// # Errors
     ///
@@ -520,35 +701,7 @@ impl<'a> NsScope<'a> {
         .bind(self.ns_s())
         .fetch_all(self.store.pool())
         .await?;
-        rows.into_iter()
-            .map(
-                |(
-                    id,
-                    hash,
-                    purpose,
-                    subject_name,
-                    payload,
-                    single_use,
-                    expires,
-                    created_by,
-                    created_at,
-                    consumed_at,
-                )| {
-                    Ok(ApiKeyRow {
-                        id: parse_id!(ApiKeyId, id)?,
-                        key_hash: TokenHash::from_hex(hash),
-                        purpose,
-                        subject_name,
-                        payload,
-                        single_use,
-                        expires: expires.map(from_ts),
-                        created_by: created_by.map(|u| parse_id!(UserId, u)).transpose()?,
-                        created_at: from_ts(created_at),
-                        consumed_at: consumed_at.map(from_ts),
-                    })
-                },
-            )
-            .collect()
+        rows.into_iter().map(api_key_from_row).collect()
     }
 
     /// Revoke this namespace's keys whose hash starts with `prefix`

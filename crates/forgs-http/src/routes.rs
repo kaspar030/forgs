@@ -799,7 +799,11 @@ async fn api_keys(
         )
         .await
         .map(|v| Json(v).into_response()),
-        ApiKeyRequest::List { namespace } => keys::list(&ctx, user, &namespace)
+        ApiKeyRequest::List {
+            namespace,
+            before,
+            limit,
+        } => keys::list(&ctx, user, &namespace, before.as_deref(), limit)
             .await
             .map(|v| Json(v).into_response()),
         ApiKeyRequest::Revoke { namespace, prefix } => {
@@ -821,7 +825,11 @@ async fn members_route(
         Err(e) => return e.into_response(),
     };
     let res = match req {
-        MembersRequest::List { namespace } => members::list(&ctx, user, &namespace)
+        MembersRequest::List {
+            namespace,
+            after,
+            limit,
+        } => members::list(&ctx, user, &namespace, after.as_deref(), limit)
             .await
             .map(|v| Json(v).into_response()),
         MembersRequest::Set {

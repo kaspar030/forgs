@@ -13,7 +13,7 @@ use forgs::{
     TokenKind, TokenStore, UserId,
 };
 use forgs_store::{
-    AuditEntry, AuditRow, GrantRow, NewApiKey, NewGrant, NewIdentity, NewSignup, NsNode,
+    ApiKeyCap, AuditEntry, AuditRow, GrantRow, NewApiKey, NewGrant, NewIdentity, NewSignup, NsNode,
     ReleaseCause, ReleaseLimit, Store, StoreError, SweepCounts, UserState, DEFAULT_RELEASE_LIMIT,
 };
 use sqlx::sqlite::SqlitePoolOptions;
@@ -1332,6 +1332,125 @@ async fn membership_is_scoped() {
     let agent = forgs::subject::agent_subject_key(&a, "builder");
     s.scoped(a).set_member(&agent, member, NOW).await.unwrap();
     assert_eq!(s.scoped(a).member_role(&agent).await.unwrap(), Some(member));
+}
+
+#[tokio::test]
+async fn api_key_caps_count_live_keys_only() {
+    let s = store(fleet()).await;
+    let (alice, a) = s.create_local_user("alice", None, NOW).await.unwrap();
+    let (bob, _) = s.create_local_user("bob", None, NOW).await.unwrap();
+    let a = a.unwrap();
+    let scope = s.scoped(a);
+    let by = |n: u8, u: UserId, exp: Option<u64>| NewApiKey {
+        created_by: Some(u),
+        ..key(hash(n), true, exp)
+    };
+    let cap = ApiKeyCap {
+        per_namespace: Some(3),
+        per_creator: Some(2),
+    };
+    scope
+        .insert_api_key_capped(&by(1, alice, Some(NOW + 10)), NOW, cap)
+        .await
+        .unwrap();
+    scope
+        .insert_api_key_capped(&by(2, alice, Some(NOW + 10)), NOW, cap)
+        .await
+        .unwrap();
+    assert!(matches!(
+        scope
+            .insert_api_key_capped(&by(3, alice, Some(NOW + 10)), NOW, cap)
+            .await,
+        Err(StoreError::KeyLimit)
+    ));
+    scope
+        .insert_api_key_capped(&by(4, bob, Some(NOW + 10)), NOW, cap)
+        .await
+        .unwrap();
+    // The namespace is full for everyone, including a shell-minted key.
+    assert!(matches!(
+        scope
+            .insert_api_key_capped(&by(5, bob, Some(NOW + 10)), NOW, cap)
+            .await,
+        Err(StoreError::KeyLimit)
+    ));
+    assert!(matches!(
+        scope
+            .insert_api_key_capped(&key(hash(6), true, None), NOW, cap)
+            .await,
+        Err(StoreError::KeyLimit)
+    ));
+    // The uncapped insert (operator path) is never refused.
+    scope
+        .insert_api_key(&key(hash(7), true, None), NOW)
+        .await
+        .unwrap();
+    // Once expired, keys stop counting.
+    scope
+        .delete_api_keys_by_prefix(&hash(7).as_str()[..8])
+        .await
+        .unwrap();
+    scope
+        .insert_api_key_capped(&by(8, alice, Some(NOW + 100)), NOW + 11, cap)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn api_keys_and_members_page() {
+    let s = store(fleet()).await;
+    let (_, a) = s.create_local_user("alice", None, NOW).await.unwrap();
+    let a = a.unwrap();
+    let scope = s.scoped(a);
+    for n in 1..=5u8 {
+        scope
+            .insert_api_key(&key(hash(n), true, None), NOW + u64::from(n))
+            .await
+            .unwrap();
+    }
+    let p1 = scope.list_api_keys_page(None, 2).await.unwrap();
+    assert_eq!(
+        p1.iter().map(|k| k.key_hash.clone()).collect::<Vec<_>>(),
+        vec![hash(5), hash(4)]
+    );
+    let p2 = scope.list_api_keys_page(Some(p1[1].id), 2).await.unwrap();
+    assert_eq!(
+        p2.iter().map(|k| k.key_hash.clone()).collect::<Vec<_>>(),
+        vec![hash(3), hash(2)]
+    );
+    let p3 = scope.list_api_keys_page(Some(p2[1].id), 2).await.unwrap();
+    assert_eq!(p3.len(), 1);
+    // Prefix lookups are bounded and validated.
+    assert_eq!(
+        scope
+            .api_keys_by_prefix(&hash(3).as_str()[..8], 2)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(scope
+        .api_keys_by_prefix("ffffffff", 2)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(matches!(
+        scope.api_keys_by_prefix("abc", 2).await,
+        Err(StoreError::BadPrefix)
+    ));
+
+    let member = s.roles().lowest();
+    for name in ["b", "c", "d"] {
+        let agent = forgs::subject::agent_subject_key(&a, name);
+        scope.set_member(&agent, member, NOW).await.unwrap();
+    }
+    let all = scope.list_members().await.unwrap();
+    assert_eq!(all.len(), 4);
+    let m1 = scope.list_members_page(None, 3).await.unwrap();
+    assert_eq!(m1, all[..3]);
+    let after = m1[2].subject.to_string();
+    let m2 = scope.list_members_page(Some(&after), 3).await.unwrap();
+    assert_eq!(m2, all[3..]);
 }
 
 #[tokio::test]

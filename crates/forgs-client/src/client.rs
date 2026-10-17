@@ -581,7 +581,7 @@ impl ForgsClient {
     ///
     /// As [`ForgsClient::exchange`]: a non-member is `403 forbidden`, a zero
     /// or over-cap TTL, unknown purpose or refused payload
-    /// `400 invalid_request`.
+    /// `400 invalid_request`, a live-key ceiling `403 key_limit`.
     pub async fn create_api_key(
         &self,
         session_token: &str,
@@ -601,7 +601,8 @@ impl ForgsClient {
         .await
     }
 
-    /// List a namespace's API keys (hashes only, never a secret).
+    /// List all of a namespace's API keys (hash prefixes only, never a
+    /// secret), following pages. The result has no `next`.
     ///
     /// # Errors
     ///
@@ -611,10 +612,43 @@ impl ForgsClient {
         session_token: &str,
         namespace: &str,
     ) -> Result<ApiKeyList, ClientError> {
+        let mut all = self
+            .list_api_keys_page(session_token, namespace, None, None)
+            .await?;
+        while let Some(before) = all.next.take() {
+            let mut page = self
+                .list_api_keys_page(session_token, namespace, Some(&before), None)
+                .await?;
+            // A server that does not advance would loop forever.
+            if page.next.as_deref() == Some(before.as_str()) || page.keys.is_empty() {
+                break;
+            }
+            all.keys.append(&mut page.keys);
+            all.next = page.next;
+        }
+        Ok(all)
+    }
+
+    /// One page of a namespace's API keys, newest first: `before` is the
+    /// previous page's [`ApiKeyList::next`], `limit` the page size (capped by
+    /// the server).
+    ///
+    /// # Errors
+    ///
+    /// As [`ForgsClient::exchange`].
+    pub async fn list_api_keys_page(
+        &self,
+        session_token: &str,
+        namespace: &str,
+        before: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<ApiKeyList, ClientError> {
         self.keys(
             session_token,
             &ApiKeyRequest::List {
                 namespace: namespace.to_owned(),
+                before: before.map(str::to_owned),
+                limit,
             },
         )
         .await
@@ -644,7 +678,8 @@ impl ForgsClient {
         .await
     }
 
-    /// List a namespace's direct members (`POST /auth/members`, `list`).
+    /// List all of a namespace's direct members (`POST /auth/members`,
+    /// `list`), following pages. The result has no `next`.
     ///
     /// # Errors
     ///
@@ -655,11 +690,43 @@ impl ForgsClient {
         session_token: &str,
         namespace: &str,
     ) -> Result<MemberList, ClientError> {
+        let mut all = self
+            .list_members_page(session_token, namespace, None, None)
+            .await?;
+        while let Some(after) = all.next.take() {
+            let mut page = self
+                .list_members_page(session_token, namespace, Some(&after), None)
+                .await?;
+            if page.next.as_deref() == Some(after.as_str()) || page.members.is_empty() {
+                break;
+            }
+            all.members.append(&mut page.members);
+            all.next = page.next;
+        }
+        Ok(all)
+    }
+
+    /// One page of a namespace's direct members, by subject: `after` is the
+    /// previous page's [`MemberList::next`], `limit` the page size (capped by
+    /// the server).
+    ///
+    /// # Errors
+    ///
+    /// As [`ForgsClient::list_members`].
+    pub async fn list_members_page(
+        &self,
+        session_token: &str,
+        namespace: &str,
+        after: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<MemberList, ClientError> {
         self.post_json(
             "/auth/members",
             Some(&Secret::from(session_token)),
             &MembersRequest::List {
                 namespace: namespace.to_owned(),
+                after: after.map(str::to_owned),
+                limit,
             },
         )
         .await

@@ -190,9 +190,14 @@ async fn api_keys_create_list_revoke() {
                 "id": "01JKEY", "namespace": "01JNS", "single_use": true, "purpose": "ci",
                 "subject_name": "builder", "expires": 99}),
             ),
-            Reply::json(&json!({"namespace": "01JNS", "keys": [{"id": "01JKEY",
-                "key_hash": "abcdef0123", "single_use": true, "purpose": "ci",
-                "created_at": 1}]})),
+            Reply::json(
+                &json!({"namespace": "01JNS", "next": "01JKEY", "keys": [{"id": "01JKEY",
+                "hash_prefix": "abcdef0123", "single_use": true, "purpose": "ci",
+                "created_at": 1}]}),
+            ),
+            Reply::json(&json!({"namespace": "01JNS", "keys": [{"id": "01JKE0",
+                "hash_prefix": "0123abcdef", "single_use": true, "purpose": "ci",
+                "created_at": 0}]})),
             Reply::json(&json!({"namespace": "01JNS", "revoked": ["abcdef0123"]})),
         ],
     );
@@ -214,8 +219,10 @@ async fn api_keys_create_list_revoke() {
     assert_eq!(created.subject_name.as_deref(), Some("builder"));
     assert_redacted(&created);
 
+    // Pages are followed: two pages, one key each.
     let list = c.list_api_keys("SEKRIT-s", "acme").await.unwrap();
-    assert_eq!(list.keys.len(), 1);
+    assert_eq!(list.keys.len(), 2);
+    assert_eq!(list.next, None);
     let revoked = c
         .revoke_api_key("SEKRIT-s", "acme", "abcdef01")
         .await
@@ -237,6 +244,10 @@ async fn api_keys_create_list_revoke() {
     );
     assert_eq!(
         reqs[2].json(),
+        json!({"action": "list", "namespace": "acme", "before": "01JKEY"})
+    );
+    assert_eq!(
+        reqs[3].json(),
         json!({"action": "revoke", "namespace": "acme", "prefix": "abcdef01"})
     );
 

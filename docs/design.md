@@ -302,6 +302,17 @@ forgs_membership { ns_node_id, subject (SubjectKey), user_id NULL, role }
   Workload tokens minted from a key record its id, and revoking the key,
   disabling its creator, removing the creator's last membership on the chain
   or deleting the creator deletes them immediately rather than at expiry.
+  Minting over the API is capped by **live** (unexpired, unconsumed) keys per
+  namespace and per minting user in it (`max_api_keys_per_namespace`, default
+  1000; `max_api_keys_per_user`, default 100; `403 key_limit`), counted in the
+  insert's `BEGIN IMMEDIATE` transaction. Key and member listings are
+  paginated (`before` / `after` cursors, at most 100 per page) and revocation
+  looks up at most two prefix matches, so no request loads a whole namespace.
+  A listing shows a 16-hex hash prefix, never the full hash; a key's payload
+  and creator are shown only to the namespace's admins and the key's creator.
+  Every refused mint (bad TTL, purpose, name, payload, cap) is audited as
+  `api_key.denied`, and a non-member's member/namespace writes as
+  `<action>.denied` (authenticated, so no unauthenticated amplification).
 
 - Browser: an HttpOnly session cookie that is the same credential as the bearer
   token, a double-submit HMAC CSRF token, a cookie accepted only on the

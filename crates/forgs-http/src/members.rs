@@ -60,27 +60,54 @@ async fn require_admin(
                 .await;
             Err(ApiError::Forbidden)
         }
+        // A non-member or an unknown namespace: the same 403, audited too
+        // (the caller is authenticated, so this is not free amplification).
+        // The namespace is not resolvable here, so the raw name is the
+        // target, truncated.
+        Err(ApiError::Forbidden) => {
+            ctx.audit()
+                .record(
+                    AuditEvent::new(ctx.now(), &format!("{action}.denied"))
+                        .subject(&SubjectKey::user(user))
+                        .target(namespace.trim().chars().take(128).collect::<String>())
+                        .detail("not a member or no such namespace"),
+                )
+                .await;
+            Err(ApiError::Forbidden)
+        }
         Err(e) => Err(e),
     }
 }
 
-/// List `namespace`'s direct members.
+/// List one page of `namespace`'s direct members, by subject.
+///
+/// `after` is the previous page's [`MemberList::next`]; `limit` is capped at
+/// [`forgs::api::MAX_PAGE`].
 ///
 /// # Errors
 ///
-/// `403` for a non-member, `500` on storage failure.
+/// `403` for a non-member, `400` for a zero `limit`, `500` on storage
+/// failure.
 pub async fn list(
     ctx: &AuthContext,
     user: UserId,
     namespace: &str,
+    after: Option<&str>,
+    limit: Option<u32>,
 ) -> Result<MemberList, ApiError> {
     let (ns, _) = role_in(ctx, user, namespace).await?;
-    let rows = ctx
+    let limit = crate::keys::page_size(limit)?;
+    let mut rows = ctx
         .store()
         .scoped(ns)
-        .list_members()
+        .list_members_page(after, limit.saturating_add(1))
         .await
-        .map_err(store_err("list_members"))?;
+        .map_err(store_err("list_members_page"))?;
+    let more = rows.len() > limit as usize;
+    rows.truncate(limit as usize);
+    let next = more
+        .then(|| rows.last().map(|m| m.subject.to_string()))
+        .flatten();
     let roles = ctx.store().roles();
     Ok(MemberList {
         namespace: ns.to_string(),
@@ -93,6 +120,7 @@ pub async fn list(
                 role: roles.label(m.role).unwrap_or_default().to_owned(),
             })
             .collect(),
+        next,
     })
 }
 

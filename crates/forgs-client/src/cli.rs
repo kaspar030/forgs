@@ -176,6 +176,10 @@ pub fn describe(err: &ClientError, doing: &str) -> String {
                 "{doing} failed: the prefix matches more than one key; list the keys and use a \
                  longer prefix"
             ),
+            error_code::KEY_LIMIT => format!(
+                "{doing} failed: too many live API keys in this namespace; revoke one or let \
+                 one expire"
+            ),
             error_code::RATE_LIMITED => {
                 format!("{doing} failed: too many attempts recently; try again later")
             }

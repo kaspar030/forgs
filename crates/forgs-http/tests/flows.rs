@@ -2029,7 +2029,9 @@ async fn api_keys() {
     let list = keys(&alice, json!({"action": "list", "namespace": "alice"}))
         .await
         .json();
-    assert_eq!(list["keys"][0]["key_hash"], hash);
+    // A short prefix only: never the full hash.
+    assert_eq!(list["keys"][0]["hash_prefix"], hash[..16]);
+    assert!(!list.to_string().contains(&hash));
     assert!(!list.to_string().contains("frgk1_"));
 
     let revoke = |t: &str, prefix: &str| {
@@ -2986,7 +2988,7 @@ async fn api_key_payloads_are_validated_canonicalised_and_listed() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|k| k["key_hash"] == hash)
+        .find(|k| k["hash_prefix"] == hash[..16])
         .unwrap();
     assert_eq!(row["payload"], json!({"tags": ["a", "b"]}));
 
@@ -3035,7 +3037,7 @@ async fn api_key_payloads_are_validated_canonicalised_and_listed() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|k| k["key_hash"] == "ab".repeat(32))
+        .find(|k| k["hash_prefix"] == "ab".repeat(8))
         .unwrap();
     assert!(odd.get("payload").is_none());
 }
@@ -3569,4 +3571,242 @@ async fn device_approval_can_be_cancelled_by_its_approver() {
     post(&alice, form(&alice, &code, "deny"))
         .await
         .expect(StatusCode::NOT_FOUND);
+}
+
+impl Collect {
+    fn count(&self, action: &str, detail_has: &str) -> usize {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| {
+                e.action == action && e.detail.as_deref().unwrap_or("").contains(detail_has)
+            })
+            .count()
+    }
+}
+
+#[tokio::test]
+async fn api_keys_are_capped_paginated_redacted_and_refusals_audited() {
+    let h = harness_cfg(true, &format!("{PUBLIC}/"), |b| {
+        b.max_api_keys_per_namespace(5).max_api_keys_per_user(3)
+    })
+    .await;
+    let alice = H::session(&h.signup("a", "1", "a@x.example", "alice").await);
+    let bob = H::session(&h.signup("b", "2", "b@x.example", "bob").await);
+    h.signup("c", "3", "c@x.example", "carol").await;
+    let post = |path: &'static str, t: &str, body: Value| {
+        let h = &h;
+        let t = t.to_owned();
+        async move { h.post_json(path, Some(&t), None, &[], &body).await }
+    };
+    // Alice's keys carry a payload; bob (a plain member) mints plain CI keys.
+    let mint = |t: &str| {
+        let body = if t == alice {
+            json!({"action": "create", "namespace": "alice", "ttl_secs": 60, "purpose": "node",
+                   "payload": {"tags": ["x"]}})
+        } else {
+            json!({"action": "create", "namespace": "alice", "ttl_secs": 60, "purpose": "ci"})
+        };
+        post("/auth/keys", t, body)
+    };
+
+    // Refused mints are audited.
+    post(
+        "/auth/keys",
+        &alice,
+        json!({"action": "create", "namespace": "alice", "ttl_secs": 0, "purpose": "ci"}),
+    )
+    .await
+    .expect(StatusCode::BAD_REQUEST);
+    assert_eq!(h.audit.count("api_key.denied", "bad ttl"), 1);
+    post(
+        "/auth/keys",
+        &alice,
+        json!({"action": "create", "namespace": "alice", "ttl_secs": 60, "purpose": "nope"}),
+    )
+    .await
+    .expect(StatusCode::BAD_REQUEST);
+    assert_eq!(h.audit.count("api_key.denied", "unknown purpose"), 1);
+
+    // Per-user cap: alice may hold 3 live keys.
+    for _ in 0..3 {
+        mint(&alice).await.expect(StatusCode::OK);
+    }
+    let r = mint(&alice).await;
+    r.expect(StatusCode::FORBIDDEN);
+    assert_eq!(r.error(), "key_limit");
+    assert_eq!(h.audit.count("api_key.denied", "live key limit"), 1);
+
+    // Per-namespace cap: bob joins and fills the namespace to 5.
+    post(
+        "/auth/members",
+        &alice,
+        json!({"action": "set", "namespace": "alice", "username": "bob", "role": "member"}),
+    )
+    .await
+    .expect(StatusCode::NO_CONTENT);
+    mint(&bob).await.expect(StatusCode::OK);
+    let bobs = mint(&bob).await;
+    bobs.expect(StatusCode::OK);
+    let bobs_hash = bobs.json()["key_hash"].as_str().unwrap().to_owned();
+    let r = mint(&bob).await;
+    r.expect(StatusCode::FORBIDDEN);
+    assert_eq!(r.error(), "key_limit");
+
+    // A plain member sees prefixes only, and detail only for their own keys.
+    let list = post(
+        "/auth/keys",
+        &bob,
+        json!({"action": "list", "namespace": "alice"}),
+    )
+    .await
+    .json();
+    let rows = list["keys"].as_array().unwrap();
+    assert_eq!(rows.len(), 5);
+    assert!(list.get("next").is_none());
+    for k in rows {
+        assert_eq!(k["hash_prefix"].as_str().unwrap().len(), 16);
+        assert!(k.get("key_hash").is_none());
+        // Alice's keys: neither payload nor creator shown to bob.
+        if k["purpose"] == "node" {
+            assert!(
+                k.get("payload").is_none() && k.get("created_by").is_none(),
+                "{k}"
+            );
+        } else {
+            assert!(k.get("created_by").is_some(), "{k}");
+        }
+    }
+    assert!(rows
+        .iter()
+        .any(|k| bobs_hash.starts_with(k["hash_prefix"].as_str().unwrap())));
+    assert_eq!(
+        rows.iter()
+            .filter(|k| k.get("created_by").is_some())
+            .count(),
+        2
+    );
+    // The admin sees every key's detail.
+    let list = post(
+        "/auth/keys",
+        &alice,
+        json!({"action": "list", "namespace": "alice"}),
+    )
+    .await
+    .json();
+    assert!(list["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|k| k.get("created_by").is_some()
+            && (k["purpose"] != "node" || k.get("payload").is_some())));
+
+    // Pagination: pages of 2 cover all 5, newest first, without repeats.
+    let mut seen = Vec::new();
+    let mut before: Option<String> = None;
+    loop {
+        let mut body = json!({"action": "list", "namespace": "alice", "limit": 2});
+        if let Some(b) = &before {
+            body["before"] = json!(b);
+        }
+        let page = post("/auth/keys", &alice, body).await.json();
+        for k in page["keys"].as_array().unwrap() {
+            seen.push(k["id"].as_str().unwrap().to_owned());
+        }
+        match page.get("next") {
+            Some(n) => before = Some(n.as_str().unwrap().to_owned()),
+            None => break,
+        }
+    }
+    assert_eq!(seen.len(), 5);
+    let mut sorted = seen.clone();
+    sorted.sort();
+    sorted.reverse();
+    sorted.dedup();
+    assert_eq!(seen, sorted);
+    post(
+        "/auth/keys",
+        &alice,
+        json!({"action": "list", "namespace": "alice", "limit": 0}),
+    )
+    .await
+    .expect(StatusCode::BAD_REQUEST);
+    post(
+        "/auth/keys",
+        &alice,
+        json!({"action": "list", "namespace": "alice", "before": "not-an-id"}),
+    )
+    .await
+    .expect(StatusCode::BAD_REQUEST);
+
+    // Expired keys stop counting: alice can mint again after they lapse.
+    h.clock.advance(61);
+    mint(&alice).await.expect(StatusCode::OK);
+
+    // Members pagination.
+    post(
+        "/auth/members",
+        &alice,
+        json!({"action": "set", "namespace": "alice", "username": "carol", "role": "member"}),
+    )
+    .await
+    .expect(StatusCode::NO_CONTENT);
+    let p1 = post(
+        "/auth/members",
+        &bob,
+        json!({"action": "list", "namespace": "alice", "limit": 2}),
+    )
+    .await
+    .json();
+    assert_eq!(p1["members"].as_array().unwrap().len(), 2);
+    let after = p1["next"].as_str().unwrap().to_owned();
+    let p2 = post(
+        "/auth/members",
+        &bob,
+        json!({"action": "list", "namespace": "alice", "limit": 2, "after": after}),
+    )
+    .await
+    .json();
+    assert_eq!(p2["members"].as_array().unwrap().len(), 1);
+    assert!(p2.get("next").is_none());
+
+    // A non-member's (or unknown namespace's) member writes are audited.
+    let dave = H::session(&h.signup("d", "4", "d@x.example", "dave").await);
+    for (action, body) in [
+        (
+            "member.set.denied",
+            json!({"action": "set", "namespace": "alice", "username": "dave", "role": "admin"}),
+        ),
+        (
+            "member.remove.denied",
+            json!({"action": "remove", "namespace": "alice", "username": "bob"}),
+        ),
+        (
+            "member.set.denied",
+            json!({"action": "set", "namespace": "nope", "username": "dave", "role": "admin"}),
+        ),
+    ] {
+        let before = h.audit.count(action, "not a member");
+        post("/auth/members", &dave, body)
+            .await
+            .expect(StatusCode::FORBIDDEN);
+        assert_eq!(
+            h.audit.count(action, "not a member"),
+            before + 1,
+            "{action}"
+        );
+    }
+    let before = h.audit.count("namespace.rename.denied", "not a member");
+    post(
+        "/auth/rename",
+        &dave,
+        json!({"action": "namespace", "namespace": "alice", "new_name": "x"}),
+    )
+    .await
+    .expect(StatusCode::FORBIDDEN);
+    assert_eq!(
+        h.audit.count("namespace.rename.denied", "not a member"),
+        before + 1
+    );
 }

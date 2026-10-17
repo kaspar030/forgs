@@ -288,6 +288,8 @@ pub(crate) struct Inner {
     pub(crate) max_pending_devices: u64,
     pub(crate) max_pending_approvals: u64,
     pub(crate) max_pending_devices_per_source: u64,
+    pub(crate) max_api_keys_per_namespace: u64,
+    pub(crate) max_api_keys_per_user: u64,
     pub(crate) client_ip: Arc<dyn ClientIp>,
     /// Poll state per device-secret hash, for `slow_down`.
     pub(crate) poll_log: Mutex<HashMap<String, PollState>>,
@@ -442,6 +444,8 @@ impl AuthContext {
             max_pending_devices: 1024,
             max_pending_approvals: 1024,
             max_pending_devices_per_source: 32,
+            max_api_keys_per_namespace: 1000,
+            max_api_keys_per_user: 100,
             client_ip: Arc::new(NoClientIp),
         }
     }
@@ -616,6 +620,8 @@ pub struct AuthContextBuilder {
     max_pending_devices: u64,
     max_pending_approvals: u64,
     max_pending_devices_per_source: u64,
+    max_api_keys_per_namespace: u64,
+    max_api_keys_per_user: u64,
     client_ip: Arc<dyn ClientIp>,
 }
 
@@ -774,6 +780,25 @@ impl AuthContextBuilder {
         self
     }
 
+    /// Ceiling on **live** (unexpired, unconsumed) API keys a namespace may
+    /// hold when minting over the API (default 1000; `u64::MAX` disables).
+    /// Past it a mint is `403 key_limit`. Shell-minted keys count toward it
+    /// but are never refused by it.
+    #[must_use]
+    pub fn max_api_keys_per_namespace(mut self, n: u64) -> Self {
+        self.max_api_keys_per_namespace = n;
+        self
+    }
+
+    /// Ceiling on live API keys one user may hold in one namespace when
+    /// minting over the API (default 100; `u64::MAX` disables), so one member
+    /// cannot exhaust [`Self::max_api_keys_per_namespace`] alone.
+    #[must_use]
+    pub fn max_api_keys_per_user(mut self, n: u64) -> Self {
+        self.max_api_keys_per_user = n;
+        self
+    }
+
     /// How the device-start route learns the caller's address (default
     /// [`NoClientIp`]: the [`PeerIp`] extension if present, never a header).
     #[must_use]
@@ -868,6 +893,8 @@ impl AuthContextBuilder {
                 max_pending_devices: self.max_pending_devices,
                 max_pending_approvals: self.max_pending_approvals,
                 max_pending_devices_per_source: self.max_pending_devices_per_source,
+                max_api_keys_per_namespace: self.max_api_keys_per_namespace,
+                max_api_keys_per_user: self.max_api_keys_per_user,
                 client_ip: self.client_ip,
                 poll_log: Mutex::new(HashMap::new()),
                 decide_misses: Mutex::new(HashMap::new()),

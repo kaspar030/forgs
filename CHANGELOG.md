@@ -4,6 +4,22 @@
 
 ### Security
 
+- API keys minted over `/auth/keys` are capped by live keys per namespace
+  (`AuthContextBuilder::max_api_keys_per_namespace`, default 1000) and per
+  user in a namespace (`max_api_keys_per_user`, default 100); past a cap a
+  mint is `403 key_limit` (`StoreError::KeyLimit`,
+  `NsScope::insert_api_key_capped`). Key and member listings are paginated
+  (`limit`, capped at `forgs::api::MAX_PAGE`; `before` / `after` cursors and
+  `next` in the response; `NsScope::list_api_keys_page`,
+  `list_members_page`), and revocation no longer loads every key.
+  **API change:** `ApiKeyInfo.key_hash` is replaced by `hash_prefix` (16 hex);
+  `payload` and `created_by` are listed only for admins and the key's
+  creator. `ForgsClient::list_api_keys` / `list_members` follow pages; the
+  `_page` variants fetch one.
+- Refused API-key mints (bad TTL, unknown purpose, bad `subject_name`,
+  refused payload, key limit) are audited as `api_key.denied`, and member
+  set/remove and namespace rename/delete/create attempts by a non-member (or
+  on an unknown namespace) as `<action>.denied`.
 - A connection token of a kind the route does not accept is refused from
   its prefix alone, before any store lookup: a live and a forged workload or
   app token now both get `403` on a session-only route (previously a live one

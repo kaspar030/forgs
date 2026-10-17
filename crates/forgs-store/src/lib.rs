@@ -82,7 +82,9 @@ pub use error::StoreError;
 pub use migrate::{migrate, SCHEMA_VERSION};
 pub use ns::{Membership, NsNode};
 pub use pending::{ApprovedDevice, LiveCounts, PendingDevice, PendingSignup};
-pub use scoped::{ApiKeyRow, AuditEntry, AuditRow, MemberRow, NewApiKey, NewGrant, NsScope};
+pub use scoped::{
+    ApiKeyCap, ApiKeyRow, AuditEntry, AuditRow, MemberRow, NewApiKey, NewGrant, NsScope,
+};
 pub use sweep::SweepCounts;
 pub use tombstones::{ReleaseCause, ReleaseLimit, Tombstone, DEFAULT_RELEASE_LIMIT};
 pub use users::{Identity, NewIdentity, NewSignup, User, UserState};

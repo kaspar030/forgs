@@ -103,6 +103,8 @@ impl ApiError {
     /// `403 namespace_limit`.
     pub const NAMESPACE_LIMIT: ApiError =
         ApiError::Code(StatusCode::FORBIDDEN, code::NAMESPACE_LIMIT);
+    /// `403 key_limit`.
+    pub const KEY_LIMIT: ApiError = ApiError::Code(StatusCode::FORBIDDEN, code::KEY_LIMIT);
     /// `409 not_empty`.
     pub const NOT_EMPTY: ApiError = ApiError::Code(StatusCode::CONFLICT, code::NOT_EMPTY);
     /// `409 last_admin`.
@@ -158,6 +160,7 @@ impl From<StoreError> for ApiError {
                 ApiError::CONFLICT
             }
             StoreError::OwnedLimit => ApiError::NAMESPACE_LIMIT,
+            StoreError::KeyLimit => ApiError::KEY_LIMIT,
             StoreError::LastIdentity => ApiError::LAST_IDENTITY,
             StoreError::ReleaseLimited => ApiError::RATE_LIMITED,
             StoreError::LastAdmin | StoreError::SoleAdmin(_) => ApiError::LAST_ADMIN,
@@ -228,6 +231,7 @@ mod tests {
             ApiError::from(StoreError::OwnedLimit),
             ApiError::NAMESPACE_LIMIT
         );
+        assert_eq!(ApiError::from(StoreError::KeyLimit), ApiError::KEY_LIMIT);
         assert_eq!(
             ApiError::from(StoreError::LastIdentity),
             ApiError::LAST_IDENTITY

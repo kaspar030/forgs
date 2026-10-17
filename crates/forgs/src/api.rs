@@ -48,6 +48,9 @@ pub mod error_code {
     pub const LAST_ADMIN: &str = "last_admin";
     /// The caller already owns the maximum number of such namespaces.
     pub const NAMESPACE_LIMIT: &str = "namespace_limit";
+    /// The namespace (or the caller there) already holds the maximum number
+    /// of live API keys; revoke one or let one expire.
+    pub const KEY_LIMIT: &str = "key_limit";
     /// The namespace still has children or app data referencing it.
     pub const NOT_EMPTY: &str = "not_empty";
     /// The login provider is unknown or not configured.
@@ -310,10 +313,18 @@ pub enum ApiKeyRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         payload: Option<serde_json::Value>,
     },
-    /// List a namespace's keys (hashes only).
+    /// List one page of a namespace's keys (hash prefixes only), newest
+    /// first.
     List {
         /// The namespace (id or path).
         namespace: String,
+        /// Resume after this key id: the previous page's
+        /// [`ApiKeyList::next`]. Absent for the first page.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before: Option<String>,
+        /// Page size; the server caps it ([`MAX_PAGE`]) and defaults to it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
     },
     /// Revoke keys whose hash starts with `prefix`.
     Revoke {
@@ -351,13 +362,20 @@ pub struct ApiKeyCreated {
     pub expires: u64,
 }
 
-/// One API key as a listing shows it. Hash-only, never a secret.
+/// The largest page a listing returns (and the default page size).
+pub const MAX_PAGE: u32 = 100;
+
+/// One API key as a listing shows it. Never a secret, nor even the full hash.
+///
+/// `payload` and `created_by` are shown only to the namespace's admins and
+/// to the key's own creator.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApiKeyInfo {
     /// The key's id.
     pub id: String,
-    /// Lowercase-hex SHA-256 of the key.
-    pub key_hash: String,
+    /// The first 16 hex characters of the key's SHA-256: enough to revoke
+    /// by, not the whole hash.
+    pub hash_prefix: String,
     /// Whether redeeming the key consumes it.
     pub single_use: bool,
     /// What the key is for.
@@ -366,7 +384,7 @@ pub struct ApiKeyInfo {
     /// identity**, so revoking any of them affects that identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject_name: Option<String>,
-    /// The payload the key carries, if any. Not a secret.
+    /// The payload the key carries, if any (admins and the creator only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload: Option<serde_json::Value>,
     /// Expiry (epoch seconds), or `None` for a key that never expires.
@@ -377,18 +395,22 @@ pub struct ApiKeyInfo {
     pub consumed_at: Option<u64>,
     /// When the key was minted (epoch seconds).
     pub created_at: u64,
-    /// The user who minted it, or `None` for a shell-minted key.
+    /// The user who minted it (admins and the creator only), or `None` for
+    /// a shell-minted or withheld one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_by: Option<String>,
 }
 
-/// A namespace's API keys, newest first.
+/// One page of a namespace's API keys, newest first.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApiKeyList {
     /// The namespace id listed.
     pub namespace: String,
     /// The keys, newest first.
     pub keys: Vec<ApiKeyInfo>,
+    /// Pass as `before` for the next page; absent on the last page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
 }
 
 /// The outcome of a revocation.
@@ -408,10 +430,17 @@ pub struct ApiKeyRevoked {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum MembersRequest {
-    /// List the direct members.
+    /// List one page of the direct members, by subject.
     List {
         /// The namespace (id or path).
         namespace: String,
+        /// Resume after this subject: the previous page's
+        /// [`MemberList::next`]. Absent for the first page.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after: Option<String>,
+        /// Page size; the server caps it ([`MAX_PAGE`]) and defaults to it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
     },
     /// Add a user, or change their role.
     Set {
@@ -453,6 +482,9 @@ pub struct MemberList {
     pub namespace: String,
     /// The members, by subject.
     pub members: Vec<MemberInfo>,
+    /// Pass as `after` for the next page; absent on the last page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
 }
 
 /// A request to `POST /auth/rename`.
@@ -798,6 +830,8 @@ mod tests {
         round_trip(
             &ApiKeyRequest::List {
                 namespace: "acme".into(),
+                before: None,
+                limit: None,
             },
             &json!({"action": "list", "namespace": "acme"}),
         );
@@ -814,7 +848,7 @@ mod tests {
     fn api_key_responses_round_trip() {
         let info = ApiKeyInfo {
             id: "01J".into(),
-            key_hash: "ab".into(),
+            hash_prefix: "ab".into(),
             single_use: true,
             purpose: "ci".into(),
             subject_name: None,
@@ -832,12 +866,21 @@ mod tests {
             &ApiKeyList {
                 namespace: "n".into(),
                 keys: vec![info, with_payload],
+                next: Some("01J".into()),
             },
-            &json!({"namespace": "n", "keys": [
-                {"id": "01J", "key_hash": "ab",
+            &json!({"namespace": "n", "next": "01J", "keys": [
+                {"id": "01J", "hash_prefix": "ab",
                     "single_use": true, "purpose": "ci", "expires": 9, "created_at": 1},
-                {"id": "01J", "key_hash": "ab", "payload": ["x"],
+                {"id": "01J", "hash_prefix": "ab", "payload": ["x"],
                     "single_use": true, "purpose": "ci", "expires": 9, "created_at": 1}]}),
+        );
+        round_trip(
+            &ApiKeyRequest::List {
+                namespace: "acme".into(),
+                before: Some("01J".into()),
+                limit: Some(5),
+            },
+            &json!({"action": "list", "namespace": "acme", "before": "01J", "limit": 5}),
         );
         round_trip(
             &ApiKeyCreated {
@@ -890,8 +933,18 @@ mod tests {
         round_trip(
             &MembersRequest::List {
                 namespace: "acme".into(),
+                after: None,
+                limit: None,
             },
             &json!({"action": "list", "namespace": "acme"}),
+        );
+        round_trip(
+            &MembersRequest::List {
+                namespace: "acme".into(),
+                after: Some("user:01J".into()),
+                limit: Some(2),
+            },
+            &json!({"action": "list", "namespace": "acme", "after": "user:01J", "limit": 2}),
         );
         round_trip(
             &MembersRequest::Set {
@@ -917,6 +970,7 @@ mod tests {
                     username: Some("bob".into()),
                     role: "admin".into(),
                 }],
+                next: None,
             },
             &json!({"namespace": "n", "members": [{"subject": "user:01J", "user_id": "01J",
                     "username": "bob", "role": "admin"}]}),

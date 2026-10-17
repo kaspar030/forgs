@@ -66,6 +66,10 @@ pub enum StoreError {
     /// [`crate::Store::create_node_with_admin`]).
     #[error("the owner already holds the maximum number of such nodes")]
     OwnedLimit,
+    /// The namespace (or the minting user there) already holds the maximum
+    /// number of live API keys (see [`crate::NsScope::insert_api_key_capped`]).
+    #[error("too many live API keys")]
+    KeyLimit,
     /// A personal node is renamed and deleted only together with its user.
     #[error("a personal namespace node follows its user")]
     PersonalNode,
