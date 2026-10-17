@@ -3,8 +3,12 @@
 //! Two properties make it safe to let a plain member mint:
 //!
 //! * the namespace is a *target* checked for membership (effective role,
-//!   inheritance included) — a minted key can never exceed the caller's own
-//!   access, and "not a member" and "no such namespace" are the same `403`;
+//!   inheritance included), and "not a member" and "no such namespace" are
+//!   the same `403`. A minted key can never exceed the caller's own access:
+//!   naming a workload identity (`subject_name`) requires the namespace's
+//!   **highest role** (a key for an existing name speaks as that identity
+//!   and inherits its grants), and the payload hook receives the caller's
+//!   role to cap the payload's authority ([`crate::KeyMint`]);
 //! * keys minted over the API **must expire**, capped at
 //!   [`crate::Ttls::api_key_max`]. A forever-key is refused rather than
 //!   silently capped: quietly giving a 30-day key would be discovered a
@@ -22,7 +26,7 @@ use crate::audit::AuditEvent;
 use crate::auth::resolve_ns;
 use crate::context::AuthContext;
 use crate::error::{store_err, ApiError};
-use crate::hooks::PurposeKind;
+use crate::hooks::{KeyMint, PurposeKind};
 
 /// The shortest revocation prefix, in hex characters.
 pub const MIN_PREFIX_LEN: usize = 8;
@@ -76,7 +80,8 @@ async fn require_member(
 ///
 /// # Errors
 ///
-/// `403` for a non-member; `400` for a zero or over-cap TTL, an unknown
+/// `403` for a non-member, or for a caller below the namespace's highest
+/// role passing a `subject_name` (audited); `400` for a zero or over-cap TTL, an unknown
 /// purpose, a `subject_name` that is invalid or on a non-workload
 /// purpose, or a payload the purpose policy refuses
 /// ([`crate::ApiKeyPurposes::check_payload`]); `500` on storage failure.
@@ -92,7 +97,7 @@ pub async fn create(
     payload: Option<&serde_json::Value>,
 ) -> Result<ApiKeyCreated, ApiError> {
     let now = ctx.now();
-    let (ns, _role) = require_member(ctx, user, namespace, "api_key").await?;
+    let (ns, role) = require_member(ctx, user, namespace, "api_key").await?;
     if ttl_secs == 0 || ttl_secs > ctx.ttl().api_key_max {
         return Err(ApiError::BadRequest);
     }
@@ -105,7 +110,34 @@ pub async fn create(
         Some(_) if kind != PurposeKind::Workload => return Err(ApiError::BadRequest),
         Some(raw) => Some(forgs::subject::normalise_service_name(raw).ok_or(ApiError::BadRequest)?),
     };
-    let stored = ctx.purposes().check_payload(purpose, payload)?;
+    // A named identity is derived from (ns, name) alone: a key for an
+    // existing name inherits that identity's grants. Only the highest role
+    // may name (or rotate) one.
+    if subject_name.is_some() && !role.satisfies(ctx.store().roles().highest()) {
+        ctx.audit()
+            .record(
+                AuditEvent::new(now, "api_key.denied")
+                    .ns(ns)
+                    .subject(&forgs::SubjectKey::user(user))
+                    .detail("naming an identity requires the highest role"),
+            )
+            .await;
+        return Err(ApiError::Forbidden);
+    }
+    let stored = ctx
+        .purposes()
+        .check_payload(
+            ctx,
+            &KeyMint {
+                caller: user,
+                ns,
+                role,
+                purpose,
+                subject_name: subject_name.as_deref(),
+                payload,
+            },
+        )
+        .await?;
     let echoed = match stored
         .as_deref()
         .map(serde_json::from_str::<serde_json::Value>)

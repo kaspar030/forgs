@@ -58,7 +58,7 @@ pub use context::{
 };
 pub use error::{reject, ApiError};
 pub use hooks::{
-    ApiKeyPurposes, AppTokenLookup, NoPendingApprovals, PendingApprovalHook, PurposeKind,
+    ApiKeyPurposes, AppTokenLookup, KeyMint, NoPendingApprovals, PendingApprovalHook, PurposeKind,
     StaticPurposes,
 };
 pub use routes::{router, JsonBody};

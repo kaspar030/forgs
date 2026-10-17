@@ -17,8 +17,8 @@ use forgs::store::AppRecord;
 use forgs::{AppKind, RoleLadder, SubjectKey, TokenFormat, TokenHash, TokenKind, TokenUse};
 use forgs_http::{
     AllowedKinds, AnyConnection, ApiCookie, ApiError, ApiKeyPurposes, AppTokenLookup, AuditEvent,
-    AuditSink, AuthContext, Authenticated, FixedClock, HeaderOnly, PurposeKind, SessionOnly,
-    StaticPurposes,
+    AuditSink, AuthContext, Authenticated, FixedClock, HeaderOnly, KeyMint, PurposeKind,
+    SessionOnly, StaticPurposes,
 };
 use forgs_idp::oidc::OidcError;
 use forgs_idp::workload::{WorkloadClaims, WorkloadIdentity};
@@ -178,7 +178,8 @@ impl AppTokenLookup for NodeTokens {
     }
 }
 
-/// `ci`/`node` purposes; `node` keys carry `{"tags": [..]}`, stored sorted.
+/// `ci`/`node` purposes; `node` keys carry `{"tags": [..]}`, stored sorted,
+/// and only the highest role may mint tags.
 struct TestPurposes(StaticPurposes);
 
 #[async_trait]
@@ -187,14 +188,18 @@ impl ApiKeyPurposes for TestPurposes {
         self.0.kind(purpose)
     }
 
-    fn check_payload(
+    async fn check_payload(
         &self,
-        purpose: &str,
-        payload: Option<&Value>,
+        ctx: &AuthContext,
+        mint: &KeyMint<'_>,
     ) -> Result<Option<String>, ApiError> {
-        match (purpose, payload) {
+        match (mint.purpose, mint.payload) {
             (_, None | Some(Value::Null)) => Ok(None),
             ("node", Some(p)) => {
+                // Authority cap: tags confer access only an admin holds.
+                if !mint.role.satisfies(ctx.store().roles().highest()) {
+                    return Err(ApiError::Forbidden);
+                }
                 let mut tags: Vec<String> = p
                     .get("tags")
                     .and_then(Value::as_array)
@@ -2020,6 +2025,99 @@ async fn api_key_payloads_are_validated_canonicalised_and_listed() {
         .find(|k| k["key_hash"] == "ab".repeat(32))
         .unwrap();
     assert!(odd.get("payload").is_none());
+}
+
+#[tokio::test]
+async fn named_identity_and_payload_authority_require_highest_role() {
+    let h = harness().await;
+    let alice = H::session(&h.signup("a", "1", "a@x.example", "alice").await);
+    let bob = H::session(&h.signup("b", "2", "b@x.example", "bob").await);
+    let keys = |t: &str, body: Value| {
+        let h = &h;
+        let t = t.to_owned();
+        async move { h.post_json("/auth/keys", Some(&t), None, &[], &body).await }
+    };
+    let named = |name: Option<&str>| {
+        let mut b = json!({"action": "create", "namespace": "alice", "ttl_secs": 600,
+                           "purpose": "ci"});
+        if let Some(n) = name {
+            b["subject_name"] = json!(n);
+        }
+        b
+    };
+    let set_role = |role: &str| {
+        let h = &h;
+        let alice = alice.clone();
+        let body = json!({"action": "set", "namespace": "alice", "username": "bob", "role": role});
+        async move {
+            h.post_json("/auth/members", Some(&alice), None, &[], &body)
+                .await
+                .expect(StatusCode::NO_CONTENT);
+        }
+    };
+    let redeem_subject = |key: Value| {
+        let h = &h;
+        async move {
+            let r = h
+                .post_json(
+                    "/auth/token",
+                    None,
+                    None,
+                    &[],
+                    &json!({"grant_type": "api_key", "api_key": key["key"]}),
+                )
+                .await;
+            r.expect(StatusCode::OK);
+            h.whoami(r.json()["token"].as_str().unwrap()).await.json()["subject"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        }
+    };
+
+    // The admin names an identity.
+    keys(&alice, named(Some("deployer")))
+        .await
+        .expect(StatusCode::OK);
+    set_role("member").await;
+    // A plain member may not reuse it, nor name a fresh one.
+    keys(&bob, named(Some("deployer")))
+        .await
+        .expect(StatusCode::FORBIDDEN);
+    assert!(h.audit.has("api_key.denied"));
+    keys(&bob, named(Some("other")))
+        .await
+        .expect(StatusCode::FORBIDDEN);
+    // An unnamed key is fine, and speaks as its own immutable id.
+    let r = keys(&bob, named(None)).await;
+    r.expect(StatusCode::OK);
+    let unnamed = r.json();
+    let subject = redeem_subject(unnamed.clone()).await;
+    assert!(
+        subject.ends_with(&format!(
+            "/workload:key:{}",
+            unnamed["id"].as_str().unwrap()
+        )),
+        "{subject}"
+    );
+    assert!(!subject.contains(&unnamed["key_hash"].as_str().unwrap()[..8]));
+    // The payload hook sees the role: a member may not mint tags.
+    let node = json!({"action": "create", "namespace": "alice", "ttl_secs": 60,
+                      "purpose": "node", "payload": {"tags": ["a"]}});
+    keys(&bob, node.clone()).await.expect(StatusCode::FORBIDDEN);
+    keys(&alice, node).await.expect(StatusCode::OK);
+
+    // The admin can still rotate the identity.
+    let r = keys(&alice, named(Some("deployer"))).await;
+    r.expect(StatusCode::OK);
+    assert!(redeem_subject(r.json())
+        .await
+        .ends_with("/workload:agent:deployer"));
+    // A promoted bob may.
+    set_role("admin").await;
+    keys(&bob, named(Some("deployer")))
+        .await
+        .expect(StatusCode::OK);
 }
 
 #[tokio::test]

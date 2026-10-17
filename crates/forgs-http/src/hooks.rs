@@ -3,7 +3,7 @@
 
 use async_trait::async_trait;
 use forgs::store::AppRecord;
-use forgs::{AppKind, NsNodeId, SubjectKey, TokenHash, UserId};
+use forgs::{AppKind, NsNodeId, Role, SubjectKey, TokenHash, UserId};
 use forgs_store::{ConsumedApiKey, PendingDevice};
 
 use crate::context::AuthContext;
@@ -42,11 +42,36 @@ pub trait AppTokenLookup: Send + Sync {
 pub enum PurposeKind {
     /// Redeemable for a workload token (a runner with no workload identity).
     /// Such keys may carry a `subject_name`: a stable identity that survives
-    /// rotation (`<ns>/workload:agent:<name>`).
+    /// rotation (`<ns>/workload:agent:<name>`). Naming an identity requires
+    /// the namespace's **highest role**: the subject is derived from the
+    /// namespace and name alone, so a key for an existing name speaks as that
+    /// identity and inherits its grants. An unnamed key speaks as
+    /// `<ns>/workload:key:<ApiKeyId>`.
     Workload,
     /// Redeemed by the app at its own route (fleet: node enrollment). Refused
     /// at `/auth/token` with `403`. No `subject_name`.
     App,
+}
+
+/// Who is minting what: the context handed to
+/// [`ApiKeyPurposes::check_payload`].
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct KeyMint<'a> {
+    /// The minting user.
+    pub caller: UserId,
+    /// The namespace the key is minted in.
+    pub ns: NsNodeId,
+    /// The caller's effective role in `ns` (inheritance included). Interpret
+    /// it against `ctx.store().roles()`.
+    pub role: Role,
+    /// The (known) purpose.
+    pub purpose: &'a str,
+    /// The normalised `subject_name`, if any (workload purposes only; the
+    /// caller holds the highest role).
+    pub subject_name: Option<&'a str>,
+    /// The payload as sent.
+    pub payload: Option<&'a serde_json::Value>,
 }
 
 /// The app's API-key purposes.
@@ -59,9 +84,16 @@ pub trait ApiKeyPurposes: Send + Sync {
     /// How `purpose` redeems, or `None` if the app does not know it.
     fn kind(&self, purpose: &str) -> Option<PurposeKind>;
 
-    /// Validate and canonicalise the app payload a key of `purpose` is minted
+    /// Validate, authorise and canonicalise the app payload a key is minted
     /// with (fleet: a node key's tags, a CI key's ops). Called at mint time,
-    /// after the purpose is known and the caller's membership was checked.
+    /// after the purpose is known, the caller's membership was checked and
+    /// (for a `subject_name`) the highest role was required.
+    ///
+    /// **The app must cap the payload's authority by [`KeyMint::role`]**:
+    /// forgs cannot interpret app ops or tags, so a payload delegating
+    /// authority the caller does not hold is the app's to refuse (typically
+    /// [`ApiError::Forbidden`]). Otherwise a low-role member could mint a key
+    /// that exceeds their own access.
     ///
     /// The returned string is stored **verbatim** in `forgs_api_key.payload`,
     /// echoed (parsed) in the mint response and listing, and handed back in
@@ -73,15 +105,15 @@ pub trait ApiKeyPurposes: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Any [`ApiError`] (typically [`ApiError::BadRequest`]); it becomes the
-    /// response and nothing is minted.
-    fn check_payload(
+    /// Any [`ApiError`] (typically [`ApiError::BadRequest`] for a bad shape,
+    /// [`ApiError::Forbidden`] for authority the caller lacks); it becomes
+    /// the response and nothing is minted.
+    async fn check_payload(
         &self,
-        purpose: &str,
-        payload: Option<&serde_json::Value>,
+        _ctx: &AuthContext,
+        mint: &KeyMint<'_>,
     ) -> Result<Option<String>, ApiError> {
-        let _ = purpose;
-        match payload {
+        match mint.payload {
             None | Some(serde_json::Value::Null) => Ok(None),
             Some(_) => Err(ApiError::BadRequest),
         }

@@ -166,7 +166,9 @@ pub async fn exchange_api_key(ctx: &AuthContext, key: &str) -> Result<TokenRespo
         .map_err(store_err("consume_api_key"))?
         .ok_or(ApiError::InvalidGrant)?;
     // Named: an identity that survives rotation. Unnamed: derived from the
-    // key, so every runner redeeming it is one subject. The name is
+    // key's immutable id (a ULID), so every runner redeeming it is one
+    // subject and no two keys can collide (a hash prefix could). The hash
+    // prefix stays in logs only. The name is
     // re-validated on read: constructing a subject id from unvalidated text
     // is precisely what the charset rule exists to prevent.
     let subject = match consumed.subject_name.as_deref() {
@@ -177,7 +179,7 @@ pub async fn exchange_api_key(ctx: &AuthContext, key: &str) -> Result<TokenRespo
         None => SubjectKey::new(
             Some(&consumed.ns.to_string()),
             SubjectKind::Workload,
-            &format!("key:{}", hash.short()),
+            &format!("key:{}", consumed.id),
         )
         .ok_or(ApiError::Internal)?,
     };

@@ -203,8 +203,12 @@ forgs_membership { ns_node_id, subject (SubjectKey), user_id NULL, role }
   `logout --all` revokes every session and refresh token of the user.
 - API keys are namespace-scoped. Minting requires membership, keys minted over
   the API must expire, they are revocable by the creator or an admin, and named
-  identities survive rotation. The purpose is app-defined, with a redemption
-  hook.
+  identities survive rotation. Naming a workload identity (`subject_name`)
+  requires the namespace's highest role, because a key for an existing name
+  speaks as that identity and inherits its grants. An unnamed key speaks as
+  `<ns>/workload:key:<ApiKeyId>`. The purpose is app-defined, with a mint hook
+  (`check_payload`, which receives the caller's role and must cap the
+  payload's authority by it) and a redemption hook.
 - Browser: an HttpOnly session cookie that is the same credential as the bearer
   token, a double-submit HMAC CSRF token, a cookie accepted only on the
   explicitly marked browser routes and under a configurable API prefix, and
