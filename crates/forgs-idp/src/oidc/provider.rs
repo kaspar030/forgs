@@ -16,7 +16,9 @@ use crate::url::{append_query, form_body};
 /// issuer.
 ///
 /// Built once with [`OidcProvider::discover`] (one fetch of the discovery
-/// document); the JWKS is cached and refreshed per [`JwksCache`]. No
+/// document); the JWKS is cached and refreshed per [`JwksCache`]. The
+/// discovery document — and so `jwks_uri` and every endpoint — is **not**
+/// re-fetched: an issuer that moves its JWKS or endpoints needs a restart. No
 /// userinfo call in v1: identity comes from the verified `id_token` alone.
 #[derive(Debug)]
 pub struct OidcProvider {
@@ -55,6 +57,14 @@ impl OidcProvider {
         if metadata.issuer != config.issuer {
             return Err(IdpError::Discovery("issuer mismatch".to_owned()));
         }
+        // Pinned metadata never went through `parse_discovery`; check its
+        // endpoints the same way (`jwks_uri` is checked by `JwksCache::new`).
+        for url in [&metadata.authorization_endpoint, &metadata.token_endpoint]
+            .into_iter()
+            .chain(metadata.userinfo_endpoint.as_ref())
+        {
+            crate::url::check_endpoint_url(url)?;
+        }
         // An absent list means the spec default, RS256.
         let advertised: Vec<&str> = if metadata.id_token_signing_alg_values_supported.is_empty() {
             vec!["RS256"]
@@ -81,7 +91,7 @@ impl OidcProvider {
             metadata.jwks_uri.clone(),
             JwksCache::DEFAULT_REFRESH_AFTER,
             JwksCache::DEFAULT_MIN_REFETCH,
-        );
+        )?;
         Ok(Self {
             config,
             metadata,
@@ -92,7 +102,8 @@ impl OidcProvider {
     /// Replace the JWKS cache timings (tests; operators with unusual issuers).
     #[must_use]
     pub fn with_jwks_timing(mut self, refresh_after: Duration, min_refetch: Duration) -> Self {
-        self.jwks = JwksCache::new(self.metadata.jwks_uri.clone(), refresh_after, min_refetch);
+        // The URL was checked when `self.jwks` was first built.
+        self.jwks = JwksCache::build(self.metadata.jwks_uri.clone(), refresh_after, min_refetch);
         self
     }
 
@@ -459,7 +470,26 @@ mod tests {
             id_token_signing_alg_values_supported: vec![],
             ..md
         };
-        assert!(OidcProvider::from_metadata(forgejo("x", issuer, CLIENT, "s"), md).is_ok());
+        assert!(
+            OidcProvider::from_metadata(forgejo("x", issuer.clone(), CLIENT, "s"), md.clone())
+                .is_ok()
+        );
+        // Pinned metadata never went through `parse_discovery`: its URLs are
+        // still checked, so a cleartext JWKS cannot be configured in.
+        for bad in [
+            ProviderMetadata {
+                jwks_uri: "http://evil.example/k".into(),
+                ..md.clone()
+            },
+            ProviderMetadata {
+                token_endpoint: "http://evil.example/t".into(),
+                ..md.clone()
+            },
+        ] {
+            let err = OidcProvider::from_metadata(forgejo("x", issuer.clone(), CLIENT, "s"), bad)
+                .unwrap_err();
+            assert!(matches!(err, IdpError::Url(_)), "{err:?}");
+        }
 
         let err = OidcProvider::discover(forgejo("x", stub.url("/nothing"), CLIENT, "s"))
             .await

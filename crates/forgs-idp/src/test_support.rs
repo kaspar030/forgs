@@ -16,6 +16,8 @@ pub struct Reply {
     pub status: u16,
     pub content_type: String,
     pub body: Vec<u8>,
+    /// Wait this long before answering (slow / tarpitting endpoints).
+    pub delay: Option<std::time::Duration>,
 }
 
 impl Reply {
@@ -32,7 +34,14 @@ impl Reply {
             status,
             content_type: content_type.to_owned(),
             body: body.into(),
+            delay: None,
         }
+    }
+
+    #[must_use]
+    pub fn delayed(mut self, d: std::time::Duration) -> Self {
+        self.delay = Some(d);
+        self
     }
 }
 
@@ -214,6 +223,9 @@ async fn serve(mut sock: tokio::net::TcpStream, st: Arc<Mutex<State>>) -> std::i
         s.requests.push(rec);
         reply
     };
+    if let Some(d) = reply.delay {
+        tokio::time::sleep(d).await;
+    }
     let head = format!(
         "HTTP/1.1 {} X\r\ncontent-type: {}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
         reply.status,

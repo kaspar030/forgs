@@ -33,7 +33,7 @@ mod provider;
 pub use discovery::{parse_discovery, parse_token_response, ProviderMetadata};
 pub use jwt::{
     decode_verified, parse_jwks, verify_id_token, AlgPolicy, IdTokenClaims, IdTokenPolicy,
-    OidcError, VerifyParams,
+    OidcError, VerifyParams, MAX_LEEWAY_SECS,
 };
 pub use presets::OidcConfig;
 

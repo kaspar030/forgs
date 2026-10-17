@@ -52,7 +52,8 @@ pub struct OidcPolicy {
     /// replayable here. The app's own public URL is the intended value, and
     /// the workflow asks for it explicitly.
     pub audience: String,
-    /// Clock-skew margin, in seconds, applied to `exp` and `nbf`.
+    /// Clock-skew margin, in seconds, applied to `exp`, `nbf` and `iat`;
+    /// clamped to [`MAX_LEEWAY_SECS`](crate::oidc::MAX_LEEWAY_SECS).
     pub leeway_secs: u64,
     /// The issuer label every subject verified under this policy carries
     /// (the namespace slot of `<label>/workload:id:…`). Must pass
@@ -263,6 +264,7 @@ mod issuer {
     use super::{
         verify_github_actions, OidcPolicy, WorkloadIdentity, WorkloadIssuer, GHA_JWKS_URL,
     };
+    use crate::identity::IdpError;
     use crate::oidc::{JwksCache, OidcError};
 
     /// The GitHub Actions [`WorkloadIssuer`]: verification over a
@@ -276,6 +278,11 @@ mod issuer {
 
     impl GithubActionsIssuer {
         /// github.com's issuer and JWKS, for `audience`.
+        ///
+        /// # Panics
+        ///
+        /// Never: the issuer and JWKS URLs are constants that pass the check
+        /// (pinned by a test).
         #[must_use]
         pub fn new(audience: impl Into<String>) -> Self {
             Self::with_parts(
@@ -284,20 +291,29 @@ mod issuer {
                     GHA_JWKS_URL,
                     JwksCache::DEFAULT_REFRESH_AFTER,
                     JwksCache::DEFAULT_MIN_REFETCH,
-                ),
+                )
+                .expect("the constant GitHub JWKS URL is valid"),
             )
+            .expect("the constant GitHub issuer is valid")
         }
 
         /// Explicit policy and cache (GHES, tests). The name defaults to
         /// `github-actions`; give a second issuer a distinct one with
         /// [`Self::with_name`].
-        #[must_use]
-        pub fn with_parts(policy: OidcPolicy, jwks: JwksCache) -> Self {
-            Self {
+        ///
+        /// The JWKS URL is checked by [`JwksCache::new`]; this checks
+        /// `policy.issuer`.
+        ///
+        /// # Errors
+        ///
+        /// [`IdpError::Url`] for an unusable issuer URL.
+        pub fn with_parts(policy: OidcPolicy, jwks: JwksCache) -> Result<Self, IdpError> {
+            crate::url::check_endpoint_url(&policy.issuer)?;
+            Ok(Self {
                 name: "github-actions".to_owned(),
                 policy,
                 jwks,
-            }
+            })
         }
 
         /// The same issuer under another [`WorkloadIssuer::name`].
@@ -633,6 +649,19 @@ mod tests {
     }
 
     #[cfg(feature = "client")]
+    #[test]
+    fn the_github_issuer_builds_and_bad_issuers_are_refused() {
+        use crate::oidc::JwksCache;
+        use std::time::Duration;
+        let _ = GithubActionsIssuer::new(AUDIENCE);
+        let mut bad = policy();
+        bad.issuer = "http://evil.example".to_owned();
+        let jwks =
+            JwksCache::new("https://idp.example/jwks", Duration::ZERO, Duration::ZERO).unwrap();
+        assert!(GithubActionsIssuer::with_parts(bad, jwks).is_err());
+    }
+
+    #[cfg(feature = "client")]
     #[tokio::test]
     async fn issuer_refreshes_once_for_a_rotated_key() {
         use crate::oidc::JwksCache;
@@ -646,8 +675,9 @@ mod tests {
         .await;
         let issuer = GithubActionsIssuer::with_parts(
             policy(),
-            JwksCache::new(stub.url("/jwks"), Duration::from_hours(1), Duration::ZERO),
-        );
+            JwksCache::new(stub.url("/jwks"), Duration::from_hours(1), Duration::ZERO).unwrap(),
+        )
+        .unwrap();
         assert_eq!(issuer.name(), "github-actions");
         assert_eq!(issuer.subject_ns(), "gha");
         issuer

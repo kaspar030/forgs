@@ -33,7 +33,8 @@ pub struct OidcConfig {
     pub username_claim: Option<String>,
     /// Allowed `id_token` signature algorithms.
     pub algs: AlgPolicy,
-    /// Clock-skew margin for `exp`/`nbf`, seconds.
+    /// Clock-skew margin for `exp`/`nbf`/`iat`, seconds; at most
+    /// [`MAX_LEEWAY_SECS`](super::MAX_LEEWAY_SECS).
     pub leeway_secs: u64,
 }
 
@@ -89,6 +90,14 @@ impl OidcConfig {
             return Err(IdpError::Config(format!(
                 "{}: scopes must include `openid`",
                 self.name
+            )));
+        }
+        if self.leeway_secs > super::jwt::MAX_LEEWAY_SECS {
+            return Err(IdpError::Config(format!(
+                "{}: `leeway_secs` {} exceeds the maximum {}",
+                self.name,
+                self.leeway_secs,
+                super::jwt::MAX_LEEWAY_SECS
             )));
         }
         crate::url::check_endpoint_url(&self.issuer)
@@ -214,6 +223,11 @@ mod tests {
         assert_eq!(cb.scopes, "openid email profile");
         assert_eq!(cb.algs, AlgPolicy::rs256());
         assert!(cb.validate().is_ok());
+        let mut lax = cb.clone();
+        lax.leeway_secs = crate::oidc::MAX_LEEWAY_SECS;
+        assert!(lax.validate().is_ok());
+        lax.leeway_secs += 1;
+        assert!(matches!(lax.validate(), Err(IdpError::Config(_))));
         assert_eq!(
             cb.discovery_url(),
             "https://codeberg.org/.well-known/openid-configuration"

@@ -43,6 +43,11 @@ struct Raw {
 /// every `id_token`'s `iss`. Every endpoint must pass [`check_endpoint_url`],
 /// so a document cannot downgrade the token exchange to cleartext.
 ///
+/// There is deliberately **no** same-site check between the issuer and its
+/// endpoints: legitimate issuers host them elsewhere (Google's JWKS lives on
+/// `www.googleapis.com`). The document is fetched once, at provider
+/// construction; a changed `jwks_uri` or endpoint takes a restart.
+///
 /// # Errors
 ///
 /// [`IdpError::Discovery`] for a malformed document, a missing field or an

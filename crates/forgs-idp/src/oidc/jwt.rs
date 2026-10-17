@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use jsonwebtoken::jwk::{JwkSet, PublicKeyUse};
+use jsonwebtoken::jwk::{JwkSet, KeyOperations, PublicKeyUse};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
@@ -19,7 +19,7 @@ pub enum OidcError {
     /// The header named a `kid` that is not in the JWKS. The one variant a
     /// caller acts on: it is what a key **rotation** looks like, so refresh
     /// the JWKS once and retry.
-    #[error("unknown key id `{0}`")]
+    #[error("unknown key id {0:?}")]
     UnknownKid(String),
     /// The signature did not verify against the selected key.
     #[error("bad signature")]
@@ -33,7 +33,7 @@ pub enum OidcError {
     /// `exp` is in the past (allowing for leeway).
     #[error("expired")]
     Expired,
-    /// `nbf` is in the future (allowing for leeway).
+    /// `nbf` or `iat` is in the future (allowing for leeway).
     #[error("not yet valid")]
     NotYetValid,
     /// A required claim is absent or unusable.
@@ -73,6 +73,12 @@ impl OidcError {
         }
     }
 }
+
+/// The largest clock-skew margin honoured, seconds. A larger configured
+/// `leeway_secs` is clamped to this by [`decode_verified`] (and refused by
+/// `OidcConfig::validate`): an unbounded leeway would quietly turn expired
+/// tokens back into valid ones.
+pub const MAX_LEEWAY_SECS: u64 = 300;
 
 /// The signature algorithms a verifier accepts.
 ///
@@ -134,7 +140,8 @@ pub struct VerifyParams<'a> {
     pub audience: &'a str,
     /// Allowed algorithms.
     pub algs: &'a AlgPolicy,
-    /// Clock-skew margin for `exp`/`nbf`, seconds.
+    /// Clock-skew margin for `exp`/`nbf`/`iat`, seconds; clamped to
+    /// [`MAX_LEEWAY_SECS`].
     pub leeway_secs: u64,
     /// Current time, epoch seconds.
     pub now: u64,
@@ -148,10 +155,12 @@ struct TimeClaims {
     exp: Option<u64>,
     #[serde(default)]
     nbf: Option<u64>,
+    #[serde(default)]
+    iat: Option<u64>,
     sub: Option<String>,
 }
 
-/// Verify a JWT's signature, algorithm, `kid`, `iss`, `aud`, `exp` and `nbf`
+/// Verify a JWT's signature, algorithm, `kid`, `iss`, `aud`, `exp`, `nbf` and `iat`
 /// and deserialise its claims as `T`.
 ///
 /// The shared core of [`verify_id_token`] and
@@ -178,7 +187,26 @@ pub fn decode_verified<T: DeserializeOwned>(
         // A key published for encryption is not a signing key. Absent `use`
         // is accepted: it is optional in RFC 7517.
         .filter(|jwk| !matches!(jwk.common.public_key_use, Some(PublicKeyUse::Encryption)))
+        // Likewise a key whose `key_ops` (when given) exclude `verify`.
+        .filter(|jwk| {
+            jwk.common
+                .key_operations
+                .as_ref()
+                .is_none_or(|ops| ops.contains(&KeyOperations::Verify))
+        })
         .ok_or_else(|| OidcError::UnknownKid(kid.clone()))?;
+    // A key restricted to one `alg` (RFC 7517 §4.4) verifies only that alg.
+    // Compared by name: jsonwebtoken's `KeyAlgorithm` -> `Algorithm`
+    // conversion is private, and the shared variants are named identically
+    // (encryption-only variants never match a signing alg, as intended).
+    if let Some(ka) = jwk.common.key_algorithm {
+        if format!("{ka:?}") != format!("{:?}", header.alg) {
+            return Err(OidcError::UnsupportedAlg(format!(
+                "{:?} for a key restricted to {ka:?}",
+                header.alg
+            )));
+        }
+    }
     let key = DecodingKey::from_jwk(jwk).map_err(|e| OidcError::Jwks(e.to_string()))?;
     // An algorithm family different from the key's (an RSA key named by an
     // ES256 header) is an unsupported algorithm for this key, not a panic or
@@ -210,13 +238,14 @@ pub fn decode_verified<T: DeserializeOwned>(
     if time.sub.as_deref().is_none_or(str::is_empty) {
         return Err(OidcError::MissingClaim("sub"));
     }
-    if exp.saturating_add(params.leeway_secs) <= params.now {
+    let leeway = params.leeway_secs.min(MAX_LEEWAY_SECS);
+    if exp.saturating_add(leeway) <= params.now {
         return Err(OidcError::Expired);
     }
-    if let Some(nbf) = time.nbf {
-        if nbf > params.now.saturating_add(params.leeway_secs) {
-            return Err(OidcError::NotYetValid);
-        }
+    let not_before = params.now.saturating_add(leeway);
+    if time.nbf.is_some_and(|nbf| nbf > not_before) || time.iat.is_some_and(|iat| iat > not_before)
+    {
+        return Err(OidcError::NotYetValid);
     }
     serde_json::from_value(data.claims).map_err(|_| OidcError::Malformed)
 }
@@ -262,7 +291,7 @@ pub struct IdTokenPolicy {
     pub client_id: String,
     /// Allowed signature algorithms.
     pub algs: AlgPolicy,
-    /// Clock-skew margin, seconds.
+    /// Clock-skew margin, seconds; clamped to [`MAX_LEEWAY_SECS`].
     pub leeway_secs: u64,
 }
 
@@ -693,5 +722,81 @@ mod tests {
     fn jwks_parsing_rejects_junk() {
         assert!(parse_jwks(b"{\"keys\":[]}").is_ok());
         assert!(matches!(parse_jwks(b"nope"), Err(OidcError::Jwks(_))));
+    }
+
+    fn keys_with(extra: &serde_json::Value) -> JwkSet {
+        let mut set = crate::test_support::jwks_json(&[("k1", KEY_A_N)]);
+        let key = set["keys"][0].as_object_mut().unwrap();
+        key.remove("alg");
+        for (k, v) in extra.as_object().unwrap() {
+            key.insert(k.clone(), v.clone());
+        }
+        serde_json::from_value(set).unwrap()
+    }
+
+    #[test]
+    fn a_keys_alg_and_key_ops_restrict_it() {
+        let jwt = sign("k1", KEY_A_DER_B64, &claims());
+        let verify = |set: &JwkSet| verify_id_token(&jwt, set, &policy(), "n0nce", 1_000);
+        assert!(verify(&keys_with(&json!({}))).is_ok());
+        assert!(verify(&keys_with(&json!({"alg": "RS256"}))).is_ok());
+        assert!(matches!(
+            verify(&keys_with(&json!({"alg": "RS384"}))).unwrap_err(),
+            OidcError::UnsupportedAlg(_)
+        ));
+        assert!(verify(&keys_with(&json!({"key_ops": ["verify"]}))).is_ok());
+        assert_eq!(
+            verify(&keys_with(&json!({"key_ops": ["encrypt"]}))).unwrap_err(),
+            OidcError::UnknownKid("k1".to_owned())
+        );
+    }
+
+    #[test]
+    fn iat_in_the_future_is_not_yet_valid() {
+        let mut c = claims();
+        c["iat"] = json!(2_000u64);
+        c.as_object_mut().unwrap().remove("nbf");
+        assert_eq!(
+            verify_id_token(
+                &sign("k1", KEY_A_DER_B64, &c),
+                &keys(),
+                &policy(),
+                "n0nce",
+                1_000
+            )
+            .unwrap_err(),
+            OidcError::NotYetValid
+        );
+        c["iat"] = json!(1_000u64);
+        assert!(verify_id_token(
+            &sign("k1", KEY_A_DER_B64, &c),
+            &keys(),
+            &policy(),
+            "n0nce",
+            1_000
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn leeway_is_clamped() {
+        let huge = IdTokenPolicy {
+            leeway_secs: 10_000,
+            ..policy()
+        };
+        let jwt = sign("k1", KEY_A_DER_B64, &claims());
+        // exp = 2000: within the clamped 300 s, but not 10 000.
+        assert!(verify_id_token(&jwt, &keys(), &huge, "n0nce", 2_299).is_ok());
+        assert_eq!(
+            verify_id_token(&jwt, &keys(), &huge, "n0nce", 3_000).unwrap_err(),
+            OidcError::Expired
+        );
+    }
+
+    #[test]
+    fn an_unknown_kid_is_escaped_in_the_message() {
+        let msg = OidcError::UnknownKid("k\nINFO forged".to_owned()).to_string();
+        assert!(!msg.contains('\n'), "{msg}");
+        assert!(msg.contains("\\n"), "{msg}");
     }
 }
