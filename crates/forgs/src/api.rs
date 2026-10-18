@@ -71,6 +71,11 @@ pub mod error_code {
     /// The SSH public key is already registered (to this or another user):
     /// a key maps to exactly one account.
     pub const SSH_KEY_TAKEN: &str = "ssh_key_taken";
+    /// The server does not accept new signups (invite or admin-created
+    /// accounts only).
+    pub const SIGNUP_CLOSED: &str = "signup_closed";
+    /// The account exists but is waiting for an administrator's approval.
+    pub const ACCOUNT_PENDING: &str = "account_pending";
 }
 
 /// A token-exchange request to `POST /auth/token`.
@@ -547,6 +552,52 @@ pub struct MemberList {
     pub next: Option<String>,
 }
 
+/// A user waiting for signup approval, as listed by `GET /auth/signups`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingUserInfo {
+    /// The user id (what approve and reject name).
+    pub user_id: String,
+    /// The chosen username (reserved while pending).
+    pub username: String,
+    /// Display name, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// When they signed up, epoch seconds.
+    pub created_at: u64,
+    /// The verified email addresses their identity asserted.
+    #[serde(default)]
+    pub emails: Vec<String>,
+}
+
+/// One page of users waiting for signup approval, oldest first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingUserList {
+    /// The users.
+    pub users: Vec<PendingUserInfo>,
+    /// Pass as `after` for the next page; absent on the last page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
+}
+
+/// A request to `POST /auth/signups/approve` or `/auth/signups/reject`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignupDecisionRequest {
+    /// The pending user's id.
+    pub user_id: String,
+}
+
+/// The `202 Accepted` body of a JSON `POST /auth/signup` under an approval
+/// policy: the account exists but no session was minted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignupPendingResponse {
+    /// Always `"pending"`.
+    pub status: String,
+    /// The new user's id.
+    pub user_id: String,
+    /// The chosen (canonical) username.
+    pub username: String,
+}
+
 /// A request to `POST /auth/rename`.
 ///
 /// The old name is tombstoned forever (docs/design.md §6, decision 5), so
@@ -723,6 +774,38 @@ mod tests {
         assert_eq!(&to_value(v).unwrap(), expected);
         let back: T = serde_json::from_value(expected.clone()).unwrap();
         assert_eq!(&back, v);
+    }
+
+    #[test]
+    fn signup_approval_shapes() {
+        round_trip(
+            &PendingUserList {
+                users: vec![PendingUserInfo {
+                    user_id: "u".into(),
+                    username: "alice".into(),
+                    display_name: None,
+                    created_at: 5,
+                    emails: vec!["a@x.org".into()],
+                }],
+                next: None,
+            },
+            &json!({"users": [{"user_id": "u", "username": "alice", "created_at": 5,
+                               "emails": ["a@x.org"]}]}),
+        );
+        round_trip(
+            &SignupDecisionRequest {
+                user_id: "u".into(),
+            },
+            &json!({"user_id": "u"}),
+        );
+        round_trip(
+            &SignupPendingResponse {
+                status: "pending".into(),
+                user_id: "u".into(),
+                username: "alice".into(),
+            },
+            &json!({"status": "pending", "user_id": "u", "username": "alice"}),
+        );
     }
 
     #[test]

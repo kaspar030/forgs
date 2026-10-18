@@ -7,8 +7,8 @@
 //! identity providers, workload issuers, an [`AuditSink`] and its hooks) and
 //! merges [`router`] into its own axum `Router`. Every route is a thin
 //! adapter over a framework-agnostic service function ([`session`],
-//! [`login`], [`signup`], [`device`], [`keys`], [`workload`], [`members`],
-//! [`identities`]),
+//! [`login`], [`signup`], [`signups`], [`device`], [`keys`], [`workload`],
+//! [`members`], [`identities`]),
 //! so an app can drive the same logic from elsewhere.
 //!
 //! # Threat model, in brief
@@ -49,6 +49,7 @@ pub mod members;
 mod routes;
 pub mod session;
 pub mod signup;
+pub mod signups;
 pub mod ssh_keys;
 pub mod workload;
 
@@ -59,11 +60,11 @@ pub use auth::{
 };
 pub use context::{
     source_key, AuthContext, AuthContextBuilder, ClientIp, Clock, ConfigError, CookieNames,
-    CsrfKey, FixedClock, ForwardedFor, NoClientIp, PeerIp, SystemClock, Ttls,
+    CsrfKey, FixedClock, ForwardedFor, NoClientIp, PeerIp, SignupPolicy, SystemClock, Ttls,
 };
 pub use error::{reject, ApiError};
 pub use hooks::{
-    ApiKeyPurposes, AppTokenLookup, KeyMint, NoPendingApprovals, PendingApprovalHook, PurposeKind,
-    StaticPurposes,
+    ApiKeyPurposes, AppTokenLookup, KeyMint, NoPendingApprovals, NoSignupApprovals,
+    PendingApprovalHook, PurposeKind, SignupApprovalHook, StaticPurposes,
 };
 pub use routes::{router, JsonBody};

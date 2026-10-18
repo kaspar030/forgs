@@ -12,8 +12,8 @@ use zeroize::Zeroize;
 use forgs::api::{
     ApiKeyCreated, ApiKeyList, ApiKeyRequest, ApiKeyRevoked, DevicePollRequest, DevicePollResponse,
     DeviceStartRequest, DeviceStartResponse, LogoutRequest, MemberList, MembersRequest,
-    RenameRequest, SshKeyAddRequest, SshKeyDeleteRequest, SshKeyInfo, SshKeyList, TokenRequest,
-    TokenResponse,
+    PendingUserList, RenameRequest, SignupDecisionRequest, SshKeyAddRequest, SshKeyDeleteRequest,
+    SshKeyInfo, SshKeyList, TokenRequest, TokenResponse,
 };
 
 use crate::error::ClientError;
@@ -846,6 +846,110 @@ impl ForgsClient {
         .map(drop)
     }
 
+    /// Every user waiting for signup approval, oldest first, following
+    /// pages (`GET /auth/signups`). Approvers only.
+    ///
+    /// # Errors
+    ///
+    /// As [`ForgsClient::exchange`]: a caller the server's approval hook does
+    /// not allow is `403 forbidden`.
+    pub async fn list_pending_signups(
+        &self,
+        session_token: &str,
+    ) -> Result<PendingUserList, ClientError> {
+        let mut all = self
+            .list_pending_signups_page(session_token, None, None)
+            .await?;
+        while let Some(after) = all.next.take() {
+            let mut page = self
+                .list_pending_signups_page(session_token, Some(&after), None)
+                .await?;
+            if page.next.as_deref() == Some(after.as_str()) || page.users.is_empty() {
+                break;
+            }
+            all.users.append(&mut page.users);
+            all.next = page.next;
+        }
+        Ok(all)
+    }
+
+    /// One page of users waiting for signup approval: `after` is the
+    /// previous page's [`PendingUserList::next`], `limit` the page size
+    /// (capped by the server).
+    ///
+    /// # Errors
+    ///
+    /// As [`ForgsClient::list_pending_signups`].
+    pub async fn list_pending_signups_page(
+        &self,
+        session_token: &str,
+        after: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<PendingUserList, ClientError> {
+        let mut query = Vec::new();
+        if let Some(a) = after {
+            query.push(format!("after={}", percent_encode_query(a)));
+        }
+        if let Some(l) = limit {
+            query.push(format!("limit={l}"));
+        }
+        let route = if query.is_empty() {
+            "/auth/signups".to_owned()
+        } else {
+            format!("/auth/signups?{}", query.join("&"))
+        };
+        self.get_json(&route, Some(&Secret::from(session_token)))
+            .await
+    }
+
+    /// Approve a pending signup (`POST /auth/signups/approve`). The success
+    /// response (`204`) has no body.
+    ///
+    /// # Errors
+    ///
+    /// As [`ForgsClient::exchange`]: `403` for a non-approver, `404` for a
+    /// user that is not pending.
+    pub async fn approve_signup(
+        &self,
+        session_token: &str,
+        user_id: &str,
+    ) -> Result<(), ClientError> {
+        self.signup_decision("/auth/signups/approve", session_token, user_id)
+            .await
+    }
+
+    /// Reject a pending signup (`POST /auth/signups/reject`): the account is
+    /// deleted and its name freed. The success response (`204`) has no body.
+    ///
+    /// # Errors
+    ///
+    /// As [`ForgsClient::approve_signup`].
+    pub async fn reject_signup(
+        &self,
+        session_token: &str,
+        user_id: &str,
+    ) -> Result<(), ClientError> {
+        self.signup_decision("/auth/signups/reject", session_token, user_id)
+            .await
+    }
+
+    async fn signup_decision(
+        &self,
+        route: &str,
+        session_token: &str,
+        user_id: &str,
+    ) -> Result<(), ClientError> {
+        self.post(
+            route,
+            Some(&Secret::from(session_token)),
+            &SignupDecisionRequest {
+                user_id: user_id.to_owned(),
+            },
+        )
+        .await
+        .map(drop)
+    }
+
     async fn members(
         &self,
         session_token: &str,
@@ -864,6 +968,20 @@ impl ForgsClient {
         self.post_json("/auth/keys", Some(&Secret::from(session_token)), request)
             .await
     }
+}
+
+/// Percent-encode a query value (unreserved characters kept).
+fn percent_encode_query(v: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(v.len());
+    for b in v.bytes() {
+        if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) {
+            out.push(char::from(b));
+        } else {
+            let _ = write!(out, "%{b:02X}");
+        }
+    }
+    out
 }
 
 /// Normalise a user-supplied server address into `http(s)://host[:port][/path]`

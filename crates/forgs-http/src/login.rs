@@ -207,6 +207,14 @@ pub enum LoginOutcome {
         /// Where to go next.
         return_to: Option<String>,
     },
+    /// A known identity whose account waits for signup approval: nothing
+    /// was minted; show the "waiting for approval" page.
+    Pending {
+        /// Who.
+        user: UserId,
+        /// Where they were going.
+        return_to: Option<String>,
+    },
     /// The step-up leg succeeded: the browser goes on to the target
     /// provider with this new flow cookie.
     Reauthenticated {
@@ -224,7 +232,8 @@ pub enum LoginOutcome {
 /// `400 invalid_request` for a missing/forged/expired/mismatched state (all
 /// alike, and nothing minted), [`ApiError::NO_VERIFIED_EMAIL`],
 /// [`ApiError::UPSTREAM`] for other provider failures, `403` for a disabled
-/// user, [`ApiError::IDENTITY_TAKEN`] when linking an identity already
+/// user, [`ApiError::SIGNUP_CLOSED`] for an unknown identity under
+/// [`crate::SignupPolicy::Closed`], [`ApiError::IDENTITY_TAKEN`] when linking an identity already
 /// linked, [`ApiError::REAUTH_REQUIRED`] when a step-up leg asserted an
 /// identity that is not the logged-in user's, `500` on storage failure.
 #[allow(clippy::too_many_lines)]
@@ -379,15 +388,31 @@ pub async fn complete_login(
         .await
         .map_err(store_err("user_by_identity"))?;
     if let Some(user) = known {
-        if user.state != UserState::Active {
-            ctx.audit()
-                .record(
-                    AuditEvent::new(now, "auth.login.disabled")
-                        .subject(&forgs::SubjectKey::user(user.id))
-                        .target(provider),
-                )
-                .await;
-            return Err(ApiError::Forbidden);
+        match user.state {
+            UserState::Active => {}
+            UserState::Pending => {
+                ctx.audit()
+                    .record(
+                        AuditEvent::new(now, "auth.login.pending")
+                            .subject(&forgs::SubjectKey::user(user.id))
+                            .target(provider),
+                    )
+                    .await;
+                return Ok(LoginOutcome::Pending {
+                    user: user.id,
+                    return_to,
+                });
+            }
+            UserState::Disabled => {
+                ctx.audit()
+                    .record(
+                        AuditEvent::new(now, "auth.login.disabled")
+                            .subject(&forgs::SubjectKey::user(user.id))
+                            .target(provider),
+                    )
+                    .await;
+                return Err(ApiError::Forbidden);
+            }
         }
         ctx.store()
             .touch_identity_login(
@@ -415,6 +440,12 @@ pub async fn complete_login(
     }
 
     // Unknown identity. Deliberately no email lookup: see the module docs.
+    if ctx.signup_policy() == crate::context::SignupPolicy::Closed {
+        ctx.audit()
+            .record(AuditEvent::new(now, "signup.reject.closed").target(provider))
+            .await;
+        return Err(ApiError::SIGNUP_CLOSED);
+    }
     let expires = now.saturating_add(ctx.ttl().pending_signup);
     let ticket = ctx
         .store()

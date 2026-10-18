@@ -4039,3 +4039,484 @@ async fn logout_all_can_delete_late_ssh_keys() {
     assert_eq!(left.len(), 1);
     assert_eq!(left[0].title, "k1");
 }
+
+// ---------------------------------------------------------------------------
+// Signup approval
+// ---------------------------------------------------------------------------
+
+/// Lets `approver` (by username) decide; records `on_pending` calls.
+#[derive(Default)]
+struct TestSignupApprovals {
+    approver: Mutex<Option<String>>,
+    pending: Mutex<Vec<String>>,
+}
+
+#[async_trait]
+impl forgs_http::SignupApprovalHook for TestSignupApprovals {
+    async fn can_approve(&self, ctx: &AuthContext, approver: forgs::UserId) -> bool {
+        let Some(name) = self.approver.lock().unwrap().clone() else {
+            return false;
+        };
+        ctx.store()
+            .user_by_username(&name)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|u| u.id == approver)
+    }
+    async fn on_pending(&self, _ctx: &AuthContext, user: &forgs_store::User) {
+        self.pending.lock().unwrap().push(user.username.clone());
+    }
+}
+
+async fn approval_harness() -> (H, Arc<TestSignupApprovals>) {
+    let hook = Arc::new(TestSignupApprovals::default());
+    let hk = hook.clone();
+    let h = harness_cfg(true, &format!("{PUBLIC}/"), move |b| {
+        b.signup_policy(forgs_http::SignupPolicy::Approval)
+            .signup_approvals(hk)
+    })
+    .await;
+    (h, hook)
+}
+
+impl H {
+    /// First login + signup form under an approval policy; returns the
+    /// signup response and the jar.
+    async fn signup_pending(
+        &self,
+        code: &str,
+        sub: &str,
+        email: &str,
+        username: &str,
+    ) -> (Resp, Jar) {
+        self.idp.add(code, sub, email, Some(username));
+        let mut jar = Jar::default();
+        let cb = self.browser_login(&mut jar, "stub", code).await;
+        cb.expect(StatusCode::FOUND);
+        let r = self
+            .post_form("/auth/signup", &jar, &[("username", username)])
+            .await;
+        jar.absorb(&r);
+        (r, jar)
+    }
+}
+
+#[tokio::test]
+async fn approval_signup_waits_and_login_shows_the_pending_page() {
+    let (h, hook) = approval_harness().await;
+    let (r, jar) = h.signup_pending("a", "1", "a@x.example", "alice").await;
+    r.expect(StatusCode::OK);
+    assert!(r.text().contains("waiting for approval"));
+    assert!(H::session(&jar).is_empty());
+    assert!(!jar.0.contains_key("__Host-frg_signup"));
+    assert!(h.audit.has("user.signup.pending"));
+    assert_eq!(*hook.pending.lock().unwrap(), vec!["alice".to_owned()]);
+    let alice = h.user_id("alice").await;
+    assert_eq!(
+        h.ctx
+            .store()
+            .user_by_id(alice)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        forgs_store::UserState::Pending
+    );
+
+    // Logging in again: the same page, no session.
+    let mut j = Jar::default();
+    h.idp.add("again", "1", "a@x.example", None);
+    let cb = h.browser_login(&mut j, "stub", "again").await;
+    cb.expect(StatusCode::OK);
+    assert!(cb.text().contains("waiting for approval"));
+    assert!(H::session(&j).is_empty());
+    assert!(h.audit.has("auth.login.pending"));
+
+    // The name is reserved meanwhile.
+    h.idp.add("b", "2", "b@x.example", Some("alice"));
+    let mut jb = Jar::default();
+    h.browser_login(&mut jb, "stub", "b").await;
+    h.post_form("/auth/signup", &jb, &[("username", "alice")])
+        .await
+        .expect(StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn approval_signup_json_is_202_without_a_session() {
+    let (h, _) = approval_harness().await;
+    h.idp.add("a", "1", "a@x.example", None);
+    let mut jar = Jar::default();
+    h.browser_login(&mut jar, "stub", "a").await;
+    let r = h
+        .post_json(
+            "/auth/signup",
+            None,
+            Some(&jar),
+            &[("origin", PUBLIC)],
+            &json!({"ticket": "", "username": "alice"}),
+        )
+        .await;
+    r.expect(StatusCode::ACCEPTED);
+    assert_eq!(r.json()["status"], "pending");
+    assert_eq!(r.json()["username"], "alice");
+    assert!(!r
+        .set_cookies()
+        .iter()
+        .any(|c| c.starts_with("__Host-frg_session=") && !c.contains("Max-Age=0")));
+}
+
+#[tokio::test]
+async fn closed_signup_is_refused_at_callback_and_submit() {
+    // An old ticket from an open server, then the server closes.
+    let h = harness().await;
+    h.idp.add("a", "1", "a@x.example", None);
+    let mut jar = Jar::default();
+    h.browser_login(&mut jar, "stub", "a").await;
+    let closed = harness_cfg(true, &format!("{PUBLIC}/"), |b| {
+        b.signup_policy(forgs_http::SignupPolicy::Closed)
+    })
+    .await;
+    // Same secret, so the old ticket opens; but the ticket lives in the
+    // other store, so the policy check must come first.
+    let r = closed
+        .post_form("/auth/signup", &jar, &[("username", "alice")])
+        .await;
+    r.expect(StatusCode::FORBIDDEN);
+    assert!(r.text().contains("closed"));
+    assert!(closed.audit.has("signup.reject.closed"));
+    let r = closed
+        .post_json(
+            "/auth/signup",
+            None,
+            Some(&jar),
+            &[("origin", PUBLIC)],
+            &json!({"ticket": "", "username": "alice"}),
+        )
+        .await;
+    r.expect(StatusCode::FORBIDDEN);
+    assert_eq!(r.error(), "signup_closed");
+
+    // An unknown identity is refused at the callback, with no ticket.
+    closed.idp.add("c", "3", "c@x.example", None);
+    let mut j = Jar::default();
+    let cb = closed.browser_login(&mut j, "stub", "c").await;
+    cb.expect(StatusCode::FORBIDDEN);
+    assert!(!j.0.contains_key("__Host-frg_signup"));
+    // A known (app-created) user still logs in.
+    let (bob, _) = closed
+        .ctx
+        .store()
+        .create_local_user("bob", None, NOW)
+        .await
+        .unwrap();
+    closed
+        .ctx
+        .store()
+        .link_identity(
+            bob,
+            &forgs_store::NewIdentity {
+                provider: "stub".into(),
+                subject: "4".into(),
+                email: None,
+                email_verified: false,
+            },
+            NOW,
+        )
+        .await
+        .unwrap();
+    closed.idp.add("d", "4", "d@x.example", None);
+    let mut j = Jar::default();
+    closed
+        .browser_login(&mut j, "stub", "d")
+        .await
+        .expect(StatusCode::FOUND);
+    assert!(!H::session(&j).is_empty());
+}
+
+#[tokio::test]
+async fn pending_users_are_refused_on_every_credential_path() {
+    let h = harness().await;
+    let alice = H::session(&h.signup("a", "1", "a@x.example", "alice").await);
+    let bob_jar = h.signup("b", "2", "b@x.example", "bob").await;
+    let bob = H::session(&bob_jar);
+    let bob_id = h.user_id("bob").await;
+    h.post_json(
+        "/auth/members",
+        Some(&alice),
+        None,
+        &[],
+        &json!({"action": "set", "namespace": "alice", "username": "bob", "role": "member"}),
+    )
+    .await
+    .expect(StatusCode::NO_CONTENT);
+    let key = h
+        .post_json(
+            "/auth/keys",
+            Some(&bob),
+            None,
+            &[],
+            &json!({"action": "create", "namespace": "alice", "ttl_secs": 3600,
+                    "purpose": "ci", "multi_use": true}),
+        )
+        .await
+        .json()["key"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let redeem_body = json!({"grant_type": "api_key", "api_key": key});
+    let redeem = || h.post_json("/auth/token", None, None, &[], &redeem_body);
+    let r = redeem().await;
+    r.expect(StatusCode::OK);
+    let wt = r.json()["token"].as_str().unwrap().to_owned();
+    let refresh = forgs_http::session::mint_refresh(&h.ctx, bob_id)
+        .await
+        .unwrap();
+    h.post_json(
+        "/auth/keys/ssh",
+        Some(&bob),
+        None,
+        &[],
+        &json!({"public_key": SSH_ED25519, "title": "laptop"}),
+    )
+    .await
+    .expect(StatusCode::CREATED);
+    let ssh = forgs::SshPublicKey::parse_openssh(SSH_ED25519).unwrap();
+
+    h.ctx
+        .store()
+        .set_user_state(bob_id, forgs_store::UserState::Pending)
+        .await
+        .unwrap();
+    // Session (header and cookie): the uniform 401, audited as pending.
+    let r = h.whoami(&bob).await;
+    r.expect(StatusCode::UNAUTHORIZED);
+    assert_eq!(r.body, br#"{"error":"unauthorized"}"#);
+    h.get("/auth/session", Some(&bob_jar), &[])
+        .await
+        .expect(StatusCode::UNAUTHORIZED);
+    assert!(h.audit.has("auth.reject.pending"));
+    // Session refresh and refresh-token redemption.
+    for body in [
+        json!({"grant_type": "refresh", "session_token": bob}),
+        json!({"grant_type": "refresh_token", "refresh_token": refresh}),
+    ] {
+        let r = h.post_json("/auth/token", None, None, &[], &body).await;
+        r.expect(StatusCode::UNAUTHORIZED);
+        assert_eq!(r.error(), "invalid_grant");
+    }
+    // API key and the workload token minted from it.
+    h.whoami(&wt).await.expect(StatusCode::UNAUTHORIZED);
+    let r = redeem().await;
+    r.expect(StatusCode::UNAUTHORIZED);
+    assert_eq!(r.error(), "invalid_grant");
+    // SSH key.
+    assert!(forgs::authenticate_ssh_key(h.ctx.store(), &ssh, NOW)
+        .await
+        .is_err());
+    // Login.
+    let mut j = Jar::default();
+    h.idp.add("again", "2", "b@x.example", None);
+    h.browser_login(&mut j, "stub", "again")
+        .await
+        .expect(StatusCode::OK);
+    assert!(H::session(&j).is_empty());
+    // Not addable as a member: like an unknown user.
+    let r = h
+        .post_json(
+            "/auth/members",
+            Some(&alice),
+            None,
+            &[],
+            &json!({"action": "set", "namespace": "alice", "username": "bob", "role": "admin"}),
+        )
+        .await;
+    r.expect(StatusCode::NOT_FOUND);
+
+    // Approved (by the store): everything is back, except the purged
+    // workload token.
+    h.ctx.store().approve_user(bob_id).await.unwrap();
+    h.whoami(&bob).await.expect(StatusCode::OK);
+    h.whoami(&wt).await.expect(StatusCode::UNAUTHORIZED);
+    redeem().await.expect(StatusCode::OK);
+    assert!(forgs::authenticate_ssh_key(h.ctx.store(), &ssh, NOW)
+        .await
+        .is_ok());
+}
+
+#[tokio::test]
+async fn approvers_list_approve_and_reject() {
+    let (h, hook) = approval_harness().await;
+    // An approver created by the app.
+    let (root, _) = h
+        .ctx
+        .store()
+        .create_local_user("root", None, NOW)
+        .await
+        .unwrap();
+    let root_session = forgs_http::session::mint_session(&h.ctx, root, "test")
+        .await
+        .unwrap()
+        .token;
+    h.signup_pending("a", "1", "a@x.example", "alice").await;
+    h.clock.advance(1);
+    h.signup_pending("b", "2", "b@x.example", "bob").await;
+
+    // The hook denies everyone until told otherwise.
+    let r = h
+        .get(
+            "/auth/signups",
+            None,
+            &[("authorization", &format!("Bearer {root_session}"))],
+        )
+        .await;
+    r.expect(StatusCode::FORBIDDEN);
+    assert!(h.audit.has("signup.denied"));
+    *hook.approver.lock().unwrap() = Some("root".into());
+
+    let auth = format!("Bearer {root_session}");
+    let r = h
+        .get("/auth/signups?limit=1", None, &[("authorization", &auth)])
+        .await;
+    r.expect(StatusCode::OK);
+    let page = r.json();
+    assert_eq!(page["users"][0]["username"], "alice");
+    assert_eq!(page["users"][0]["emails"][0], "a@x.example");
+    let next = page["next"].as_str().unwrap().to_owned();
+    let r = h
+        .get(
+            &format!("/auth/signups?after={next}"),
+            None,
+            &[("authorization", &auth)],
+        )
+        .await;
+    assert_eq!(r.json()["users"][0]["username"], "bob");
+    assert!(r.json().get("next").is_none());
+    let alice_id = h.user_id("alice").await.to_string();
+    let bob_id = h.user_id("bob").await.to_string();
+
+    // Approve alice: her login works.
+    h.post_json(
+        "/auth/signups/approve",
+        Some(&root_session),
+        None,
+        &[],
+        &json!({ "user_id": alice_id }),
+    )
+    .await
+    .expect(StatusCode::NO_CONTENT);
+    assert!(h.audit.has("user.signup.approved"));
+    let mut j = Jar::default();
+    h.idp.add("a2", "1", "a@x.example", None);
+    h.browser_login(&mut j, "stub", "a2")
+        .await
+        .expect(StatusCode::FOUND);
+    let alice_session = H::session(&j);
+    h.whoami(&alice_session).await.expect(StatusCode::OK);
+    // Approving again, or approving garbage: 404.
+    for id in [alice_id.as_str(), "nope"] {
+        h.post_json(
+            "/auth/signups/approve",
+            Some(&root_session),
+            None,
+            &[],
+            &json!({ "user_id": id }),
+        )
+        .await
+        .expect(StatusCode::NOT_FOUND);
+    }
+    // A non-approver (alice) is refused.
+    h.post_json(
+        "/auth/signups/reject",
+        Some(&alice_session),
+        None,
+        &[],
+        &json!({ "user_id": bob_id }),
+    )
+    .await
+    .expect(StatusCode::FORBIDDEN);
+
+    // Reject bob: the name is free again.
+    h.post_json(
+        "/auth/signups/reject",
+        Some(&root_session),
+        None,
+        &[],
+        &json!({ "user_id": bob_id }),
+    )
+    .await
+    .expect(StatusCode::NO_CONTENT);
+    assert!(h.audit.has("user.signup.rejected"));
+    assert!(h
+        .ctx
+        .store()
+        .user_by_username("bob")
+        .await
+        .unwrap()
+        .is_none());
+    let (r, _) = h.signup_pending("b2", "2", "b@x.example", "bob").await;
+    r.expect(StatusCode::OK);
+    assert!(r.text().contains("waiting for approval"));
+}
+
+#[tokio::test]
+async fn the_review_page_lists_and_decides_with_csrf() {
+    let (h, hook) = approval_harness().await;
+    h.signup_pending("a", "1", "a@x.example", "<alice>").await; // invalid name
+    h.signup_pending("b", "2", "b@x.example", "bob").await;
+    // Logged out: login links.
+    let r = h.get("/auth/signups/review", None, &[]).await;
+    r.expect(StatusCode::OK);
+    assert!(r.text().contains("/auth/stub/start"));
+
+    // An approver signed up and approved out of band.
+    let (rr, _) = h.signup_pending("r", "9", "r@x.example", "root").await;
+    rr.expect(StatusCode::OK);
+    let root = h.user_id("root").await;
+    h.ctx.store().approve_user(root).await.unwrap();
+    let mut jar = Jar::default();
+    h.idp.add("r2", "9", "r@x.example", None);
+    h.browser_login(&mut jar, "stub", "r2")
+        .await
+        .expect(StatusCode::FOUND);
+    let csrf = jar.get("__Host-frg_csrf");
+
+    // Not yet an approver: 403 page.
+    h.get("/auth/signups/review", Some(&jar), &[])
+        .await
+        .expect(StatusCode::FORBIDDEN);
+    *hook.approver.lock().unwrap() = Some("root".into());
+    let r = h.get("/auth/signups/review", Some(&jar), &[]).await;
+    r.expect(StatusCode::OK);
+    assert!(r.text().contains("bob"));
+    let bob = h.user_id("bob").await.to_string();
+
+    // Without CSRF: refused.
+    h.post_form(
+        "/auth/signups/review",
+        &jar,
+        &[("user_id", &bob), ("action", "approve")],
+    )
+    .await
+    .expect(StatusCode::FORBIDDEN);
+    let r = h
+        .post_form(
+            "/auth/signups/review",
+            &jar,
+            &[("user_id", &bob), ("action", "approve"), ("csrf", &csrf)],
+        )
+        .await;
+    r.expect(StatusCode::OK);
+    assert!(r.text().contains("Approved."));
+    assert!(r.text().contains("No signups are waiting"));
+    assert_eq!(
+        h.ctx
+            .store()
+            .user_by_username("bob")
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        forgs_store::UserState::Active
+    );
+}

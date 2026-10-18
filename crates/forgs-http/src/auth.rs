@@ -185,14 +185,24 @@ pub async fn authenticate_request(
             Ok(a) => a,
             Err(e) => return Err(reject_authentication(ctx, &e).await),
         };
-    // A disabled (or deleted) user's sessions stop working at once, with the
-    // same body as an unknown token.
+    // A disabled, pending (or deleted) user's sessions stop working at once,
+    // with the same body as an unknown token.
     if auth.subject.kind() == SubjectKind::User {
         let Some(user) = auth.subject.user_id() else {
             return Err(unauthorized());
         };
         match ctx.store().user_by_id(user).await {
             Ok(Some(u)) if u.state == UserState::Active => {}
+            Ok(Some(u)) if u.state == UserState::Pending => {
+                ctx.audit()
+                    .record(
+                        AuditEvent::new(now, "auth.reject.pending")
+                            .subject(&auth.subject)
+                            .target(auth.hash.short()),
+                    )
+                    .await;
+                return Err(unauthorized());
+            }
             Ok(_) => {
                 ctx.audit()
                     .record(

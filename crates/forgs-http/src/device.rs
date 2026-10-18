@@ -487,7 +487,7 @@ pub async fn poll(ctx: &AuthContext, device_secret: &str) -> Result<PollOutcome,
     // The approver must still be active for both outcomes: a login mints
     // their session, and an app payload is redeemed on their authority.
     let user = approved.approved_by;
-    if !crate::session::user_is_active(ctx, user).await? {
+    if !crate::session::user_is_active(ctx, user, "device flow").await? {
         return Err(ApiError::InvalidGrant);
     }
     if let Some(payload) = approved.payload.as_deref() {

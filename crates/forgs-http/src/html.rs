@@ -9,6 +9,8 @@
 //! origin (while same-origin form posts still carry a real `Origin`), and
 //! `Cache-Control: no-store`.
 
+use std::fmt::Write as _;
+
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 
@@ -181,6 +183,58 @@ pub fn device_approved(action: &str, code: &str, csrf: &str) -> Response {
         escape(code),
     );
     page(StatusCode::OK, "Device approved", &body)
+}
+
+/// After a signup (or a login) under an approval policy: the account
+/// exists but waits for an administrator.
+#[must_use]
+pub fn pending_approval() -> Response {
+    message(
+        StatusCode::OK,
+        "Waiting for approval",
+        "Your account is waiting for approval by an administrator. You can log in once it \
+         has been approved.",
+    )
+}
+
+/// The pending-signup review page: one row per user, each with an approve
+/// and a reject button (CSRF-checked form POSTs to `action`).
+#[must_use]
+pub fn signup_review(
+    action: &str,
+    csrf: &str,
+    users: &[forgs::api::PendingUserInfo],
+    notice: Option<&str>,
+) -> Response {
+    let mut body = String::new();
+    if let Some(n) = notice {
+        let _ = writeln!(body, "<p><strong>{}</strong></p>", escape(n));
+    }
+    if users.is_empty() {
+        body.push_str("<p>No signups are waiting for approval.</p>");
+        return page(StatusCode::OK, "Pending signups", &body);
+    }
+    body.push_str("<table>\n<tr><th>Username</th><th>Email</th><th>Signed up</th><th></th></tr>\n");
+    for u in users {
+        let _ = writeln!(
+            body,
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>\
+             <form method=\"post\" action=\"{}\">\
+             <input type=\"hidden\" name=\"csrf\" value=\"{}\">\
+             <input type=\"hidden\" name=\"user_id\" value=\"{}\">\
+             <button type=\"submit\" name=\"action\" value=\"approve\">Approve</button> \
+             <button type=\"submit\" name=\"action\" value=\"reject\">Reject</button>\
+             </form></td></tr>",
+            escape(&u.username),
+            escape(&u.emails.join(", ")),
+            escape(&utc(u.created_at)),
+            escape(action),
+            escape(csrf),
+            escape(&u.user_id),
+        );
+    }
+    body.push_str("</table>");
+    page(StatusCode::OK, "Pending signups", &body)
 }
 
 /// Epoch seconds as `YYYY-MM-DD HH:MM:SS UTC`.

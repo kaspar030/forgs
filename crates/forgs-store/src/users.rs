@@ -86,6 +86,12 @@ pub enum UserState {
     Active,
     /// May not log in. Existing rows (memberships, keys) are kept.
     Disabled,
+    /// Signed up under an approval policy and not approved yet
+    /// ([`Store::approve_user`], [`Store::reject_user`]). May not log in and
+    /// no credential of theirs authenticates; not counted as an active
+    /// member anywhere. Their username (and personal namespace name) is
+    /// reserved, but the personal namespace is not usable.
+    Pending,
 }
 
 impl UserState {
@@ -95,6 +101,7 @@ impl UserState {
         match self {
             UserState::Active => "active",
             UserState::Disabled => "disabled",
+            UserState::Pending => "pending",
         }
     }
 
@@ -102,6 +109,7 @@ impl UserState {
         match s {
             "active" => Ok(UserState::Active),
             "disabled" => Ok(UserState::Disabled),
+            "pending" => Ok(UserState::Pending),
             other => Err(crate::error::corrupt("user state", other)),
         }
     }
@@ -270,6 +278,7 @@ impl Store {
         raw_username: &str,
         display_name: Option<&str>,
         identity: Option<&NewIdentity>,
+        state: UserState,
         now: u64,
     ) -> Result<(UserId, Option<NsNodeId>)> {
         let username = self.schema.validate_username(raw_username)?;
@@ -279,11 +288,12 @@ impl Store {
         let now_i = ts(now)?;
         sqlx::query(
             "INSERT INTO forgs_user (id, username, display_name, state, created_at)
-             VALUES (?1, ?2, ?3, 'active', ?4)",
+             VALUES (?1, ?2, ?3, ?4, ?5)",
         )
         .bind(&user_s)
         .bind(&username)
         .bind(display_name)
+        .bind(state.as_str())
         .bind(now_i)
         .execute(&mut *conn)
         .await?;
@@ -334,12 +344,22 @@ impl Store {
     /// root nodes of every kind, tombstones). Any failure — including a
     /// linked identity or an email another user holds — rolls everything back.
     ///
+    /// `state` is the new user's state: [`UserState::Active`] for an open
+    /// signup, [`UserState::Pending`] when an administrator must approve it
+    /// first. The personal node is created either way, so the name is
+    /// reserved while the user waits.
+    ///
     /// # Errors
     ///
     /// [`StoreError::Name`], [`StoreError::NameTaken`],
     /// [`StoreError::NameTombstoned`], [`StoreError::IdentityTaken`],
     /// [`StoreError::EmailTaken`], or a database error.
-    pub async fn signup(&self, signup: &NewSignup, now: u64) -> Result<(UserId, Option<NsNodeId>)> {
+    pub async fn signup(
+        &self,
+        signup: &NewSignup,
+        state: UserState,
+        now: u64,
+    ) -> Result<(UserId, Option<NsNodeId>)> {
         let mut tx = self.begin().await?;
         let out = self
             .create_user_tx(
@@ -347,6 +367,7 @@ impl Store {
                 &signup.username,
                 signup.display_name.as_deref(),
                 Some(&signup.identity),
+                state,
                 now,
             )
             .await?;
@@ -359,7 +380,7 @@ impl Store {
     ///
     /// Returns `Ok(None)` for an unknown or expired ticket. If the signup
     /// fails (say the username is taken) the ticket is **not** consumed, so
-    /// the user can pick another name.
+    /// the user can pick another name. `state` is as for [`Store::signup`].
     ///
     /// # Errors
     ///
@@ -369,6 +390,7 @@ impl Store {
         ticket: PendingId,
         username: &str,
         display_name: Option<&str>,
+        state: UserState,
         now: u64,
     ) -> Result<Option<(UserId, Option<NsNodeId>)>> {
         let mut tx = self.begin().await?;
@@ -383,7 +405,7 @@ impl Store {
             email_verified: pending.email_verified,
         };
         let out = self
-            .create_user_tx(&mut tx, username, display_name, Some(&identity), now)
+            .create_user_tx(&mut tx, username, display_name, Some(&identity), state, now)
             .await?;
         tx.commit().await?;
         Ok(Some(out))
@@ -403,7 +425,14 @@ impl Store {
     ) -> Result<(UserId, Option<NsNodeId>)> {
         let mut tx = self.begin().await?;
         let out = self
-            .create_user_tx(&mut tx, username, display_name, None, now)
+            .create_user_tx(
+                &mut tx,
+                username,
+                display_name,
+                None,
+                UserState::Active,
+                now,
+            )
             .await?;
         tx.commit().await?;
         Ok(out)
@@ -652,7 +681,11 @@ impl Store {
 
     /// Set a user's state.
     ///
-    /// Disabling also deletes, in the same transaction, every workload token
+    /// [`UserState::Pending`] is normally entered only through signup (an
+    /// operator may set it, and it then behaves exactly like disabling,
+    /// below, except for the label).
+    ///
+    /// Disabling (or setting pending) also deletes, in the same transaction, every workload token
     /// minted from the user's API keys. The keys themselves are kept: they
     /// are inert while the user is disabled (see [`Store::consume_api_key`])
     /// and redeemable again after re-enabling. The user's SSH keys likewise
@@ -669,10 +702,10 @@ impl Store {
     pub async fn set_user_state(&self, user: UserId, state: UserState) -> Result<Vec<NsNodeId>> {
         let user_s = user.to_string();
         let mut tx = self.begin().await?;
-        let orphaned = if state == UserState::Disabled {
-            self.sole_admin_of_tx(&mut tx, &user_s).await?
-        } else {
+        let orphaned = if state == UserState::Active {
             Vec::new()
+        } else {
+            self.sole_admin_of_tx(&mut tx, &user_s).await?
         };
         let n = sqlx::query("UPDATE forgs_user SET state = ?2 WHERE id = ?1")
             .bind(&user_s)
@@ -683,11 +716,122 @@ impl Store {
         if n == 0 {
             return Err(StoreError::NotFound);
         }
-        if state == UserState::Disabled {
+        if state != UserState::Active {
             crate::credentials::purge_dead_key_tokens_for_user_tx(&mut tx, &user_s).await?;
         }
         tx.commit().await?;
         Ok(orphaned)
+    }
+
+    /// Approve a [`UserState::Pending`] user: they become
+    /// [`UserState::Active`] and can log in.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `user` is unknown or not pending (already
+    /// approved, disabled), or a database error.
+    pub async fn approve_user(&self, user: UserId) -> Result<()> {
+        let mut tx = self.begin().await?;
+        let n = sqlx::query(
+            "UPDATE forgs_user SET state = 'active' WHERE id = ?1 AND state = 'pending'",
+        )
+        .bind(user.to_string())
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if n == 0 {
+            return Err(StoreError::NotFound);
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Reject a [`UserState::Pending`] user, in one transaction: delete
+    /// their personal node and the user row (which cascades identities,
+    /// emails, sessions, refresh tokens, SSH keys and memberships).
+    ///
+    /// Unlike [`Store::delete_user`] this writes **no tombstone**: the
+    /// account was never in use, so nothing can have been bound to its name,
+    /// and a rejected name (and identity, and email) is free to sign up
+    /// again.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if `user` is unknown or not pending,
+    /// [`StoreError::HasChildren`] if the app created nodes under the
+    /// personal node, [`StoreError::Dangling`] if an app table still
+    /// references the user, or a database error. Nothing is changed on error.
+    pub async fn reject_user(&self, user: UserId) -> Result<()> {
+        let user_s = user.to_string();
+        let mut tx = self.begin().await?;
+        let row: Option<(Option<String>,)> = sqlx::query_as(
+            "SELECT (SELECT n.id FROM forgs_ns_node n WHERE n.personal_of_user_id = u.id)
+               FROM forgs_user u WHERE u.id = ?1 AND u.state = 'pending'",
+        )
+        .bind(&user_s)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((personal,)) = row else {
+            return Err(StoreError::NotFound);
+        };
+        // Defensive, as in `delete_user`: a pending user cannot mint keys,
+        // but a key with a NULL `created_by` must keep meaning shell-minted.
+        sqlx::query(
+            "DELETE FROM forgs_workload_token WHERE api_key_id IN (
+                 SELECT id FROM forgs_api_key WHERE created_by = ?1)",
+        )
+        .bind(&user_s)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM forgs_api_key WHERE created_by = ?1")
+            .bind(&user_s)
+            .execute(&mut *tx)
+            .await?;
+        if let Some(node) = &personal {
+            crate::ns::delete_leaf_tx(&mut tx, node).await?;
+        }
+        sqlx::query("DELETE FROM forgs_user WHERE id = ?1")
+            .bind(&user_s)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// One page of [`UserState::Pending`] users, oldest first (ids are
+    /// ULIDs, so id order is signup order). `after` is the last id of the
+    /// previous page.
+    ///
+    /// # Errors
+    ///
+    /// A database error, or [`StoreError::CorruptRow`].
+    pub async fn pending_users_page(&self, after: Option<UserId>, limit: u32) -> Result<Vec<User>> {
+        let rows: Vec<UserRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT {USER_COLS} FROM forgs_user u
+              WHERE u.state = 'pending' AND (?1 IS NULL OR u.id > ?1)
+              ORDER BY u.id LIMIT ?2"
+        )))
+        .bind(after.map(|a| a.to_string()))
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(user_from_row).collect()
+    }
+
+    /// The verified email addresses recorded for `user`, primary first.
+    ///
+    /// # Errors
+    ///
+    /// A database error.
+    pub async fn emails_of_user(&self, user: UserId) -> Result<Vec<String>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT email FROM forgs_user_email WHERE user_id = ?1
+              ORDER BY is_primary DESC, email",
+        )
+        .bind(user.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(e,)| e).collect())
     }
 
     /// The non-personal namespaces where `user` is the only direct admin

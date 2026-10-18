@@ -390,7 +390,11 @@ async fn malformed_token_hashes_are_refused() {
 async fn signup_creates_everything_atomically() {
     let s = store(fleet()).await;
     let (user, ns) = s
-        .signup(&signup(" Alice ", "42", Some("Alice@Example.org")), NOW)
+        .signup(
+            &signup(" Alice ", "42", Some("Alice@Example.org")),
+            UserState::Active,
+            NOW,
+        )
         .await
         .unwrap();
     let ns = ns.unwrap();
@@ -429,41 +433,55 @@ async fn assert_only_one_user(s: &Store) {
 #[tokio::test]
 async fn failed_signups_roll_back_completely() {
     let s = store(fleet()).await;
-    s.signup(&signup("alice", "1", Some("a@x.org")), NOW)
-        .await
-        .unwrap();
+    s.signup(
+        &signup("alice", "1", Some("a@x.org")),
+        UserState::Active,
+        NOW,
+    )
+    .await
+    .unwrap();
     assert!(matches!(
-        s.signup(&signup("bob", "1", Some("b@x.org")), NOW).await,
+        s.signup(&signup("bob", "1", Some("b@x.org")), UserState::Active, NOW)
+            .await,
         Err(StoreError::IdentityTaken)
     ));
     assert_only_one_user(&s).await;
     assert!(matches!(
-        s.signup(&signup("bob", "2", Some("A@X.org")), NOW).await,
+        s.signup(&signup("bob", "2", Some("A@X.org")), UserState::Active, NOW)
+            .await,
         Err(StoreError::EmailTaken)
     ));
     assert_only_one_user(&s).await;
     assert!(matches!(
-        s.signup(&signup("Alice", "3", None), NOW).await,
+        s.signup(&signup("Alice", "3", None), UserState::Active, NOW)
+            .await,
         Err(StoreError::NameTaken)
     ));
     assert_only_one_user(&s).await;
     assert!(matches!(
-        s.signup(&signup("admin", "4", None), NOW).await,
+        s.signup(&signup("admin", "4", None), UserState::Active, NOW)
+            .await,
         Err(StoreError::Name(NameError::Reserved))
     ));
     assert_only_one_user(&s).await;
     // An unverified email is not recorded, so it cannot squat an address.
     let mut su = signup("carol", "5", Some("a@x.org"));
     su.identity.email_verified = false;
-    s.signup(&su, NOW).await.unwrap();
+    s.signup(&su, UserState::Active, NOW).await.unwrap();
     assert_eq!(count(&s, "forgs_user_email").await, 1);
 }
 
 #[tokio::test]
 async fn identities_are_listed_and_unlinked_but_never_the_last() {
     let s = store(fleet()).await;
-    let (alice, _) = s.signup(&signup("alice", "1", None), NOW).await.unwrap();
-    let (bob, _) = s.signup(&signup("bob", "2", None), NOW).await.unwrap();
+    let (alice, _) = s
+        .signup(&signup("alice", "1", None), UserState::Active, NOW)
+        .await
+        .unwrap();
+    let (bob, _) = s
+        .signup(&signup("bob", "2", None), UserState::Active, NOW)
+        .await
+        .unwrap();
     let late = s
         .link_identity(alice, &ident("gitlab", "9", None), NOW + 10)
         .await
@@ -611,7 +629,8 @@ async fn the_root_pre_check_sees_non_personal_nodes_without_backstops() {
         Err(StoreError::NameTaken)
     ));
     assert!(matches!(
-        s.signup(&signup("acme", "1", None), NOW).await,
+        s.signup(&signup("acme", "1", None), UserState::Active, NOW)
+            .await,
         Err(StoreError::NameTaken)
     ));
     assert!(matches!(
@@ -2268,7 +2287,11 @@ async fn concurrent_consume_session_yields_one_winner() {
 async fn deleting_a_user_cascades_their_rows() {
     let s = store(fleet()).await;
     let (alice, a) = s
-        .signup(&signup("alice", "1", Some("a@x.org")), NOW)
+        .signup(
+            &signup("alice", "1", Some("a@x.org")),
+            UserState::Active,
+            NOW,
+        )
         .await
         .unwrap();
     let (bob, b) = s.create_local_user("bob", None, NOW).await.unwrap();
@@ -2523,11 +2546,12 @@ async fn pending_signups_are_one_shot_and_expire() {
         .await
         .unwrap();
     assert!(matches!(
-        s.signup_pending(t, "taken", None, NOW).await,
+        s.signup_pending(t, "taken", None, UserState::Active, NOW)
+            .await,
         Err(StoreError::NameTaken)
     ));
     let (user, _) = s
-        .signup_pending(t, "kaspar", None, NOW)
+        .signup_pending(t, "kaspar", None, UserState::Active, NOW)
         .await
         .unwrap()
         .unwrap();
@@ -2536,7 +2560,7 @@ async fn pending_signups_are_one_shot_and_expire() {
         user
     );
     assert!(s
-        .signup_pending(t, "other", None, NOW)
+        .signup_pending(t, "other", None, UserState::Active, NOW)
         .await
         .unwrap()
         .is_none());
@@ -3215,8 +3239,14 @@ fn ssh_key(n: u8) -> forgs::SshPublicKey {
 async fn ssh_keys_are_added_listed_and_deleted_per_user() {
     use forgs::SshKeyStore as _;
     let s = store(fleet()).await;
-    let (alice, _) = s.signup(&signup("alice", "1", None), NOW).await.unwrap();
-    let (bob, _) = s.signup(&signup("bob", "2", None), NOW).await.unwrap();
+    let (alice, _) = s
+        .signup(&signup("alice", "1", None), UserState::Active, NOW)
+        .await
+        .unwrap();
+    let (bob, _) = s
+        .signup(&signup("bob", "2", None), UserState::Active, NOW)
+        .await
+        .unwrap();
     let k1 = s
         .add_ssh_key(alice, &ssh_key(1), "laptop", None, 10, NOW)
         .await
@@ -3294,7 +3324,10 @@ async fn ssh_keys_are_added_listed_and_deleted_per_user() {
 #[tokio::test]
 async fn ssh_key_cap_counts_live_keys() {
     let s = store(fleet()).await;
-    let (alice, _) = s.signup(&signup("alice", "1", None), NOW).await.unwrap();
+    let (alice, _) = s
+        .signup(&signup("alice", "1", None), UserState::Active, NOW)
+        .await
+        .unwrap();
     s.add_ssh_key(alice, &ssh_key(1), "a", Some(NOW + 5), 2, NOW)
         .await
         .unwrap();
@@ -3320,7 +3353,10 @@ async fn ssh_key_cap_counts_live_keys() {
 async fn ssh_keys_follow_their_users_standing() {
     use forgs::{authenticate_ssh_key, SshAuthError, SshKeyStore as _};
     let s = store(fleet()).await;
-    let (alice, _) = s.signup(&signup("alice", "1", None), NOW).await.unwrap();
+    let (alice, _) = s
+        .signup(&signup("alice", "1", None), UserState::Active, NOW)
+        .await
+        .unwrap();
     let k = s
         .add_ssh_key(alice, &ssh_key(1), "laptop", Some(NOW + 100), 10, NOW)
         .await
@@ -3370,7 +3406,10 @@ async fn ssh_keys_follow_their_users_standing() {
 #[tokio::test]
 async fn ssh_key_touch_is_throttled() {
     let s = store(fleet()).await;
-    let (alice, _) = s.signup(&signup("alice", "1", None), NOW).await.unwrap();
+    let (alice, _) = s
+        .signup(&signup("alice", "1", None), UserState::Active, NOW)
+        .await
+        .unwrap();
     let k = s
         .add_ssh_key(alice, &ssh_key(1), "laptop", None, 10, NOW)
         .await
@@ -3390,8 +3429,14 @@ async fn ssh_key_touch_is_throttled() {
 #[tokio::test]
 async fn ssh_keys_added_after_are_deleted() {
     let s = store(fleet()).await;
-    let (alice, _) = s.signup(&signup("alice", "1", None), NOW).await.unwrap();
-    let (bob, _) = s.signup(&signup("bob", "2", None), NOW).await.unwrap();
+    let (alice, _) = s
+        .signup(&signup("alice", "1", None), UserState::Active, NOW)
+        .await
+        .unwrap();
+    let (bob, _) = s
+        .signup(&signup("bob", "2", None), UserState::Active, NOW)
+        .await
+        .unwrap();
     let old = s
         .add_ssh_key(alice, &ssh_key(1), "old", None, 10, NOW)
         .await
@@ -3406,4 +3451,246 @@ async fn ssh_keys_added_after_are_deleted() {
     let left = s.ssh_keys_for_user(alice).await.unwrap();
     assert_eq!(left.iter().map(|k| k.id).collect::<Vec<_>>(), vec![old]);
     assert_eq!(s.ssh_keys_for_user(bob).await.unwrap().len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Signup approval (pending users)
+// ---------------------------------------------------------------------------
+
+/// Migration 10 widens the state CHECK; a connection that cached the schema
+/// before the migration sees the new CHECK too (the schema cookie moved).
+#[tokio::test]
+async fn migration_10_accepts_pending_on_every_connection() {
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("forgs-m10-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&dir);
+    let url = format!("sqlite://{}", dir.display());
+    let opts = forgs_store::connect_options(&url).unwrap();
+    let pool = SqlitePoolOptions::new()
+        .max_connections(2)
+        .min_connections(2)
+        .connect_with(opts)
+        .await
+        .unwrap();
+    sqlx::raw_sql(
+        "CREATE TABLE forgs_schema_version (
+             version INTEGER NOT NULL PRIMARY KEY, applied_at INTEGER NOT NULL) STRICT",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    for (v, sql) in [
+        (1, include_str!("../migrations/0001_init.sql")),
+        (2, include_str!("../migrations/0002_session_auth_time.sql")),
+        (
+            3,
+            include_str!("../migrations/0003_workload_token_source_key.sql"),
+        ),
+        (4, include_str!("../migrations/0004_audit_ts_index.sql")),
+        (5, include_str!("../migrations/0005_tombstone_actor.sql")),
+        (6, include_str!("../migrations/0006_workload_jti.sql")),
+        (7, include_str!("../migrations/0007_child_names_nocase.sql")),
+        (8, include_str!("../migrations/0008_token_hash_checks.sql")),
+        (9, include_str!("../migrations/0009_ssh_keys.sql")),
+    ] {
+        sqlx::raw_sql(sql).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO forgs_schema_version VALUES (?1, 0)")
+            .bind(v)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    // Hold one connection that has read (and cached) the old schema.
+    let mut other = pool.acquire().await.unwrap();
+    sqlx::query("SELECT COUNT(*) FROM forgs_user")
+        .execute(&mut *other)
+        .await
+        .unwrap();
+    forgs_store::migrate(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO forgs_user (id, username, state, created_at) VALUES ('u1', 'p', 'pending', 0)",
+    )
+    .execute(&mut *other)
+    .await
+    .unwrap();
+    assert!(sqlx::query(
+        "INSERT INTO forgs_user (id, username, state, created_at) VALUES ('u2', 'q', 'bogus', 0)",
+    )
+    .execute(&mut *other)
+    .await
+    .is_err());
+    drop(other);
+    pool.close().await;
+    let _ = std::fs::remove_file(&dir);
+}
+
+#[tokio::test]
+async fn a_pending_signup_reserves_the_name_until_decided() {
+    let s = store(fleet()).await;
+    let (user, ns) = s
+        .signup(
+            &signup("alice", "1", Some("a@x.org")),
+            UserState::Pending,
+            NOW,
+        )
+        .await
+        .unwrap();
+    let u = s.user_by_id(user).await.unwrap().unwrap();
+    assert_eq!(u.state, UserState::Pending);
+    assert_eq!(u.personal_ns, ns);
+    assert!(ns.is_some());
+    assert!(matches!(
+        s.signup(&signup("alice", "2", None), UserState::Active, NOW)
+            .await,
+        Err(StoreError::NameTaken)
+    ));
+    assert_eq!(s.emails_of_user(user).await.unwrap(), vec!["a@x.org"]);
+
+    // Approve: active; approving again (or an active user) is NotFound.
+    s.approve_user(user).await.unwrap();
+    assert_eq!(
+        s.user_by_id(user).await.unwrap().unwrap().state,
+        UserState::Active
+    );
+    assert!(matches!(
+        s.approve_user(user).await,
+        Err(StoreError::NotFound)
+    ));
+    assert!(matches!(
+        s.reject_user(user).await,
+        Err(StoreError::NotFound)
+    ));
+    let (disabled, _) = s.create_local_user("dis", None, NOW).await.unwrap();
+    s.set_user_state(disabled, UserState::Disabled)
+        .await
+        .unwrap();
+    assert!(matches!(
+        s.approve_user(disabled).await,
+        Err(StoreError::NotFound)
+    ));
+    assert!(matches!(
+        s.approve_user(UserId::generate(1)).await,
+        Err(StoreError::NotFound)
+    ));
+}
+
+#[tokio::test]
+async fn rejecting_a_pending_user_frees_name_identity_and_email() {
+    let s = store(fleet()).await;
+    let (user, ns) = s
+        .signup(
+            &signup("alice", "1", Some("a@x.org")),
+            UserState::Pending,
+            NOW,
+        )
+        .await
+        .unwrap();
+    s.insert_session(&hash(1), user, NOW, NOW, NOW + 10)
+        .await
+        .unwrap();
+    s.reject_user(user).await.unwrap();
+    assert!(s.user_by_id(user).await.unwrap().is_none());
+    assert!(s.node(ns.unwrap()).await.unwrap().is_none());
+    assert_eq!(count(&s, "forgs_identity").await, 0);
+    assert_eq!(count(&s, "forgs_user_email").await, 0);
+    assert_eq!(count(&s, "forgs_session").await, 0);
+    assert_eq!(count(&s, "forgs_ns_tombstone").await, 0);
+    assert!(matches!(
+        s.reject_user(user).await,
+        Err(StoreError::NotFound)
+    ));
+    // The same name, identity and email sign up again.
+    let (again, _) = s
+        .signup(
+            &signup("alice", "1", Some("a@x.org")),
+            UserState::Active,
+            NOW,
+        )
+        .await
+        .unwrap();
+    assert_ne!(again, user);
+}
+
+#[tokio::test]
+async fn pending_users_page_lists_oldest_first() {
+    let s = store(fleet()).await;
+    let mut ids = Vec::new();
+    for (i, name) in ["p1", "p2", "p3"].iter().enumerate() {
+        let (u, _) = s
+            .signup(
+                &signup(name, &i.to_string(), None),
+                UserState::Pending,
+                NOW + i as u64,
+            )
+            .await
+            .unwrap();
+        ids.push(u);
+    }
+    s.create_local_user("active", None, NOW).await.unwrap();
+    let page = s.pending_users_page(None, 2).await.unwrap();
+    assert_eq!(page.iter().map(|u| u.id).collect::<Vec<_>>(), ids[..2]);
+    let rest = s.pending_users_page(Some(ids[1]), 2).await.unwrap();
+    assert_eq!(rest.iter().map(|u| u.id).collect::<Vec<_>>(), ids[2..]);
+    s.approve_user(ids[0]).await.unwrap();
+    assert_eq!(s.pending_users_page(None, 10).await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn a_pending_user_holds_no_live_credential() {
+    use forgs::SshKeyStore as _;
+    // API keys: a pending creator's keys do not redeem, their tokens die.
+    let (s, bob, _, project) = creator_fixture().await;
+    s.scoped(project)
+        .insert_api_key(&bobs_key(hash(1), bob, false), NOW)
+        .await
+        .unwrap();
+    let k = mint_from(&s, &hash(1), &hash(0x51)).await;
+    s.set_user_state(bob, UserState::Pending).await.unwrap();
+    assert!(s.lookup_workload(&hash(0x51)).await.unwrap().is_none());
+    assert!(!s.api_key_creator_live(&k).await.unwrap());
+    assert!(s.consume_api_key(&hash(1), NOW).await.unwrap().is_none());
+
+    // SSH keys are not found.
+    s.add_ssh_key(bob, &ssh_key(7), "laptop", None, 10, NOW)
+        .await
+        .unwrap();
+    assert!(s
+        .lookup_ssh_key(&ssh_key(7).fingerprint())
+        .await
+        .unwrap()
+        .is_none());
+    s.approve_user(bob).await.unwrap();
+    assert!(s
+        .lookup_ssh_key(&ssh_key(7).fingerprint())
+        .await
+        .unwrap()
+        .is_some());
+}
+
+#[tokio::test]
+async fn a_pending_admin_does_not_count_as_a_co_admin() {
+    let s = store(forge()).await;
+    let (alice, _) = s.create_local_user("alice", None, NOW).await.unwrap();
+    let (bob, _) = s
+        .signup(&signup("bob", "2", None), UserState::Pending, NOW)
+        .await
+        .unwrap();
+    let t = s
+        .create_node(None, "org", "team", NameOrigin::User, Some(alice), NOW)
+        .await
+        .unwrap();
+    let (ka, kb) = (SubjectKey::user(alice), SubjectKey::user(bob));
+    let high = s.roles().highest();
+    s.scoped(t).set_member(&ka, high, NOW).await.unwrap();
+    s.scoped(t).set_member(&kb, high, NOW).await.unwrap();
+    assert_eq!(s.sole_admin_of(alice).await.unwrap(), vec![t]);
+    assert!(matches!(
+        s.scoped(t).remove_member_guarded(&ka, &ka).await,
+        Err(StoreError::LastAdmin)
+    ));
+    // Setting alice pending reports the orphan, like disabling.
+    assert_eq!(
+        s.set_user_state(alice, UserState::Pending).await.unwrap(),
+        vec![t]
+    );
 }

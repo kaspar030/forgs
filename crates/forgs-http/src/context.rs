@@ -24,8 +24,25 @@ use sha2::Sha256;
 
 use crate::audit::{AuditSink, StoreAuditSink};
 use crate::hooks::{
-    ApiKeyPurposes, AppTokenLookup, NoPendingApprovals, PendingApprovalHook, StaticPurposes,
+    ApiKeyPurposes, AppTokenLookup, NoPendingApprovals, NoSignupApprovals, PendingApprovalHook,
+    SignupApprovalHook, StaticPurposes,
 };
+
+/// Who may create an account through first-login signup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SignupPolicy {
+    /// Anyone who logs in with a configured provider may sign up and use
+    /// the account at once.
+    #[default]
+    Open,
+    /// Signup creates the account as [`forgs_store::UserState::Pending`]:
+    /// the user sees a "waiting for approval" page and cannot log in until
+    /// an approver ([`SignupApprovalHook::can_approve`]) approves them.
+    Approval,
+    /// Signup is refused (`403 signup_closed`): accounts are created by the
+    /// app (invites, an admin) only.
+    Closed,
+}
 
 /// A source of "now", in epoch seconds.
 pub trait Clock: Send + Sync {
@@ -264,6 +281,7 @@ const RESERVED_PROVIDER_NAMES: &[&str] = &[
     "identities",
     "members",
     "rename",
+    "signups",
 ];
 
 pub(crate) struct Inner {
@@ -283,6 +301,8 @@ pub(crate) struct Inner {
     pub(crate) audit: Arc<dyn AuditSink>,
     pub(crate) purposes: Arc<dyn ApiKeyPurposes>,
     pub(crate) approvals: Arc<dyn PendingApprovalHook>,
+    pub(crate) signup_policy: SignupPolicy,
+    pub(crate) signup_approvals: Arc<dyn SignupApprovalHook>,
     pub(crate) app_tokens: Option<Arc<dyn AppTokenLookup>>,
     pub(crate) post_login_redirect: String,
     pub(crate) max_pending_devices: u64,
@@ -440,6 +460,8 @@ impl AuthContext {
             audit: None,
             purposes: Arc::new(StaticPurposes::default()),
             approvals: Arc::new(NoPendingApprovals),
+            signup_policy: SignupPolicy::Open,
+            signup_approvals: Arc::new(NoSignupApprovals),
             app_tokens: None,
             post_login_redirect: "/".to_owned(),
             max_pending_devices: 1024,
@@ -544,6 +566,18 @@ impl AuthContext {
         &self.inner.approvals
     }
 
+    /// The signup policy.
+    #[must_use]
+    pub fn signup_policy(&self) -> SignupPolicy {
+        self.inner.signup_policy
+    }
+
+    /// The signup-approval hook.
+    #[must_use]
+    pub fn signup_approvals(&self) -> &Arc<dyn SignupApprovalHook> {
+        &self.inner.signup_approvals
+    }
+
     /// The caller's address per the configured [`ClientIp`] resolver, for an
     /// app's own unauthenticated start route.
     #[must_use]
@@ -617,6 +651,8 @@ pub struct AuthContextBuilder {
     audit: Option<Arc<dyn AuditSink>>,
     purposes: Arc<dyn ApiKeyPurposes>,
     approvals: Arc<dyn PendingApprovalHook>,
+    signup_policy: SignupPolicy,
+    signup_approvals: Arc<dyn SignupApprovalHook>,
     app_tokens: Option<Arc<dyn AppTokenLookup>>,
     post_login_redirect: String,
     max_pending_devices: u64,
@@ -738,6 +774,21 @@ impl AuthContextBuilder {
     #[must_use]
     pub fn pending_approvals(mut self, hook: Arc<dyn PendingApprovalHook>) -> Self {
         self.approvals = hook;
+        self
+    }
+
+    /// Who may sign up (default [`SignupPolicy::Open`]).
+    #[must_use]
+    pub fn signup_policy(mut self, policy: SignupPolicy) -> Self {
+        self.signup_policy = policy;
+        self
+    }
+
+    /// Who may approve pending signups (default [`NoSignupApprovals`]:
+    /// nobody).
+    #[must_use]
+    pub fn signup_approvals(mut self, hook: Arc<dyn SignupApprovalHook>) -> Self {
+        self.signup_approvals = hook;
         self
     }
 
@@ -899,6 +950,8 @@ impl AuthContextBuilder {
                 audit,
                 purposes: self.purposes,
                 approvals: self.approvals,
+                signup_policy: self.signup_policy,
+                signup_approvals: self.signup_approvals,
                 app_tokens: self.app_tokens,
                 post_login_redirect: self.post_login_redirect,
                 max_pending_devices: self.max_pending_devices,

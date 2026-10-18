@@ -257,6 +257,48 @@ async fn api_keys_create_list_revoke() {
 }
 
 #[tokio::test]
+async fn pending_signups_list_approve_reject() {
+    let (stub, c) = setup().await;
+    let u = |id: &str| json!({"user_id": id, "username": id, "created_at": 1, "emails": []});
+    stub.script(
+        "/auth/signups",
+        vec![
+            Reply::json(&json!({"users": [u("a")], "next": "a"})),
+            Reply::json(&json!({"users": [u("b")]})),
+        ],
+    );
+    stub.script("/auth/signups/approve", vec![Reply::no_content()]);
+    stub.script("/auth/signups/reject", vec![Reply::no_content()]);
+    let all = c.list_pending_signups("SEKRIT-s").await.unwrap();
+    assert_eq!(
+        all.users
+            .iter()
+            .map(|u| u.username.as_str())
+            .collect::<Vec<_>>(),
+        ["a", "b"]
+    );
+    assert!(all.next.is_none());
+    c.approve_signup("SEKRIT-s", "a").await.unwrap();
+    c.reject_signup("SEKRIT-s", "b").await.unwrap();
+    let reqs = stub.requests();
+    assert!(reqs
+        .iter()
+        .all(|r| r.header("authorization") == Some("Bearer SEKRIT-s")));
+    assert_eq!(reqs[0].query(), "");
+    assert_eq!(reqs[1].query(), "after=a");
+    assert_eq!(reqs[2].path(), "/auth/signups/approve");
+    assert_eq!(reqs[2].json(), json!({"user_id": "a"}));
+    assert_eq!(reqs[3].path(), "/auth/signups/reject");
+    assert_eq!(reqs[3].json(), json!({"user_id": "b"}));
+
+    stub.script(
+        "/auth/signups/approve",
+        vec![Reply::error(403, "forbidden")],
+    );
+    assert!(c.approve_signup("s", "a").await.is_err());
+}
+
+#[tokio::test]
 async fn ssh_keys_list_add_delete() {
     let (stub, c) = setup().await;
     let key = json!({"id": "01JSSH", "key_type": "ssh-ed25519", "fingerprint": "SHA256:x",

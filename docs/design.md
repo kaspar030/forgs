@@ -365,7 +365,7 @@ forgs_membership { ns_node_id, subject (SubjectKey), user_id NULL, role }
 
 ```
 forgs_user       { id (ulid), username UNIQUE (canonical), display_name,
-                   state: active | disabled, created_at }
+                   state: active | disabled | pending, created_at }
 forgs_identity   { id, user_id, provider, provider_subject, email,
                    email_verified, linked_at, last_login_at }
                    UNIQUE(provider, provider_subject)
@@ -407,14 +407,30 @@ forgs_user_email { user_id, email UNIQUE (canonical), verified_at, is_primary }
 
 ```
 IdP callback  →  identity known?
-   yes → mint session
-   no  → create `pending_signup { id, identity fields, suggested_username,
+   yes → active: mint session; pending: "waiting for approval" page;
+         disabled: 403
+   no  → policy Closed: 403 signup_closed
+         otherwise create `pending_signup { id, identity fields, suggested_username,
                                   expires (15 min) }`
          redirect to /auth/signup  (ticket in HttpOnly cookie)
    signup  → validate username (policy + reserved + ns-root collision + tombstones)
            → one transaction: user, identity, user_email, personal ns node,
-             admin membership → mint session
+             admin membership → Open: mint session
+                                  Approval: state pending, no session
 ```
+
+- **Signup policy** (`SignupPolicy`, default `Open`). Under `Approval` the
+  account is created `pending`: the user sees a "waiting for approval" page
+  (again on every later login), no credential of theirs authenticates, and
+  they count as an active member nowhere. Their username and personal
+  namespace name are reserved meanwhile. An approver — whoever the app's
+  `SignupApprovalHook::can_approve` allows; nobody by default — lists them
+  (`GET /auth/signups`, or the `/auth/signups/review` page) and approves
+  (→ `active`) or rejects. **Reject deletes** the pending user, their
+  personal node, identities and emails **without a tombstone**: the account
+  was never usable, so nothing can be bound to its name, and the name,
+  identity and email may sign up again. Under `Closed`, an unknown identity
+  is refused at the callback; only app-created accounts exist.
 
 - **Account linking**: a second provider, or a second GitHub account, is linked
   only from an *authenticated browser* session (`POST

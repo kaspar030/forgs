@@ -146,6 +146,22 @@ async fn target_user(ctx: &AuthContext, username: &str) -> Result<UserId, ApiErr
         .id)
 }
 
+/// As [`target_user`], but a user still waiting for signup approval is
+/// reported exactly like an unknown one: they cannot be added anywhere
+/// before approval.
+async fn addable_user(ctx: &AuthContext, username: &str) -> Result<UserId, ApiError> {
+    let u = ctx
+        .store()
+        .user_by_username(username)
+        .await
+        .map_err(store_err("user_by_username"))?
+        .ok_or(ApiError::NotFound)?;
+    if u.state == forgs_store::UserState::Pending {
+        return Err(ApiError::NotFound);
+    }
+    Ok(u.id)
+}
+
 /// Add `username` to `namespace` with `role`, or change their role.
 ///
 /// # Errors
@@ -167,7 +183,7 @@ pub async fn set(
         .roles()
         .parse(role)
         .ok_or(ApiError::BadRequest)?;
-    let target = SubjectKey::user(target_user(ctx, username).await?);
+    let target = SubjectKey::user(addable_user(ctx, username).await?);
     let now = ctx.now();
     // The store re-checks the caller's role and the last-admin guard inside
     // the write's transaction: the pre-check above only orders the errors.

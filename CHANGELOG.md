@@ -1,5 +1,55 @@
 # Changelog
 
+## 0.3.0 — unreleased
+
+### Added
+
+- Signup approval. `forgs_http::SignupPolicy::{Open, Approval, Closed}`
+  (`AuthContextBuilder::signup_policy`, default `Open`, so nothing changes
+  for existing apps).
+  - `Approval`: signup creates the user `UserState::Pending` and shows a
+    "waiting for approval" page instead of logging in; a JSON
+    `POST /auth/signup` answers `202 Accepted` with
+    `forgs::api::SignupPendingResponse` (`{"status":"pending", user_id,
+    username}`) and sets no session cookie. Logging in again shows the same
+    page until approved.
+  - `Closed`: an unknown identity is refused at the login callback and a
+    signup submit is refused, both `403 signup_closed`.
+- `SignupApprovalHook` (`can_approve`, `on_pending`;
+  `AuthContextBuilder::signup_approvals`), default `NoSignupApprovals`
+  denies everyone. Routes `GET /auth/signups` (JSON `PendingUserList`,
+  `limit`/`after`), `POST /auth/signups/approve` and `/auth/signups/reject`
+  (`SignupDecisionRequest`, `204`), and the browser page
+  `GET`/`POST /auth/signups/review`; framework-agnostic `forgs_http::signups`.
+  `forgs-client` gains `list_pending_signups` (+ `_page`), `approve_signup`,
+  `reject_signup`.
+- Store: `approve_user`, `reject_user` (deletes the pending user and personal
+  node with **no tombstone**: the name, identity and email are free again),
+  `pending_users_page`, `emails_of_user`.
+- Error codes `signup_closed`, `account_pending` (`ApiError::SIGNUP_CLOSED`,
+  `ACCOUNT_PENDING`).
+- Audit events `user.signup.pending`, `user.signup.approved`,
+  `user.signup.rejected`, `signup.denied`, `signup.reject.closed`,
+  `auth.login.pending`, `auth.reject.pending`; session refresh,
+  refresh-token redemption and device-flow polls now audit
+  `auth.reject.disabled` / `auth.reject.pending` for an inactive user.
+
+### Breaking
+
+- `forgs_store::UserState` gains `Pending` (stored label `pending`);
+  migration 0010 widens the `forgs_user.state` CHECK. A pending user cannot
+  log in, none of their sessions, refresh tokens, API keys (and workload
+  tokens minted from them), or SSH keys authenticate, and they are not an
+  active member for last-admin checks. Pending users cannot be added as
+  members (`404`, like an unknown user).
+- `Store::signup` and `Store::signup_pending` take a `state: UserState`.
+- `forgs_http::signup::signup` returns `SignupOutcome::{Session, Pending}`.
+- `LoginOutcome` gains `Pending`.
+- `Store::set_user_state` to any non-active state (now including `Pending`)
+  purges workload tokens minted from the user's keys and reports orphaned
+  namespaces, as disabling did.
+- `signups` is a reserved provider name.
+
 ## 0.2.0 — 2026-10-16
 
 ### Security

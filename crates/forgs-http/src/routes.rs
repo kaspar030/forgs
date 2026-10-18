@@ -21,6 +21,9 @@
 //! | `GET /auth/keys/ssh` | header or cookie | the caller's SSH public keys |
 //! | `POST /auth/keys/ssh`, `/auth/keys/ssh/delete` | header, or cookie + CSRF | add / remove one |
 //! | `POST /auth/members`, `/auth/rename` | **header** | membership, renames |
+//! | `GET /auth/signups` | header or cookie | pending signups (JSON, approvers only) |
+//! | `POST /auth/signups/approve`, `/reject` | header, or cookie + CSRF | decide one |
+//! | `GET`/`POST /auth/signups/review` | cookie + CSRF | the browser review page |
 //!
 //! The JSON surface the CLI uses (`/auth/token`, `/auth/keys`,
 //! `/auth/logout`, `/auth/members`, `/auth/rename`) refuses a cookie-only
@@ -37,8 +40,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use forgs::api::{
     ApiKeyRequest, DevicePollRequest, DeviceStartRequest, LogoutRequest, MembersRequest,
-    RenameRequest, SessionInfo, SignupRequest, SshKeyAddRequest, SshKeyDeleteRequest, TokenRequest,
-    UnlinkIdentityRequest,
+    RenameRequest, SessionInfo, SignupDecisionRequest, SignupPendingResponse, SignupRequest,
+    SshKeyAddRequest, SshKeyDeleteRequest, TokenRequest, UnlinkIdentityRequest,
 };
 use forgs::TokenKind;
 use serde::de::DeserializeOwned;
@@ -54,7 +57,10 @@ use crate::cookies::{
 };
 use crate::error::{reject, ApiError};
 use crate::login::{safe_return_to, FlowIntent, LoginOutcome};
-use crate::{device, html, identities, keys, login, members, session, signup, ssh_keys, workload};
+use crate::signup::SignupOutcome;
+use crate::{
+    device, html, identities, keys, login, members, session, signup, signups, ssh_keys, workload,
+};
 
 /// The auth routes, to be merged or nested into the app's router. Tell the
 /// context where it is nested with [`crate::AuthContextBuilder::mount`].
@@ -82,6 +88,13 @@ where
         .route("/auth/identities/link/{provider}", post(link_start))
         .route("/auth/members", post(members_route))
         .route("/auth/rename", post(rename))
+        .route("/auth/signups", get(signups_list))
+        .route("/auth/signups/approve", post(signups_approve))
+        .route("/auth/signups/reject", post(signups_reject))
+        .route(
+            "/auth/signups/review",
+            get(signups_review_page).post(signups_review_submit),
+        )
         .route("/auth/{provider}/start", get(login_start))
         .route("/auth/{provider}/callback", get(login_callback))
 }
@@ -222,6 +235,9 @@ fn error_page(e: &ApiError) -> Response {
         e if *e == ApiError::IDENTITY_TAKEN => "That login is already linked to an account.",
         e if *e == ApiError::UNKNOWN_PROVIDER => "Unknown login provider.",
         e if *e == ApiError::UPSTREAM => "The login provider could not complete the login.",
+        e if *e == ApiError::SIGNUP_CLOSED => {
+            "This server does not accept new signups. Ask an administrator for an account."
+        }
         e if *e == ApiError::REAUTH_REQUIRED => {
             "To add a login method, confirm it's you by logging in with a method already linked \
              to this account."
@@ -346,6 +362,9 @@ async fn login_callback(
             ],
             false,
         ),
+        // Waiting for approval: no session; the browser's previous one (if
+        // any) is left alone.
+        Ok(LoginOutcome::Pending { .. }) => with_cookies(html::pending_approval(), &[spent]),
         Ok(LoginOutcome::Linked { return_to, .. }) => {
             redirect(&landing(&ctx, return_to.as_deref()), &[spent], false)
         }
@@ -588,7 +607,20 @@ async fn signup_submit(
         };
     };
     match signup::signup(&ctx, ticket.id, &username).await {
-        Ok((user, s)) => {
+        Ok(SignupOutcome::Pending(user)) => {
+            let cookies = [clear_cookie(&ctx.cookies().signup, true)];
+            if json {
+                let body = SignupPendingResponse {
+                    status: "pending".to_owned(),
+                    user_id: user.to_string(),
+                    username: session::username_of(&ctx, user).await.unwrap_or_default(),
+                };
+                with_cookies((StatusCode::ACCEPTED, Json(body)).into_response(), &cookies)
+            } else {
+                with_cookies(html::pending_approval(), &cookies)
+            }
+        }
+        Ok(SignupOutcome::Session(user, s)) => {
             let mut cookies = vec![clear_cookie(&ctx.cookies().signup, true)];
             cookies.extend(session_cookies(&ctx, &s.token, s.expires));
             if json {
@@ -605,6 +637,11 @@ async fn signup_submit(
             }
         }
         Err(e) if json => e.into_response(),
+        Err(e) if e == ApiError::SIGNUP_CLOSED => html::message(
+            e.status(),
+            "Signups are closed",
+            "This server does not accept new signups. Ask an administrator for an account.",
+        ),
         Err(e) if e == ApiError::TICKET_EXPIRED => html::message(
             StatusCode::GONE,
             "Login expired",
@@ -910,5 +947,132 @@ async fn rename(
     match res {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => e.into_response(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Signup approval
+// ---------------------------------------------------------------------------
+
+/// `GET /auth/signups?limit&after` — pending signups (approvers only).
+async fn signups_list(
+    State(ctx): State<AuthContext>,
+    auth: Authenticated<SessionOnly, CookieOk>,
+    RawQuery(q): RawQuery,
+) -> Response {
+    let user = match auth.require_user() {
+        Ok(u) => u,
+        Err(e) => return e.into_response(),
+    };
+    let q = query_map(q);
+    let Ok(limit) = q.get("limit").map(|l| l.parse::<u32>()).transpose() else {
+        return ApiError::BadRequest.into_response();
+    };
+    match signups::list(&ctx, user, q.get("after").map(String::as_str), limit).await {
+        Ok(l) => Json(l).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// `POST /auth/signups/approve` (CSRF-checked for a cookie).
+async fn signups_approve(
+    State(ctx): State<AuthContext>,
+    auth: Authenticated<SessionOnly, CookieOk>,
+    JsonBody(req): JsonBody<SignupDecisionRequest>,
+) -> Response {
+    let res = match auth.require_user() {
+        Ok(u) => signups::approve(&ctx, u, &req.user_id).await,
+        Err(e) => Err(e),
+    };
+    match res {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// `POST /auth/signups/reject` (CSRF-checked for a cookie).
+async fn signups_reject(
+    State(ctx): State<AuthContext>,
+    auth: Authenticated<SessionOnly, CookieOk>,
+    JsonBody(req): JsonBody<SignupDecisionRequest>,
+) -> Response {
+    let res = match auth.require_user() {
+        Ok(u) => signups::reject(&ctx, u, &req.user_id).await,
+        Err(e) => Err(e),
+    };
+    match res {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+fn signups_error(e: &ApiError) -> Response {
+    let text = match e {
+        ApiError::Forbidden => "You are not allowed to review signups.",
+        ApiError::NotFound => "That signup is no longer waiting for approval.",
+        e if *e == ApiError::CONFLICT => {
+            "That account cannot be rejected: something was already created in its namespace."
+        }
+        _ => "Something went wrong. Please try again.",
+    };
+    html::message(e.status(), "Pending signups", text)
+}
+
+async fn render_review(ctx: &AuthContext, caller: &Caller, notice: Option<&str>) -> Response {
+    let Some(user) = caller.user_id() else {
+        return signups_error(&ApiError::Forbidden);
+    };
+    match signups::list(ctx, user, None, None).await {
+        Ok(l) => html::signup_review(
+            &ctx.path("/auth/signups/review"),
+            &csrf_token(ctx, caller.auth.hash.as_str()),
+            &l.users,
+            notice,
+        ),
+        Err(e) => signups_error(&e),
+    }
+}
+
+/// `GET /auth/signups/review` — the browser page listing pending signups.
+async fn signups_review_page(State(ctx): State<AuthContext>, headers: HeaderMap) -> Response {
+    let Some(caller) = optional_caller(&ctx, &headers).await else {
+        return login_links(
+            &ctx,
+            Some(&ctx.path("/auth/signups/review")),
+            "Log in to review pending signups. You will come back here afterwards.",
+        );
+    };
+    render_review(&ctx, &caller, None).await
+}
+
+/// `POST /auth/signups/review`: `user_id` and `action=approve|reject`.
+async fn signups_review_submit(
+    State(ctx): State<AuthContext>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let form = form_map(&body);
+    let caller = match form_caller(&ctx, &headers, form.get("csrf").map(String::as_str)).await {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let Some(user) = caller.user_id() else {
+        return signups_error(&ApiError::Forbidden);
+    };
+    let target = form.get("user_id").map_or("", String::as_str);
+    let (res, done) = match form.get("action").map(String::as_str) {
+        Some("approve") => (signups::approve(&ctx, user, target).await, "Approved."),
+        Some("reject") => (signups::reject(&ctx, user, target).await, "Rejected."),
+        _ => {
+            return html::message(
+                StatusCode::BAD_REQUEST,
+                "Pending signups",
+                "Choose approve or reject.",
+            )
+        }
+    };
+    match res {
+        Ok(()) => render_review(&ctx, &caller, Some(done)).await,
+        Err(e) => signups_error(&e),
     }
 }

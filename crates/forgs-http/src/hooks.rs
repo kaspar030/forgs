@@ -1,5 +1,5 @@
-//! App extension points: app token kinds, API-key purposes and generic
-//! pending approvals.
+//! App extension points: app token kinds, API-key purposes, generic
+//! pending approvals and signup approvals.
 
 use async_trait::async_trait;
 use forgs::store::AppRecord;
@@ -222,6 +222,33 @@ pub trait PendingApprovalHook: Send + Sync {
         payload: &str,
     ) -> Result<serde_json::Value, ApiError>;
 }
+
+/// Who may approve signups, and what to do when one waits
+/// ([`crate::SignupPolicy::Approval`]).
+///
+/// forgs has no notion of a global administrator: the app decides. The
+/// default ([`NoSignupApprovals`]) denies everyone, so a server configured
+/// for approval without a hook simply accumulates pending users that only
+/// the store API ([`forgs_store::Store::approve_user`]) can approve.
+#[async_trait]
+pub trait SignupApprovalHook: Send + Sync {
+    /// Whether `approver` (an authenticated, active user) may list, approve
+    /// and reject pending signups. Default: no one.
+    async fn can_approve(&self, _ctx: &AuthContext, _approver: UserId) -> bool {
+        false
+    }
+
+    /// Called after a pending signup committed (e.g. to notify the
+    /// administrators). Failures are the app's to log: the signup stands.
+    async fn on_pending(&self, _ctx: &AuthContext, _user: &forgs_store::User) {}
+}
+
+/// The default signup-approval hook: nobody may approve.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoSignupApprovals;
+
+#[async_trait]
+impl SignupApprovalHook for NoSignupApprovals {}
 
 /// The default: no app approvals exist.
 #[derive(Debug, Clone, Copy, Default)]

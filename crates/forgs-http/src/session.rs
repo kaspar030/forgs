@@ -107,14 +107,33 @@ pub(crate) async fn username_of(ctx: &AuthContext, user: UserId) -> Option<Strin
         .map(|u| u.username)
 }
 
-/// Whether `user` exists and is active.
-pub(crate) async fn user_is_active(ctx: &AuthContext, user: UserId) -> Result<bool, ApiError> {
-    Ok(ctx
+/// Whether `user` exists and is active. A refusal of an existing user is
+/// audited (`auth.reject.disabled` / `auth.reject.pending`, `what` as the
+/// detail); the caller answers uniformly either way.
+pub(crate) async fn user_is_active(
+    ctx: &AuthContext,
+    user: UserId,
+    what: &str,
+) -> Result<bool, ApiError> {
+    let found = ctx
         .store()
         .user_by_id(user)
         .await
-        .map_err(store_err("user_by_id"))?
-        .is_some_and(|u| u.state == forgs_store::UserState::Active))
+        .map_err(store_err("user_by_id"))?;
+    let label = match found.map(|u| u.state) {
+        Some(forgs_store::UserState::Active) => return Ok(true),
+        None => return Ok(false),
+        Some(forgs_store::UserState::Pending) => "auth.reject.pending",
+        Some(forgs_store::UserState::Disabled) => "auth.reject.disabled",
+    };
+    ctx.audit()
+        .record(
+            AuditEvent::new(ctx.now(), label)
+                .subject(&forgs::SubjectKey::user(user))
+                .detail(what.to_owned()),
+        )
+        .await;
+    Ok(false)
 }
 
 /// `grant_type: refresh` — exchange a live session token for a fresh one.
@@ -160,7 +179,7 @@ pub async fn refresh_session(
         }
     };
     let user = auth.subject.user_id().ok_or(ApiError::InvalidGrant)?;
-    if !user_is_active(ctx, user).await? {
+    if !user_is_active(ctx, user, "session refresh").await? {
         return Err(ApiError::InvalidGrant);
     }
     let min_auth_time = now.saturating_sub(ctx.ttl().session_max_life);
@@ -224,7 +243,7 @@ pub async fn redeem_refresh_token(
                 return Err(ApiError::InvalidGrant);
             }
         };
-    if !user_is_active(ctx, record.user_id).await? {
+    if !user_is_active(ctx, record.user_id, "refresh token redemption").await? {
         return Err(ApiError::InvalidGrant);
     }
     let s = mint_session(ctx, record.user_id, "refresh token redemption").await?;

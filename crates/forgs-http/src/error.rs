@@ -135,6 +135,13 @@ impl ApiError {
         StatusCode::SERVICE_UNAVAILABLE,
         code::TEMPORARILY_UNAVAILABLE,
     );
+    /// `403 signup_closed`: the server does not accept new signups.
+    pub const SIGNUP_CLOSED: ApiError = ApiError::Code(StatusCode::FORBIDDEN, code::SIGNUP_CLOSED);
+    /// `403 account_pending`: the account waits for approval. Only signup
+    /// and login answer with it; a pending user's bearer credentials get the
+    /// uniform `401`.
+    pub const ACCOUNT_PENDING: ApiError =
+        ApiError::Code(StatusCode::FORBIDDEN, code::ACCOUNT_PENDING);
     /// `429 rate_limited`.
     pub const RATE_LIMITED: ApiError =
         ApiError::Code(StatusCode::TOO_MANY_REQUESTS, code::RATE_LIMITED);
@@ -256,5 +263,9 @@ mod tests {
         assert_eq!(ApiError::NOT_EMPTY.status(), StatusCode::CONFLICT);
         assert_eq!(ApiError::Internal.code(), "server_error");
         assert_eq!(ApiError::TICKET_EXPIRED.status(), StatusCode::GONE);
+        assert_eq!(ApiError::SIGNUP_CLOSED.status(), StatusCode::FORBIDDEN);
+        assert_eq!(ApiError::SIGNUP_CLOSED.code(), "signup_closed");
+        assert_eq!(ApiError::ACCOUNT_PENDING.status(), StatusCode::FORBIDDEN);
+        assert_eq!(ApiError::ACCOUNT_PENDING.code(), "account_pending");
     }
 }
